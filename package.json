@@ -1,0 +1,27 @@
+{
+  "name": "odinn",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cross-platform personal AI agent runtime",
+  "type": "module",
+  "packageManager": "pnpm@10.14.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "format:check": "node scripts/ci/run.mjs format",
+    "lint": "node scripts/ci/run.mjs lint",
+    "typecheck": "node scripts/ci/run.mjs typecheck",
+    "test": "node --test --test-reporter=spec tests/*.test.mjs",
+    "test:platform": "node --test --test-reporter=spec tests/platform.test.mjs",
+    "test:integration": "node --test --test-reporter=spec tests/integration.test.mjs",
+    "build": "node scripts/ci/run.mjs build",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "smoke:inference": "node scripts/ci/inference-smoke.mjs",
+    "benchmark:ci": "node scripts/ci/benchmark.mjs",
+    "release:preflight": "node scripts/release/preflight.mjs",
+    "release:package": "node scripts/release/package.mjs",
+    "release:checksums": "node scripts/release/checksums.mjs"
+  },
+  "license": "MIT"
+}

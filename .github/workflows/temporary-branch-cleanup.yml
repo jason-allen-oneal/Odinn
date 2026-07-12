@@ -1,0 +1,127 @@
+name: Temporary branch cleanup
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete stale branches and write report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ["GH_TOKEN"]
+          repository = os.environ["GH_REPOSITORY"]
+          api = "https://api.github.com"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "odinn-branch-cleanup",
+          }
+
+          def request(method, path, payload=None):
+              data = None
+              if payload is not None:
+                  data = json.dumps(payload).encode("utf-8")
+              req = urllib.request.Request(api + path, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      body = response.read()
+                      return response.status, json.loads(body) if body else None
+              except urllib.error.HTTPError as error:
+                  body = error.read().decode("utf-8", errors="replace")
+                  return error.code, {"error": body}
+
+          def paged(path):
+              items = []
+              page = 1
+              separator = "&" if "?" in path else "?"
+              while True:
+                  status, batch = request("GET", f"{path}{separator}per_page=100&page={page}")
+                  if status != 200:
+                      raise RuntimeError(f"GET {path} failed with {status}: {batch}")
+                  items.extend(batch)
+                  if len(batch) < 100:
+                      return items
+                  page += 1
+
+          status, repo = request("GET", f"/repos/{repository}")
+          if status != 200:
+              raise RuntimeError(f"Repository lookup failed with {status}: {repo}")
+
+          default_branch = repo["default_branch"]
+          pulls = paged(f"/repos/{repository}/pulls?state=open")
+          active_heads = {
+              pull["head"]["ref"]
+              for pull in pulls
+              if pull.get("head", {}).get("repo", {}).get("full_name") == repository
+          }
+
+          branches_before = [branch["name"] for branch in paged(f"/repos/{repository}/branches")]
+          deleted = []
+          skipped = []
+          failed = []
+
+          for branch in branches_before:
+              if branch == default_branch:
+                  skipped.append({"branch": branch, "reason": "default branch"})
+                  continue
+              if branch in active_heads:
+                  skipped.append({"branch": branch, "reason": "open pull request"})
+                  continue
+
+              encoded = urllib.parse.quote(branch, safe="")
+              delete_status, result = request("DELETE", f"/repos/{repository}/git/refs/heads/{encoded}")
+              if delete_status == 204:
+                  deleted.append(branch)
+              else:
+                  failed.append({"branch": branch, "status": delete_status, "result": result})
+
+          branches_after = [branch["name"] for branch in paged(f"/repos/{repository}/branches")]
+          report = {
+              "repository": repository,
+              "default_branch": default_branch,
+              "branches_before": branches_before,
+              "active_pull_request_heads": sorted(active_heads),
+              "deleted": deleted,
+              "skipped": skipped,
+              "failed": failed,
+              "branches_after": branches_after,
+          }
+
+          report_bytes = (json.dumps(report, indent=2, sort_keys=True) + "\n").encode("utf-8")
+          status, result = request(
+              "PUT",
+              f"/repos/{repository}/contents/.github/branch-cleanup-report.json",
+              {
+                  "message": "chore: record temporary branch cleanup",
+                  "content": base64.b64encode(report_bytes).decode("ascii"),
+                  "branch": default_branch,
+              },
+          )
+          if status not in (200, 201):
+              raise RuntimeError(f"Report write failed with {status}: {result}")
+
+          print(json.dumps(report, indent=2, sort_keys=True))
+          if failed:
+              raise SystemExit(1)
+          PY

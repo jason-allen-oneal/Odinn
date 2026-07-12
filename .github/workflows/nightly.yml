@@ -1,0 +1,50 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-main
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24"
+  PNPM_VERSION: "10.14.0"
+
+jobs:
+  deep-check:
+    name: Deep validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm release:preflight
+      - run: pnpm check
+      - run: pnpm test:integration
+      - run: pnpm smoke:inference
+      - run: pnpm benchmark:ci
+      - run: pnpm audit --audit-level moderate
+      - run: pnpm release:package
+      - run: pnpm release:checksums
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-release-candidate
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 7

@@ -42,15 +42,59 @@ jobs:
     name: Dependency review
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/dependency-review-action@v4
+
+      - name: Check dependency review API availability
+        id: dependency-graph
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status="$(curl --silent --show-error --output dependency-review-response.json --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/dependency-graph/compare/${BASE_SHA}...${HEAD_SHA}")"
+          echo "HTTP status: ${status}"
+          if [ "${status}" = "200" ]; then
+            echo "available=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+            cat dependency-review-response.json
+          fi
+
+      - name: Review changed dependencies
+        if: steps.dependency-graph.outputs.available == 'true'
+        uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: high
           comment-summary-in-pr: always
+
+      - name: Set up pnpm fallback
+        if: steps.dependency-graph.outputs.available != 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: Set up Node.js fallback
+        if: steps.dependency-graph.outputs.available != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Audit lockfile fallback
+        if: steps.dependency-graph.outputs.available != 'true'
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm audit --audit-level high
 
   audit:
     name: Dependency and lockfile audit

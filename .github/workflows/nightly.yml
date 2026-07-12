@@ -42,7 +42,7 @@ jobs:
       - run: pnpm audit --audit-level moderate
       - run: pnpm release:package
       - run: pnpm release:checksums
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nightly-release-candidate
           path: dist/release/

@@ -78,7 +78,7 @@ jobs:
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/release/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: odinn-release-assets
           path: dist/release/

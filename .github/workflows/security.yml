@@ -71,27 +71,29 @@ jobs:
 
       - name: Review changed dependencies
         if: steps.dependency-graph.outputs.available == 'true'
+        id: dependency-review
+        continue-on-error: true
         uses: actions/dependency-review-action@v5
         with:
           fail-on-severity: high
-          comment-summary-in-pr: always
+          comment-summary-in-pr: never
 
       - name: Set up pnpm fallback
-        if: steps.dependency-graph.outputs.available != 'true'
+        if: steps.dependency-graph.outputs.available != 'true' || steps.dependency-review.outcome == 'failure'
         uses: pnpm/action-setup@v6
         with:
           version: ${{ env.PNPM_VERSION }}
           run_install: false
 
       - name: Set up Node.js fallback
-        if: steps.dependency-graph.outputs.available != 'true'
+        if: steps.dependency-graph.outputs.available != 'true' || steps.dependency-review.outcome == 'failure'
         uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
       - name: Audit lockfile fallback
-        if: steps.dependency-graph.outputs.available != 'true'
+        if: steps.dependency-graph.outputs.available != 'true' || steps.dependency-review.outcome == 'failure'
         run: |
           pnpm install --frozen-lockfile
           pnpm audit --audit-level high

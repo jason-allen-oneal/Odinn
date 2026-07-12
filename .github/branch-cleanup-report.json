@@ -1,0 +1,83 @@
+{
+  "active_pull_request_heads": [
+    "dependabot/github_actions/actions/checkout-7",
+    "dependabot/github_actions/actions/dependency-review-action-5",
+    "dependabot/github_actions/actions/setup-node-6",
+    "dependabot/github_actions/actions/upload-artifact-7",
+    "dependabot/github_actions/github/codeql-action-4",
+    "dependabot/github_actions/gitleaks/gitleaks-action-3",
+    "dependabot/github_actions/googleapis/release-please-action-5",
+    "dependabot/github_actions/ossf/scorecard-action-2.4.3",
+    "dependabot/github_actions/pnpm/action-setup-6"
+  ],
+  "branches_after": [
+    "dependabot/github_actions/actions/checkout-7",
+    "dependabot/github_actions/actions/dependency-review-action-5",
+    "dependabot/github_actions/actions/setup-node-6",
+    "dependabot/github_actions/actions/upload-artifact-7",
+    "dependabot/github_actions/github/codeql-action-4",
+    "dependabot/github_actions/gitleaks/gitleaks-action-3",
+    "dependabot/github_actions/googleapis/release-please-action-5",
+    "dependabot/github_actions/ossf/scorecard-action-2.4.3",
+    "dependabot/github_actions/pnpm/action-setup-6",
+    "main"
+  ],
+  "branches_before": [
+    "dependabot/github_actions/actions/checkout-7",
+    "dependabot/github_actions/actions/dependency-review-action-5",
+    "dependabot/github_actions/actions/setup-node-6",
+    "dependabot/github_actions/actions/upload-artifact-7",
+    "dependabot/github_actions/github/codeql-action-4",
+    "dependabot/github_actions/gitleaks/gitleaks-action-3",
+    "dependabot/github_actions/googleapis/release-please-action-5",
+    "dependabot/github_actions/ossf/scorecard-action-2.4.3",
+    "dependabot/github_actions/pnpm/action-setup-6",
+    "main"
+  ],
+  "default_branch": "main",
+  "deleted": [],
+  "failed": [],
+  "repository": "jason-allen-oneal/Odinn",
+  "skipped": [
+    {
+      "branch": "dependabot/github_actions/actions/checkout-7",
+      "reason": "open pull request"
+    },
+    {
+      "branch": "dependabot/github_actions/actions/dependency-review-action-5",
+      "reason": "open pull request"
+    },
+    {
+      "branch": "dependabot/github_actions/actions/setup-node-6",
+      "reason": "open pull request"
+    },
+    {
+      "branch": "dependabot/github_actions/actions/upload-artifact-7",
+      "reason": "open pull request"
+    },
+    {
+      "branch": "dependabot/github_actions/github/codeql-action-4",
+      "reason": "open pull request"
+    },
+    {
+      "branch": "dependabot/github_actions/gitleaks/gitleaks-action-3",
+      "reason": "open pull request"
+    },
+    {
+      "branch": "dependabot/github_actions/googleapis/release-please-action-5",
+      "reason": "open pull request"
+    },
+    {
+      "branch": "dependabot/github_actions/ossf/scorecard-action-2.4.3",
+      "reason": "open pull request"
+    },
+    {
+      "branch": "dependabot/github_actions/pnpm/action-setup-6",
+      "reason": "open pull request"
+    },
+    {
+      "branch": "main",
+      "reason": "default branch"
+    }
+  ]
+}

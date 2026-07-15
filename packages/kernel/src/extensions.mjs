@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const EXTENSION_SCHEMA_VERSION = 1;
 const EXTENSION_TYPES = new Set(["tool", "skill", "mcp"]);
@@ -98,6 +99,73 @@ export class ExtensionRegistry {
     this.writeChain = operation.catch(() => undefined);
     return operation;
   }
+}
+
+export class ExtensionExecutor {
+  constructor(registry, { workspaceRoot = process.cwd(), defaultTimeoutMs = 30_000 } = {}) {
+    if (!registry || typeof registry.get !== "function") throw new Error("ExtensionExecutor requires an ExtensionRegistry");
+    this.registry = registry;
+    this.workspaceRoot = resolve(workspaceRoot);
+    this.defaultTimeoutMs = defaultTimeoutMs;
+  }
+
+  async invoke(id, input = {}, { capability, timeoutMs = this.defaultTimeoutMs } = {}) {
+    const extension = await this.registry.get(id);
+    if (!extension) throw new Error(`extension not found: ${id}`);
+    if (!extension.enabled || !extension.trusted) throw new Error(`extension is not enabled and trusted: ${id}`);
+    if (extension.sandbox !== "process") throw new Error(`extension sandbox is not executable by this adapter: ${extension.sandbox}`);
+    const requested = String(capability || extension.capabilities[0] || "").trim();
+    if (!requested || !extension.grants.includes(requested)) throw new Error(`extension capability is not granted: ${requested || "unspecified"}`);
+    if (!extension.entrypoint || extension.entrypoint.includes("\0")) throw new Error(`extension entrypoint is missing: ${id}`);
+    const entrypoint = resolve(this.workspaceRoot, extension.entrypoint);
+    const relativeEntrypoint = entrypoint === this.workspaceRoot ? "" : entrypoint.startsWith(`${this.workspaceRoot}/`) ? entrypoint.slice(this.workspaceRoot.length + 1) : null;
+    if (!relativeEntrypoint) throw new Error("extension entrypoint must remain inside the configured workspace root");
+    const protocol = extension.type === "mcp" ? "mcp-jsonl" : "odinn-jsonl";
+    const request = protocol === "mcp-jsonl"
+      ? { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: input.name || extension.id, arguments: input.arguments ?? input } }
+      : { type: "odinn.call", id: `call_${randomUUID()}`, input, capability: requested };
+    return runExtensionProcess(process.execPath, [entrypoint], request, { cwd: dirname(entrypoint), timeoutMs, protocol });
+  }
+}
+
+function runExtensionProcess(command, args, request, { cwd, timeoutMs, protocol }) {
+  return new Promise((resolveResult, rejectResult) => {
+    const child = spawn(command, args, { cwd, stdio: ["pipe", "pipe", "ignore"], shell: false });
+    let settled = false;
+    let buffer = "";
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdout.removeAllListeners();
+      child.removeAllListeners();
+      if (!child.killed) child.kill();
+      if (error) rejectResult(error);
+      else resolveResult(protocol === "mcp-jsonl" && result?.result?.content ? result.result : result?.result ?? result);
+    };
+    const timer = setTimeout(() => finish(new Error("extension execution timed out")), timeoutMs);
+    child.once("error", (error) => finish(error));
+    child.once("exit", (code) => {
+      if (!settled) finish(new Error(`extension process exited before returning a result: ${code ?? "unknown"}`));
+    });
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      let newline;
+      while ((newline = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        try {
+          const response = JSON.parse(line);
+          if (response.error) finish(new Error(response.error.message || "extension returned an error"));
+          else finish(undefined, response);
+        } catch {
+          finish(new Error("extension returned invalid JSON"));
+        }
+      }
+    });
+    child.stdin.end(`${JSON.stringify(request)}\n`);
+  });
 }
 
 function normalizeManifest(input, { source, provenance }) {

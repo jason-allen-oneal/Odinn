@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createGatewayServer } from "../apps/gateway/src/server.mjs";
+import { createApprovalStore } from "../packages/kernel/src/index.mjs";
 
 test("gateway control surfaces require bootstrap authentication and reject cross-origin mutations", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-security-"));
@@ -27,4 +28,19 @@ test("gateway control surfaces require bootstrap authentication and reject cross
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
+});
+
+test("approval records survive restart and claim idempotently", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-approval-restart-"));
+  const path = join(stateDir, "approvals.json");
+  const first = createApprovalStore({ path });
+  const id = first.create({ tool: "browser.click", input: { confirmed: true }, summary: "Click" });
+  const restarted = createApprovalStore({ path });
+  const claimed = restarted.claim(id);
+  assert.equal(claimed.status, "approved");
+  assert.equal(claimed.runId, `approval:${id}`);
+  const secondClaim = createApprovalStore({ path }).claim(id);
+  assert.equal(secondClaim.status, "approved");
+  assert.equal(secondClaim.runId, claimed.runId);
+  assert.deepEqual(createApprovalStore({ path }).list(), []);
 });

@@ -42,6 +42,7 @@ jobs:
       - run: node scripts/ci/audit.mjs moderate
       - run: pnpm release:package
       - run: pnpm release:checksums
+      - run: pnpm storage:drill
       - uses: actions/upload-artifact@v7
         with:
           name: nightly-release-candidate

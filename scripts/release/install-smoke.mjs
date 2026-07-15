@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,9 +34,11 @@ for (const extension of ["zip", "tar.gz"]) {
     const packageRoot = join(destination, expectedRoot);
     run(packageManager, ["install", "--frozen-lockfile", "--ignore-scripts"], packageRoot);
     const state = join(destination, "state");
+    const inputFile = join(packageRoot, "install-smoke-input.json");
+    await writeFile(inputFile, `${JSON.stringify({ text: "ODINN_INSTALL_OK" })}\n`);
     run(packageManager, ["odinn", "onboard", "--state", state], packageRoot);
-    const output = run(packageManager, ["odinn", "run", "--tool", "text.echo", "--input-json", JSON.stringify({ text: "ODINN_INSTALL_OK" }), "--state", state], packageRoot);
-    if (!output.includes("ODINN_INSTALL_OK")) throw new Error(`installed ${basename(archive)} did not execute the CLI smoke`);
+    const output = run(packageManager, ["odinn", "run", "--tool", "text.echo", "--input-file", inputFile, "--state", state], packageRoot);
+    if (!output.includes("ODINN_INSTALL_OK")) throw new Error(`installed ${basename(archive)} did not execute the CLI smoke: ${output}`);
   } finally {
     await rm(destination, { recursive: true, force: true });
   }

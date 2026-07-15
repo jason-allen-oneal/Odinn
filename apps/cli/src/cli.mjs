@@ -105,7 +105,7 @@ function usage() {
   odinn config model list [--state .odinn]
   odinn status [--state .odinn]
   odinn tui [--state .odinn] [--watch]
-  odinn run --tool <tool> [--input-json <json>] [--state .odinn]
+  odinn run --tool <tool> [--input-json <json>] [--input-file <json-file>] [--state .odinn]
   odinn plan --file <plan.json> [--state .odinn]
   odinn audit [--state .odinn]
   odinn runs [--limit 20] [--state .odinn]
@@ -1019,7 +1019,8 @@ async function run(args) {
   const state = stateDir(args);
   const tool = option(args, "--tool");
   if (!tool) throw new Error("run requires --tool");
-  const inputRaw = option(args, "--input-json", "{}");
+  const inputFile = option(args, "--input-file", "");
+  const inputRaw = inputFile ? await readFile(resolveInvocationPath(inputFile), "utf8") : option(args, "--input-json", "{}");
   const input = JSON.parse(inputRaw);
   const config = await readConfig(state);
   const result = await runTask({

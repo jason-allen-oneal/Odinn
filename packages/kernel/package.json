@@ -1,0 +1,15 @@
+{
+  "name": "@odinn/kernel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "dependencies": {
+    "@odinn/policy": "workspace:*",
+    "@odinn/protocol": "workspace:*",
+    "@odinn/store-file": "workspace:*",
+    "playwright-core": "1.61.1"
+  }
+}

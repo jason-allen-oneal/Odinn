@@ -1,0 +1,17 @@
+{
+  "id": "plan_local_smoke",
+  "name": "local-smoke",
+  "steps": [
+    {
+      "id": "health",
+      "tool": "job.healthcheck"
+    },
+    {
+      "id": "echo",
+      "tool": "text.echo",
+      "input": {
+        "text": "ODINN_PLAN_OK"
+      }
+    }
+  ]
+}

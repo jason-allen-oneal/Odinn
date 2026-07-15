@@ -8,6 +8,7 @@ test("package metadata names Odinn and pins the toolchain", async () => {
   const pkg = JSON.parse(await read("package.json"));
   assert.equal(pkg.name, "odinn");
   assert.match(pkg.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
+  assert.equal(pkg.bin.odinn, "./apps/cli/src/cli.mjs");
   assert.match(pkg.packageManager, /^pnpm@\d+\.\d+\.\d+$/);
   assert.equal(pkg.engines.node, ">=24.0.0");
 });

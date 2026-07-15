@@ -971,9 +971,12 @@ function withTimeout(promise, timeoutMs, message) {
 }
 
 function openAuthorizationUrl(url) {
+  const parsed = new URL(url);
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("OAuth authorization URL must use http or https");
   const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-  const commandArgs = process.platform === "win32" ? ["/c", "start", "", url] : [url];
-  const child = spawn(command, commandArgs, { detached: true, stdio: "ignore" });
+  const commandArgs = process.platform === "win32" ? ["/c", "start", "", parsed.href] : [parsed.href];
+  // lgtm[js/command-line-injection] - shell execution is disabled and the URL is restricted to HTTP(S).
+  const child = spawn(command, commandArgs, { detached: true, stdio: "ignore", shell: false });
   child.unref();
 }
 
@@ -1279,7 +1282,7 @@ async function saveConfig(state, config) {
 
 function renderOnboarding({ state, workspaceRoot, configPath, tools, allowedCapabilities, providers, defaultModel, runs }) {
   const providerLines = providers.length
-    ? providers.map((provider) => `  - ${provider.name} [${provider.authMode}]: ${provider.models.join(", ")} (${provider.baseUrl})${provider.configured ? "" : provider.authMode === "oauth" ? " [not connected]" : provider.apiKeyEnv ? ` [missing ${provider.apiKeyEnv}]` : ""}`)
+    ? providers.map((provider) => `  - ${provider.name} [${provider.authMode}]: ${provider.models.join(", ")} (${provider.baseUrl})${provider.configured ? "" : provider.authMode === "oauth" ? " [not connected]" : provider.apiKeyEnv ? " [credential missing]" : ""}`)
     : ["  - none"];
   return [
     "Odinn local onboarding",
@@ -1354,7 +1357,18 @@ function splitCsv(value) {
 }
 
 async function printJson(value) {
-  console.log(JSON.stringify(value, null, 2));
+  console.log(JSON.stringify(redactOutput(value), null, 2));
+}
+
+function redactOutput(value) {
+  if (Array.isArray(value)) return value.map((item) => redactOutput(item));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+    key,
+    /(?:api.?key(?!env)|access.?token|refresh.?token|client.?secret(?!env)|password|authorization)/i.test(key)
+      ? "[redacted]"
+      : redactOutput(item)
+  ]));
 }
 
 main().catch((error) => {

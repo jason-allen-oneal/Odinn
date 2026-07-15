@@ -39,7 +39,7 @@ jobs:
       - run: pnpm test:integration
       - run: pnpm smoke:inference
       - run: pnpm benchmark:ci
-      - run: pnpm audit --audit-level moderate
+      - run: node scripts/ci/audit.mjs moderate
       - run: pnpm release:package
       - run: pnpm release:checksums
       - uses: actions/upload-artifact@v7

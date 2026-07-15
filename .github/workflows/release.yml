@@ -44,7 +44,7 @@ jobs:
       - run: pnpm test:integration
       - run: pnpm smoke:inference
       - run: pnpm benchmark:ci
-      - run: pnpm audit --audit-level high
+      - run: node scripts/ci/audit.mjs high
 
   source-package:
     name: Build release assets

@@ -862,9 +862,9 @@ function domainMatches(host, domain) {
 
 function htmlToText(html) {
   return decodeHtml(html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<script\b[^>]*>[\s\S]*?<\s*\/\s*script\s*>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\s*\/\s*style\s*>/gi, " ")
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\s*\/\s*noscript\s*>/gi, " ")
     .replace(/<br\s*\/?>(?=.)/gi, "\n")
     .replace(/<\/(p|div|li|h[1-6]|tr|section|article|main|header|footer)>/gi, "\n")
     .replace(/<[^>]+>/g, " "))
@@ -874,14 +874,10 @@ function htmlToText(html) {
 }
 
 function decodeHtml(value) {
+  const entities = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&apos;": "'", "&nbsp;": " " };
   return String(value || "")
     .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
-    .replace(/&nbsp;/g, " ")
+    .replace(/&(?:amp|lt|gt|quot|#39|apos|nbsp);/g, (entity) => entities[entity] ?? entity)
     .replace(/\s+/g, " ")
     .trim();
 }

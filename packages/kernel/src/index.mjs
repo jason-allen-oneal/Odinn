@@ -862,9 +862,9 @@ function domainMatches(host, domain) {
 
 function htmlToText(html) {
   return decodeHtml(html
-    .replace(/<script\b[^>]*>[\s\S]*?<\s*\/\s*script\s*>/gi, " ")
-    .replace(/<style\b[^>]*>[\s\S]*?<\s*\/\s*style\s*>/gi, " ")
-    .replace(/<noscript\b[^>]*>[\s\S]*?<\s*\/\s*noscript\s*>/gi, " ")
+    .replace(/<script\b[^>]*>[\s\S]*?<\s*\/\s*script\b[^>]*>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\s*\/\s*style\b[^>]*>/gi, " ")
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\s*\/\s*noscript\b[^>]*>/gi, " ")
     .replace(/<br\s*\/?>(?=.)/gi, "\n")
     .replace(/<\/(p|div|li|h[1-6]|tr|section|article|main|header|footer)>/gi, "\n")
     .replace(/<[^>]+>/g, " "))

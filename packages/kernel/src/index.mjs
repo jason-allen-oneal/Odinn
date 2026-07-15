@@ -2,13 +2,14 @@ import { hostname, platform, release } from "node:os";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
 import { chromium } from "playwright-core";
-export { JobSupervisor } from "./jobs.mjs";
+export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.mjs";
 export { ExtensionRegistry } from "./extensions.mjs";
 
 const execFile = promisify(execFileCallback);
@@ -739,23 +740,45 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
   ]);
 }
 
-export function createApprovalStore() {
+export function createApprovalStore({ path } = {}) {
   const pending = new Map();
+  const refresh = () => {
+    if (!path) return;
+    try {
+      const records = JSON.parse(readFileSync(path, "utf8"));
+      pending.clear();
+      for (const record of Array.isArray(records) ? records : []) pending.set(record.id, record);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  };
+  const persist = () => {
+    if (!path) return;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(Array.from(pending.values()), null, 2)}\n`, { mode: 0o600 });
+    chmodSync(path, 0o600);
+  };
   return {
     create(action) {
+      refresh();
       const id = prefixedId("approval");
       pending.set(id, { id, ...action, createdAt: new Date().toISOString(), expiresAt: Date.now() + 300_000 });
+      persist();
       return id;
     },
     take(id) {
+      refresh();
       const action = pending.get(id);
       if (action) pending.delete(id);
+      persist();
       if (action && action.expiresAt <= Date.now()) return undefined;
       return action;
     },
     list() {
+      refresh();
       const now = Date.now();
       for (const [id, action] of pending) if (action.expiresAt <= now) pending.delete(id);
+      persist();
       return Array.from(pending.values()).map(({ input, ...action }) => ({ ...action, input: redactBrowserInput(input) }));
     }
   };

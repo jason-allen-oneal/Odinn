@@ -3,7 +3,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, JobSupervisor, listConfiguredModels, normalizeModelConfig, oauthTokenPath, runPlan, runTask } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeModelConfig, oauthTokenPath, runPlan, runTask } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { FileJobStore } from "@odinn/store-file";
 
@@ -26,18 +26,12 @@ export async function createGatewayServer({
   const config = await readConfig(state);
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
   const policy = createDefaultPolicy(config.policy);
-  const approvalStore = createApprovalStore();
+  const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
   const registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, approvalStore });
   const gatewayToken = await loadGatewayToken(state);
   const supervisor = new JobSupervisor({
     store: new FileJobStore(join(state, "jobs.json")),
-    execute: async (payload, context) => runTask({
-      task: payload.task,
-      auditStore,
-      policy,
-      registry,
-      signal: context.signal
-    })
+    execute: createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy })
   });
   await supervisor.start();
 

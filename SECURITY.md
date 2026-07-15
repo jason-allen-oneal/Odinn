@@ -33,7 +33,7 @@ Before the first stable release:
 
 ### Secure defaults
 
-The default policy enables public web reading while blocking private-network URLs, leaves domain allowlists empty, uses a separate Chromium profile for browser work, and requires explicit approval before `browser.click`, `browser.type`, or `browser.press` can execute. Approval records expire after five minutes and are kept in memory; the corresponding request and decision are written to the audit log. The gateway requires a per-state bearer token or same-site bootstrap cookie for control-plane access and rejects cross-origin mutations.
+The default policy enables public web reading while blocking private-network URLs, leaves domain allowlists empty, uses a separate Chromium profile for browser work, and requires explicit approval before `browser.click`, `browser.type`, or `browser.press` can execute. Gateway approval records expire after five minutes and are stored in the state directory with mode `0600`; the corresponding request and decision are written to the audit log. The gateway requires a per-state bearer token or same-site bootstrap cookie for control-plane access and rejects cross-origin mutations.
 
 The policy is configurable because local operators have different trust boundaries. The dangerous switches are intentionally explicit:
 

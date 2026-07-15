@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { fork } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 export class JobSupervisor {
   constructor({ store, execute, concurrency = 1, maxAttempts = 3, defaultTimeoutMs = 120_000 } = {}) {
@@ -95,4 +97,35 @@ export class JobSupervisor {
     active.promise = promise;
     return promise;
   }
+}
+
+export function createIsolatedTaskExecutor({ stateDir, workspaceRoot, config, policy } = {}) {
+  const workerPath = fileURLToPath(new URL("./task-worker.mjs", import.meta.url));
+  return (payload, { signal } = {}) => new Promise((resolve, reject) => {
+    const child = fork(workerPath, [], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      child.removeAllListeners();
+      if (child.connected) child.disconnect();
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const abort = () => {
+      child.kill();
+      finish(signal.reason instanceof Error ? signal.reason : new Error("isolated task aborted"));
+    };
+    child.on("message", (message) => {
+      if (message?.ok) finish(undefined, message.result);
+      else finish(new Error(message?.error || "isolated task failed"));
+    });
+    child.on("error", (error) => finish(error));
+    child.on("exit", (code, exitSignal) => {
+      if (!settled) finish(new Error(`isolated task worker exited unexpectedly: ${code ?? exitSignal}`));
+    });
+    signal?.addEventListener("abort", abort, { once: true });
+    child.send({ payload, stateDir, workspaceRoot, config, policy });
+  });
 }

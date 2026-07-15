@@ -4,6 +4,9 @@
   "private": true,
   "description": "Cross-platform personal AI agent runtime",
   "type": "module",
+  "bin": {
+    "odinn": "./apps/cli/src/cli.mjs"
+  },
   "packageManager": "pnpm@10.14.0",
   "engines": {
     "node": ">=24.0.0"
@@ -17,6 +20,10 @@
     "test:integration": "node --test --test-reporter=spec tests/integration.test.mjs",
     "build": "node scripts/ci/run.mjs build",
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "odinn": "node ./apps/cli/src/cli.mjs",
+    "onboard": "pnpm --filter @odinn/cli start -- onboard",
+    "tui": "pnpm --filter @odinn/cli start -- tui",
+    "gui:start": "pnpm --filter @odinn/gateway start",
     "smoke:inference": "node scripts/ci/inference-smoke.mjs",
     "benchmark:ci": "node scripts/ci/benchmark.mjs",
     "release:preflight": "node scripts/release/preflight.mjs",

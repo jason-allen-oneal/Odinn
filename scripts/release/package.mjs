@@ -20,11 +20,17 @@ function archive(format, extension) {
   return destination;
 }
 
+function currentCommit() {
+  const result = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`git rev-parse HEAD failed: ${result.stderr || result.stdout}`);
+  return result.stdout.trim();
+}
+
 const artifacts = [archive("zip", "zip"), archive("tar.gz", "tar.gz")];
 const manifest = {
   name: pkg.name,
   version: pkg.version,
-  commit: process.env.GITHUB_SHA ?? spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).stdout.trim(),
+  commit: process.env.GITHUB_SHA || currentCommit(),
   artifacts: artifacts.map((path) => path.slice(output.length + 1)),
   createdAt: new Date().toISOString()
 };

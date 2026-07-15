@@ -26,9 +26,17 @@ if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(pkg.version)) {
 
 const refType = process.env.GITHUB_REF_TYPE;
 const refName = process.env.GITHUB_REF_NAME;
-if (refType === "tag") {
+const releaseTag = process.env.ODINN_RELEASE_TAG || (refType === "tag" ? refName : undefined);
+if (releaseTag) {
   const expected = `v${pkg.version}`;
-  if (refName !== expected) throw new Error(`release preflight: tag ${refName} does not match package version ${expected}`);
+  if (releaseTag !== expected) throw new Error(`release preflight: tag ${releaseTag} does not match package version ${expected}`);
+  const tagCommit = spawnSync("git", ["rev-list", "-n", "1", `refs/tags/${releaseTag}`], { cwd: root, encoding: "utf8" });
+  if (tagCommit.status !== 0) throw new Error(`release preflight: could not resolve tag ${releaseTag}`);
+  const headCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" });
+  if (headCommit.status !== 0) throw new Error("release preflight: could not resolve HEAD");
+  if (tagCommit.stdout.trim() !== headCommit.stdout.trim()) {
+    throw new Error(`release preflight: checked-out commit is not ${releaseTag}`);
+  }
 }
 
 const status = spawnSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" });

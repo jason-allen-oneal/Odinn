@@ -38,6 +38,8 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm release:preflight
+        env:
+          ODINN_RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       - run: pnpm check
       - run: pnpm test:integration
       - run: pnpm smoke:inference
@@ -75,6 +77,7 @@ jobs:
           format: spdx-json
           output-file: dist/release/odinn.spdx.json
       - run: pnpm release:checksums
+      - run: node scripts/release/verify.mjs
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/release/*

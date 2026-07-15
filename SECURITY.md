@@ -21,7 +21,7 @@ Reports will be acknowledged as soon as practical. Disclosure timing will be coo
 
 ## Security boundaries
 
-Odinn is designed around explicit capability boundaries, durable approvals, isolated workers, authenticated control surfaces, and local-first storage. These controls are still under active development.
+Ódinn's initial beta has explicit capability boundaries, append-only audit events, expiring approval records, an isolated browser profile, and local-first storage. It does not yet provide multi-user authentication or a remotely hardened control plane.
 
 Before the first stable release:
 
@@ -30,6 +30,30 @@ Before the first stable release:
 - Use dedicated credentials with minimal permissions.
 - Keep provider keys and channel tokens out of source control.
 - Treat generated skills and imported configuration as untrusted until reviewed.
+
+### Secure defaults
+
+The default policy enables public web reading while blocking private-network URLs, leaves domain allowlists empty, uses a separate Chromium profile for browser work, and requires explicit approval before `browser.click`, `browser.type`, or `browser.press` can execute. Approval records expire after five minutes and are kept in memory; the corresponding request and decision are written to the audit log.
+
+The policy is configurable because local operators have different trust boundaries. The dangerous switches are intentionally explicit:
+
+```bash
+pnpm odinn config security show
+pnpm odinn config security set --surface web --allow-private-network true
+pnpm odinn config security set --surface browser --require-approval false
+```
+
+Private-network access can expose local services and metadata endpoints. Disabling browser approval allows the model to drive external accounts without a human checkpoint. Those settings are operator decisions, not safe defaults.
+
+The web tools follow redirects through the same URL policy and enforce blocked/allowed domains at each hop. Browser navigation and post-action snapshots are checked against the same network and domain rules. The beta does not expose file upload or download tools.
+
+### Trust model
+
+- The local operator controls the config, provider credentials, browser login, and approval decisions.
+- Model output and imported skills are untrusted input; they cannot bypass the kernel policy evaluator.
+- Public web content is untrusted data and may contain prompt injection. Ódinn must not treat page instructions as operator authorization.
+- Browser read access is not action authorization. An external side effect requires the approval gate unless the operator explicitly disables it.
+- Loopback binding is the supported deployment. `ODINN_ALLOW_REMOTE=1` is an escape hatch for controlled experiments, not a security boundary.
 
 ## CI security gates
 

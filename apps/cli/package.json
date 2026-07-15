@@ -1,0 +1,16 @@
+{
+  "name": "@odinn/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "odinn": "./src/cli.mjs"
+  },
+  "scripts": {
+    "start": "node ./src/cli.mjs"
+  },
+  "dependencies": {
+    "@odinn/kernel": "workspace:*",
+    "@odinn/policy": "workspace:*"
+  }
+}

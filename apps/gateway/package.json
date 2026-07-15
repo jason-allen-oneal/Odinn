@@ -1,0 +1,16 @@
+{
+  "name": "@odinn/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/server.mjs"
+  },
+  "scripts": {
+    "start": "node ./src/server.mjs"
+  },
+  "dependencies": {
+    "@odinn/kernel": "workspace:*",
+    "@odinn/policy": "workspace:*"
+  }
+}

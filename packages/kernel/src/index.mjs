@@ -307,7 +307,7 @@ export const PROVIDER_PRESETS = {
     type: "openai-compatible",
     baseUrl: "http://127.0.0.1:11434/v1",
     apiKeyEnv: "",
-    models: ["llama3.2:1b"]
+    models: []
   },
   lmstudio: {
     type: "openai-compatible",
@@ -827,6 +827,12 @@ const WEB_TIMEOUT_MS = 20_000;
 const WEB_MAX_BYTES = 2_000_000;
 const browserManagers = new Map();
 
+export async function closeBrowserManagers() {
+  const managers = Array.from(browserManagers.values());
+  browserManagers.clear();
+  await Promise.allSettled(managers.map((manager) => manager.close()));
+}
+
 async function searchWeb(input = {}) {
   const query = cleanRequired(input.query, "web.search requires query");
   const limit = Math.min(normalizeLimit(input.limit, 5), 10);
@@ -976,6 +982,12 @@ class BrowserManager {
       args: ["--no-first-run", "--no-default-browser-check"]
     });
     return this.context;
+  }
+
+  async close() {
+    const context = this.context;
+    this.context = null;
+    if (context) await context.close().catch(() => undefined);
   }
 
   async page(tabId) {
@@ -1320,7 +1332,7 @@ export function createAuditStore(path = ".odinn/audit.jsonl") {
 async function chatWithModel(modelConfig, input = {}, { stateDir, signal } = {}) {
   const modelRef = modelString(input.model, modelConfig.defaultModel);
   if (!modelRef) {
-    throw new Error("no model configured; run `odinn onboard --provider ollama` or `odinn onboard --provider openai`");
+    throw new Error("no model configured; run `odinn onboard --provider openai` or `odinn onboard --provider ollama --model <installed-model>`");
   }
   const parsed = parseModelRef(modelRef);
   const provider = modelConfig.providers[parsed.provider];

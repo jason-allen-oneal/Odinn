@@ -101,12 +101,25 @@ export class JobSupervisor {
 
 export function createIsolatedTaskExecutor({ stateDir, workspaceRoot, config, policy } = {}) {
   const workerPath = fileURLToPath(new URL("./task-worker.mjs", import.meta.url));
-  return (payload, { signal } = {}) => new Promise((resolve, reject) => {
+  const browserWorkerPath = fileURLToPath(new URL("./browser-worker.mjs", import.meta.url));
+  const browserExecutor = createPersistentWorkerExecutor({
+    workerPath: browserWorkerPath,
+    stateDir,
+    workspaceRoot,
+    config,
+    policy
+  });
+  const children = new Set();
+  const execute = (payload, { signal } = {}) => {
+    if (String(payload?.task?.tool || "").startsWith("browser.")) return browserExecutor(payload, { signal });
+    return new Promise((resolve, reject) => {
     const child = fork(workerPath, [], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+    children.add(child);
     let settled = false;
     const finish = (error, result) => {
       if (settled) return;
       settled = true;
+      children.delete(child);
       signal?.removeEventListener("abort", abort);
       child.removeAllListeners();
       if (child.connected) child.disconnect();
@@ -127,5 +140,100 @@ export function createIsolatedTaskExecutor({ stateDir, workspaceRoot, config, po
     });
     signal?.addEventListener("abort", abort, { once: true });
     child.send({ payload, stateDir, workspaceRoot, config, policy });
+    });
+  };
+  execute.shutdown = async () => {
+    await browserExecutor.shutdown();
+    for (const child of children) child.kill();
+    children.clear();
+  };
+  return execute;
+}
+
+function createPersistentWorkerExecutor({ workerPath, stateDir, workspaceRoot, config, policy } = {}) {
+  let child;
+  let sequence = 0;
+  let shuttingDown = false;
+  const pending = new Map();
+
+  const rejectPending = (error) => {
+    for (const request of pending.values()) request.finish(error);
+    pending.clear();
+  };
+
+  const ensureChild = () => {
+    if (child && child.connected) return child;
+    const currentChild = fork(workerPath, [], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+    child = currentChild;
+    currentChild.on("message", (message) => {
+      const request = pending.get(message?.id);
+      if (!request) return;
+      pending.delete(message.id);
+      if (message.ok) request.finish(undefined, message.result);
+      else request.finish(new Error(message.error || "persistent worker failed"));
+    });
+    currentChild.on("error", (error) => rejectPending(error));
+    currentChild.on("exit", (code, exitSignal) => {
+      if (currentChild.connected) currentChild.disconnect();
+      if (child === currentChild) child = undefined;
+      if (!shuttingDown) rejectPending(new Error(`persistent worker exited unexpectedly: ${code ?? exitSignal}`));
+    });
+    return currentChild;
+  };
+
+  const execute = (payload, { signal } = {}) => new Promise((resolve, reject) => {
+    if (shuttingDown) {
+      reject(new Error("persistent worker is shutting down"));
+      return;
+    }
+    const id = `request_${++sequence}`;
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const abort = () => {
+      for (const request of pending.values()) request.finish(signal.reason instanceof Error ? signal.reason : new Error("persistent task aborted"));
+      pending.clear();
+      child?.kill();
+      finish(signal.reason instanceof Error ? signal.reason : new Error("persistent task aborted"));
+    };
+    pending.set(id, { finish });
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      ensureChild().send({ type: "task", id, payload, stateDir, workspaceRoot, config, policy }, (error) => {
+        if (error) {
+          pending.delete(id);
+          finish(error);
+        }
+      });
+    } catch (error) {
+      pending.delete(id);
+      finish(error);
+    }
   });
+
+  execute.shutdown = async () => {
+    shuttingDown = true;
+    if (!child) return;
+    const current = child;
+    rejectPending(new Error("persistent worker shutting down"));
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        current.kill();
+        resolve();
+      }, 5_000);
+      current.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      if (current.connected) current.send({ type: "shutdown" });
+      else current.kill();
+    });
+    child = undefined;
+  };
+  return execute;
 }

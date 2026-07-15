@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@odinn/kernel": "workspace:*",
-    "@odinn/policy": "workspace:*"
+    "@odinn/policy": "workspace:*",
+    "@odinn/store-file": "workspace:*"
   }
 }

@@ -69,6 +69,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:platform
+      - run: pnpm smoke:onboarding
       - run: pnpm typecheck
       - run: pnpm build
 

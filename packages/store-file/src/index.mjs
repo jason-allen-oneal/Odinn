@@ -1,6 +1,18 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir, readFile, rename, writeFile, copyFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { normalizeAuditEvent } from "@odinn/protocol";
+
+export const STORE_SCHEMA_VERSION = 1;
+
+export class StoreCorruptionError extends Error {
+  constructor(path, line, cause) {
+    super(`store is corrupted at ${path}:${line}: ${cause.message}`);
+    this.name = "StoreCorruptionError";
+    this.path = path;
+    this.line = line;
+    this.cause = cause;
+  }
+}
 
 export class FileAuditStore {
   constructor(path) {
@@ -23,10 +35,17 @@ export class FileAuditStore {
       if (error?.code === "ENOENT") return [];
       throw error;
     }
-    return content
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line));
+    return parseJsonLines(this.path, content);
+  }
+
+  async backup(destination = `${this.path}.bak`) {
+    await mkdir(dirname(destination), { recursive: true });
+    await copyFile(this.path, destination);
+    return destination;
+  }
+
+  async recover() {
+    return recoverJsonLines(this.path, (record) => normalizeAuditEvent(record));
   }
 
   async readRuns() {
@@ -116,10 +135,17 @@ export class FileRecordStore {
       if (error?.code === "ENOENT") return [];
       throw error;
     }
-    return content
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line));
+    return parseJsonLines(this.path, content).map(migrateRecord);
+  }
+
+  async backup(destination = `${this.path}.bak`) {
+    await mkdir(dirname(destination), { recursive: true });
+    await copyFile(this.path, destination);
+    return destination;
+  }
+
+  async recover() {
+    return recoverJsonLines(this.path, migrateRecord);
   }
 
   async list({ type, limit = 50 } = {}) {
@@ -138,4 +164,182 @@ export class FileRecordStore {
     const count = Number.isFinite(limit) && limit > 0 ? limit : 20;
     return filtered.slice(-count).reverse();
   }
+}
+
+export class FileJobStore {
+  constructor(path) {
+    if (!path) throw new Error("FileJobStore requires a path");
+    this.path = path;
+    this.writeChain = Promise.resolve();
+  }
+
+  async list() {
+    const state = await this.readState();
+    return Object.values(state.jobs).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  async get(id) {
+    const state = await this.readState();
+    return state.jobs[id];
+  }
+
+  async create(job) {
+    return this.mutate((state) => {
+      if (state.jobs[job.id]) throw new Error(`job already exists: ${job.id}`);
+      state.jobs[job.id] = normalizeJob(job);
+      return state.jobs[job.id];
+    });
+  }
+
+  async update(id, patch) {
+    return this.mutate((state) => {
+      const current = state.jobs[id];
+      if (!current) throw new Error(`job not found: ${id}`);
+      state.jobs[id] = normalizeJob({ ...current, ...patch, id, updatedAt: new Date().toISOString() });
+      return state.jobs[id];
+    });
+  }
+
+  async recover({ maxAttempts = 3 } = {}) {
+    return this.mutate((state) => {
+      for (const job of Object.values(state.jobs)) {
+        if (job.status !== "running") continue;
+        const attempts = Number(job.attempts ?? 0) + 1;
+        state.jobs[job.id] = normalizeJob({
+          ...job,
+          attempts,
+          status: attempts >= maxAttempts ? "failed" : "queued",
+          error: attempts >= maxAttempts ? "worker crashed or gateway stopped during execution" : undefined,
+          recoveredAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+      }
+      return Object.values(state.jobs);
+    });
+  }
+
+  async backup(destination = `${this.path}.bak`) {
+    await mkdir(dirname(destination), { recursive: true });
+    try {
+      await copyFile(this.path, destination);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      await writeFile(destination, `${JSON.stringify(emptyJobState(), null, 2)}\n`);
+    }
+    return destination;
+  }
+
+  async recoverCorruption() {
+    const backup = `${this.path}.corrupt-${Date.now()}`;
+    try {
+      await rename(this.path, backup);
+    } catch (error) {
+      if (error?.code === "ENOENT") return { recovered: false, reason: "missing" };
+      throw error;
+    }
+    await writeFile(this.path, `${JSON.stringify(emptyJobState(), null, 2)}\n`, { mode: 0o600 });
+    return { recovered: true, backup, jobs: [] };
+  }
+
+  async readState() {
+    let content;
+    try {
+      content = await readFile(this.path, "utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT") return emptyJobState();
+      throw error;
+    }
+    try {
+      const state = JSON.parse(content);
+      if (state.schemaVersion !== STORE_SCHEMA_VERSION || !state.jobs || typeof state.jobs !== "object") {
+        throw new Error(`unsupported job store schema version: ${String(state.schemaVersion)}`);
+      }
+      return state;
+    } catch (error) {
+      throw new StoreCorruptionError(this.path, 1, error);
+    }
+  }
+
+  async mutate(fn) {
+    const operation = this.writeChain.then(async () => {
+      const state = await this.readState();
+      const result = await fn(state);
+      await mkdir(dirname(this.path), { recursive: true });
+      const temporary = join(dirname(this.path), `.${this.path.split(/[\\/]/).pop()}.${process.pid}.${Date.now()}.tmp`);
+      await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+      await rename(temporary, this.path);
+      return result;
+    });
+    this.writeChain = operation.catch(() => undefined);
+    return operation;
+  }
+}
+
+function emptyJobState() {
+  return { schemaVersion: STORE_SCHEMA_VERSION, jobs: {} };
+}
+
+function normalizeJob(job) {
+  return {
+    schemaVersion: STORE_SCHEMA_VERSION,
+    id: String(job.id),
+    status: String(job.status ?? "queued"),
+    payload: job.payload && typeof job.payload === "object" ? job.payload : {},
+    createdAt: job.createdAt ?? new Date().toISOString(),
+    updatedAt: job.updatedAt ?? new Date().toISOString(),
+    startedAt: job.startedAt,
+    completedAt: job.completedAt,
+    attempts: Number(job.attempts ?? 0),
+    timeoutMs: Number(job.timeoutMs ?? 120_000),
+    result: job.result,
+    error: job.error,
+    recoveredAt: job.recoveredAt
+  };
+}
+
+function migrateRecord(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    throw new Error("record must be an object");
+  }
+  const schemaVersion = Number(record.schemaVersion ?? 1);
+  if (schemaVersion > STORE_SCHEMA_VERSION) throw new Error(`unsupported record schema version: ${schemaVersion}`);
+  return { schemaVersion: STORE_SCHEMA_VERSION, ...record };
+}
+
+function parseJsonLines(path, content) {
+  const records = [];
+  for (const [index, line] of content.split("\n").entries()) {
+    if (!line.trim()) continue;
+    try {
+      records.push(JSON.parse(line));
+    } catch (error) {
+      throw new StoreCorruptionError(path, index + 1, error);
+    }
+  }
+  return records;
+}
+
+async function recoverJsonLines(path, normalize) {
+  let content;
+  try {
+    content = await readFile(path, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { recovered: false, reason: "missing" };
+    throw error;
+  }
+  const valid = [];
+  let discarded = 0;
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      valid.push(JSON.stringify(normalize(JSON.parse(line))));
+    } catch {
+      discarded += 1;
+    }
+  }
+  const backup = `${path}.corrupt-${Date.now()}`;
+  await rename(path, backup);
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, valid.length ? `${valid.join("\n")}\n` : "", { mode: 0o600 });
+  return { recovered: true, backup, retained: valid.length, discarded };
 }

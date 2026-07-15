@@ -2,10 +2,10 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { access, copyFile, lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { access, copyFile, cp, lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { createAuditStore, createBuiltInRegistry, createOAuthAuthorizationRequest, exchangeOAuthCode, listConfiguredModels, listProviderPresets, normalizeModelConfig, oauthTokenPath, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken } from "@odinn/kernel";
+import { createAuditStore, createBuiltInRegistry, createOAuthAuthorizationRequest, exchangeOAuthCode, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeModelConfig, oauthTokenPath, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 
 const rawArgs = process.argv.slice(2);
@@ -29,6 +29,14 @@ async function main() {
       break;
     case "import":
       await importCommand(args);
+      break;
+    case "state":
+      await stateCommand(args);
+      break;
+    case "extension":
+    case "extensions":
+    case "tool":
+      await extensionCommand(args);
       break;
     case "doctor":
     case "status":
@@ -85,6 +93,13 @@ function usage() {
   odinn config security set --surface web|browser [--enabled true|false] [--allow-private-network true|false] [--allowed-domains a,b] [--blocked-domains a,b] [--require-approval true|false] [--state .odinn]
   odinn auth import openclaw [--provider openai] [--profile <id-or-email>] [--source <path>] [--state .odinn]
   odinn import openclaw|hermes [--source <path>] [--auth-only|--skills-only] [--dry-run] [--state .odinn]
+  odinn state backup --output <directory> [--state .odinn]
+  odinn state restore --input <directory> --confirm [--state .odinn]
+  odinn extension install --manifest <manifest.json> [--state .odinn]
+  odinn extension list [--state .odinn]
+  odinn extension enable --id <id> --grant <capability[,capability]> [--trust] [--allow-unsafe-sandbox] [--state .odinn]
+  odinn extension disable --id <id> [--reason <text>] [--state .odinn]
+  odinn extension rollback --id <id> [--state .odinn]
   odinn config model default <provider:model> [--state .odinn]
   odinn config model list [--state .odinn]
   odinn status [--state .odinn]
@@ -1094,6 +1109,70 @@ async function memory(args) {
     default:
       throw new Error("memory requires subcommand: remember, search, recall, browse, open, compact, correct, or curate");
   }
+}
+
+async function extensionCommand(args) {
+  const [subcommand, ...rest] = args;
+  const registry = new ExtensionRegistry(join(stateDir(rest), "extensions.json"));
+  switch (subcommand ?? "list") {
+    case "install":
+      await printJson(await registry.install(JSON.parse(await readFile(resolveInvocationPath(option(rest, "--manifest")), "utf8")), {
+        source: option(rest, "--source", "local-manifest"),
+        provenance: option(rest, "--provenance", "user-reviewed")
+      }));
+      break;
+    case "list":
+      await printJson({ extensions: await registry.list() });
+      break;
+    case "enable":
+      await printJson(await registry.enable(option(rest, "--id"), {
+        grants: splitCsv(option(rest, "--grant", "")),
+        trust: hasFlag(rest, "--trust"),
+        allowUnsafeSandbox: hasFlag(rest, "--allow-unsafe-sandbox")
+      }));
+      break;
+    case "disable":
+      await printJson(await registry.disable(option(rest, "--id"), option(rest, "--reason", "operator disabled")));
+      break;
+    case "rollback":
+      await printJson(await registry.rollback(option(rest, "--id")));
+      break;
+    default:
+      throw new Error("extension requires subcommand: install, list, enable, disable, or rollback");
+  }
+}
+
+async function stateCommand(args) {
+  const [subcommand, ...rest] = args;
+  const state = stateDir(rest);
+  if (subcommand === "backup" || subcommand === "export") {
+    const output = option(rest, "--output");
+    if (!output) throw new Error("state backup requires --output <directory>");
+    const destination = resolveInvocationPath(output);
+    if (destination === state || destination.startsWith(`${state}/`) || destination.startsWith(`${state}\\`)) {
+      throw new Error("state backup destination must not be inside the active state directory");
+    }
+    await cp(state, destination, { recursive: true, force: false, errorOnExist: true });
+    await writeFile(join(destination, "backup-manifest.json"), `${JSON.stringify({ schemaVersion: 1, source: state, createdAt: new Date().toISOString() }, null, 2)}\n`, { flag: "wx" });
+    await printJson({ ok: true, operation: "backup", source: state, destination });
+    return;
+  }
+  if (subcommand === "restore" || subcommand === "import") {
+    if (!hasFlag(rest, "--confirm")) throw new Error("state restore is destructive; pass --confirm after reviewing the backup");
+    const input = option(rest, "--input");
+    if (!input) throw new Error("state restore requires --input <directory>");
+    const source = resolveInvocationPath(input);
+    await access(source);
+    const backup = `${state}.before-restore-${Date.now()}`;
+    await cp(state, backup, { recursive: true, force: false, errorOnExist: true }).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+    await mkdir(state, { recursive: true });
+    await cp(source, state, { recursive: true, force: true });
+    await printJson({ ok: true, operation: "restore", source, destination: state, preRestoreBackup: backup });
+    return;
+  }
+  throw new Error("state requires subcommand: backup or restore");
 }
 
 async function session(args) {

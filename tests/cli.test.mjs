@@ -276,6 +276,8 @@ test("CLI exposes URL-free presets for hosted and local providers", async () => 
     transport: "openai-chat-completions"
   });
   assert.equal(byName.get("ollama").baseUrl, "http://127.0.0.1:11434/v1");
+  assert.deepEqual(byName.get("ollama").models, []);
+  assert.equal(byName.get("ollama").models.includes("llama3.2:1b"), false);
   assert.equal(byName.get("openai").auth, "oauth or api-key");
 });
 

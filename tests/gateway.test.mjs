@@ -2,7 +2,7 @@ process.env.ODINN_GATEWAY_AUTH = "off";
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { access, mkdtemp } from "node:fs/promises";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -115,6 +115,69 @@ test("gateway stops browser state changes for explicit approval", async () => {
     assert.equal(runs[0].status, "awaiting_approval");
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("gateway reuses one browser worker across sequential browser tasks", async (t) => {
+  const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
+  try {
+    await access(chromiumPath);
+  } catch {
+    t.skip(`Chromium not available at ${chromiumPath}`);
+    return;
+  }
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-browser-worker-"));
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    const tabs = await postJson(`${base}/run`, { tool: "browser.tabs", input: {} });
+    assert.equal(tabs.ok, true);
+    assert.ok(tabs.output.tabs.length >= 1);
+    const snapshot = await postJson(`${base}/run`, {
+      tool: "browser.snapshot",
+      input: { tabId: tabs.output.tabs[0].id }
+    });
+    assert.equal(snapshot.ok, true);
+    assert.equal(snapshot.output.id, tabs.output.tabs[0].id);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("gateway closes and reopens the persistent browser profile cleanly", async (t) => {
+  const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
+  try {
+    await access(chromiumPath);
+  } catch {
+    t.skip(`Chromium not available at ${chromiumPath}`);
+    return;
+  }
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-browser-restart-"));
+  const first = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve) => first.listen(0, "127.0.0.1", resolve));
+  const firstBase = `http://127.0.0.1:${first.address().port}`;
+  try {
+    const tabs = await postJson(`${firstBase}/run`, { tool: "browser.tabs", input: {} });
+    assert.equal(tabs.ok, true);
+  } finally {
+    await new Promise((resolve, reject) => first.close((error) => error ? reject(error) : resolve()));
+  }
+
+  const second = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve) => second.listen(0, "127.0.0.1", resolve));
+  const secondBase = `http://127.0.0.1:${second.address().port}`;
+  try {
+    const tabs = await postJson(`${secondBase}/run`, { tool: "browser.tabs", input: {} });
+    assert.equal(tabs.ok, true);
+    const snapshot = await postJson(`${secondBase}/run`, {
+      tool: "browser.snapshot",
+      input: { tabId: tabs.output.tabs[0].id }
+    });
+    assert.equal(snapshot.ok, true);
+  } finally {
+    await new Promise((resolve, reject) => second.close((error) => error ? reject(error) : resolve()));
   }
 });
 

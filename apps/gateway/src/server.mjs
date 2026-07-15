@@ -3,7 +3,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeModelConfig, oauthTokenPath, runPlan } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeModelConfig, oauthTokenPath } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { FileJobStore } from "@odinn/store-file";
 
@@ -29,11 +29,11 @@ export async function createGatewayServer({
   const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
   const registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, approvalStore });
   const gatewayToken = await loadGatewayToken(state);
+  const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy });
   const supervisor = new JobSupervisor({
     store: new FileJobStore(join(state, "jobs.json")),
-    execute: createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy })
+    execute: isolatedTaskExecutor
   });
-  const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy });
   const runTask = ({ task }) => isolatedTaskExecutor({ task });
   await supervisor.start();
 
@@ -89,11 +89,8 @@ export async function createGatewayServer({
         if (!original || !started?.tool || !started.data?.input) return json(response, 409, { ok: false, error: "run has no replayable task input" });
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const replayId = body.id || request.headers["idempotency-key"] || `${id}:replay:${Date.now()}`;
-        return json(response, 200, await runTask({
+        return json(response, 200, await isolatedTaskExecutor({
           task: { id: replayId, tool: started.tool, input: started.data.input, actor: "gateway-replay", reason: `replay:${id}` },
-          auditStore,
-          policy,
-          registry
         }));
       }
       if (request.method === "GET" && url.pathname === "/jobs") {
@@ -132,11 +129,8 @@ export async function createGatewayServer({
         const id = decodeURIComponent(url.pathname.slice("/approvals/".length, -"/approve".length));
         const pending = approvalStore.claim(id);
         if (!pending) return json(response, 404, { ok: false, error: "approval not found or expired" });
-        return json(response, 200, await runTask({
+        return json(response, 200, await isolatedTaskExecutor({
           task: { id: pending.runId ?? `approval:${id}`, tool: pending.tool, input: { ...pending.input, confirmed: true }, actor: "user-approved", reason: "explicit user approval" },
-          auditStore,
-          policy,
-          registry
         }));
       }
       if (request.method === "GET" && url.pathname === "/memory") {
@@ -329,12 +323,8 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname === "/plan") {
         const plan = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, await runPlan({
-          plan: { ...plan, id: plan.id ?? request.headers["idempotency-key"] },
-          auditStore,
-          policy,
-          registry,
-          actor: "gateway"
+        return json(response, 200, await isolatedTaskExecutor({
+          plan: { ...plan, id: plan.id ?? request.headers["idempotency-key"], actor: "gateway" }
         }));
       }
       return json(response, 404, { ok: false, error: "not found" });
@@ -342,6 +332,14 @@ export async function createGatewayServer({
       return json(response, error.status ?? 400, { ok: false, error: error.message });
     }
   });
+
+  const close = server.close.bind(server);
+  server.close = (callback) => {
+    Promise.allSettled([supervisor.shutdown(), isolatedTaskExecutor.shutdown?.()])
+      .then(() => close(callback))
+      .catch((error) => callback?.(error));
+    return server;
+  };
   server.on("close", () => supervisor.shutdown().catch(() => undefined));
   server.odinnAuthToken = gatewayToken;
   return server;
@@ -2971,6 +2969,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const port = Number.parseInt(process.env.ODINN_PORT ?? "18790", 10);
   const stateDir = resolve(invocationRoot(), process.env.ODINN_STATE_DIR ?? ".odinn");
   const server = await createGatewayServer({ stateDir, workspaceRoot: invocationRoot() });
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    server.close((error) => {
+      if (error) console.error(error);
+      process.exitCode = error ? 1 : 0;
+    });
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
   server.listen(port, host, () => {
     console.log(JSON.stringify({ ok: true, host, port: server.address().port, stateDir }, null, 2));
   });

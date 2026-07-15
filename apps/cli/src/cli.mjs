@@ -1398,7 +1398,7 @@ function renderOnboarding({ state, workspaceRoot, configPath, tools, allowedCapa
     `Recorded runs: ${runs.length}`,
     "",
     "Try next:",
-    "  pnpm odinn onboard --provider ollama --state .odinn",
+    "  pnpm odinn onboard --provider ollama --model <installed-model> --state .odinn",
     "  pnpm odinn onboard --provider openai --state .odinn",
     "  pnpm odinn onboard --provider openai --auth api-key --model gpt-4.1-mini --state .odinn",
     "  pnpm odinn config model default <provider:model> --state .odinn",

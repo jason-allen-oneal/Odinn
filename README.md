@@ -67,8 +67,10 @@ pnpm odinn onboard --provider openai --auth api-key
 Local models work without a cloud account:
 
 ```bash
-pnpm odinn onboard --provider ollama
+pnpm odinn onboard --provider ollama --model <installed-model>
 ```
+
+Ódinn does not assume a particular local model. Pass the model name already served by your Ollama instance.
 
 Ódinn also includes URL-free presets for OpenRouter, Groq, Together, Mistral, DeepSeek, xAI, Moonshot, Fireworks, Cerebras, Cohere, DeepInfra, NVIDIA, Z.ai, Qianfan, Volcengine, Xiaomi, Hugging Face, Venice, Chutes, LiteLLM, vLLM, SGLang, LM Studio, GitHub Copilot, xAI device OAuth, and Antigravity.
 

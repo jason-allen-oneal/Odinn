@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { access, copyFile, cp, lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { createAuditStore, createBuiltInRegistry, createOAuthAuthorizationRequest, exchangeOAuthCode, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeModelConfig, oauthTokenPath, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken } from "@odinn/kernel";
+import { createAuditStore, createBuiltInRegistry, createOAuthAuthorizationRequest, exchangeOAuthCode, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeModelConfig, oauthTokenPath, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 
 const rawArgs = process.argv.slice(2);
@@ -100,6 +100,7 @@ function usage() {
   odinn extension enable --id <id> --grant <capability[,capability]> [--trust] [--allow-unsafe-sandbox] [--state .odinn]
   odinn extension disable --id <id> [--reason <text>] [--state .odinn]
   odinn extension rollback --id <id> [--state .odinn]
+  odinn extension run --id <id> --input-json <json> [--capability <capability>] [--state .odinn]
   odinn config model default <provider:model> [--state .odinn]
   odinn config model list [--state .odinn]
   odinn status [--state .odinn]
@@ -1137,8 +1138,16 @@ async function extensionCommand(args) {
     case "rollback":
       await printJson(await registry.rollback(option(rest, "--id")));
       break;
+    case "run": {
+      const id = option(rest, "--id");
+      if (!id) throw new Error("extension run requires --id <id>");
+      const input = JSON.parse(option(rest, "--input-json", "{}"));
+      const executor = new ExtensionExecutor(registry, { workspaceRoot: invocationRoot() });
+      await printJson(await executor.invoke(id, input, { capability: option(rest, "--capability", "") }));
+      break;
+    }
     default:
-      throw new Error("extension requires subcommand: install, list, enable, disable, or rollback");
+      throw new Error("extension requires subcommand: install, list, enable, disable, rollback, or run");
   }
 }
 

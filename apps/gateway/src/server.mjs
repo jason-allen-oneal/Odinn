@@ -3,7 +3,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeModelConfig, oauthTokenPath, runPlan, runTask } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeModelConfig, oauthTokenPath, runPlan } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { FileJobStore } from "@odinn/store-file";
 
@@ -33,6 +33,8 @@ export async function createGatewayServer({
     store: new FileJobStore(join(state, "jobs.json")),
     execute: createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy })
   });
+  const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy });
+  const runTask = ({ task }) => isolatedTaskExecutor({ task });
   await supervisor.start();
 
   const server = createServer(async (request, response) => {
@@ -128,10 +130,10 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname.startsWith("/approvals/") && url.pathname.endsWith("/approve")) {
         const id = decodeURIComponent(url.pathname.slice("/approvals/".length, -"/approve".length));
-        const pending = approvalStore.take(id);
+        const pending = approvalStore.claim(id);
         if (!pending) return json(response, 404, { ok: false, error: "approval not found or expired" });
         return json(response, 200, await runTask({
-          task: { tool: pending.tool, input: { ...pending.input, confirmed: true }, actor: "user-approved", reason: "explicit user approval" },
+          task: { id: pending.runId ?? `approval:${id}`, tool: pending.tool, input: { ...pending.input, confirmed: true }, actor: "user-approved", reason: "explicit user approval" },
           auditStore,
           policy,
           registry

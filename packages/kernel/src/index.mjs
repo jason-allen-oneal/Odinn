@@ -2,7 +2,7 @@ import { hostname, platform, release } from "node:os";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
@@ -10,7 +10,7 @@ import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
 import { chromium } from "playwright-core";
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.mjs";
-export { ExtensionRegistry } from "./extensions.mjs";
+export { ExtensionRegistry, ExtensionExecutor } from "./extensions.mjs";
 
 const execFile = promisify(execFileCallback);
 
@@ -373,6 +373,25 @@ export function normalizeProviderAuth(value, providerName = "provider") {
       ? Object.fromEntries(Object.entries(auth.authorizationParams).map(([key, item]) => [key, modelString(item, "")]).filter(([, item]) => item))
       : {}
   };
+}
+
+export function normalizeUsage(value) {
+  if (!value || typeof value !== "object") return undefined;
+  const inputTokens = integerOrUndefined(value.input_tokens ?? value.prompt_tokens ?? value.inputTokens);
+  const outputTokens = integerOrUndefined(value.output_tokens ?? value.completion_tokens ?? value.outputTokens);
+  const totalTokens = integerOrUndefined(value.total_tokens ?? value.totalTokens) ?? (inputTokens !== undefined && outputTokens !== undefined ? inputTokens + outputTokens : undefined);
+  if (inputTokens === undefined && outputTokens === undefined && totalTokens === undefined) return undefined;
+  return {
+    ...(inputTokens === undefined ? {} : { inputTokens, prompt_tokens: inputTokens }),
+    ...(outputTokens === undefined ? {} : { outputTokens, completion_tokens: outputTokens }),
+    ...(totalTokens === undefined ? {} : { totalTokens, total_tokens: totalTokens }),
+    source: "provider"
+  };
+}
+
+function integerOrUndefined(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : undefined;
 }
 
 export function createOAuthAuthorizationRequest(provider, { redirectUri, state = randomBytes(24).toString("hex") } = {}) {
@@ -745,7 +764,8 @@ export function createApprovalStore({ path } = {}) {
   const refresh = () => {
     if (!path) return;
     try {
-      const records = JSON.parse(readFileSync(path, "utf8"));
+      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      const records = Array.isArray(parsed) ? parsed : parsed?.schemaVersion === 1 && Array.isArray(parsed.approvals) ? parsed.approvals : [];
       pending.clear();
       for (const record of Array.isArray(records) ? records : []) pending.set(record.id, record);
     } catch (error) {
@@ -755,31 +775,50 @@ export function createApprovalStore({ path } = {}) {
   const persist = () => {
     if (!path) return;
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `${JSON.stringify(Array.from(pending.values()), null, 2)}\n`, { mode: 0o600 });
+    const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify({ schemaVersion: 1, approvals: Array.from(pending.values()) }, null, 2)}\n`, { mode: 0o600 });
+    renameSync(temporary, path);
     chmodSync(path, 0o600);
+  };
+  const expire = () => {
+    const now = Date.now();
+    for (const [id, action] of pending) {
+      if (action.status === "pending" && action.expiresAt <= now) pending.delete(id);
+    }
   };
   return {
     create(action) {
       refresh();
       const id = prefixedId("approval");
-      pending.set(id, { id, ...action, createdAt: new Date().toISOString(), expiresAt: Date.now() + 300_000 });
+      pending.set(id, { id, ...action, status: "pending", createdAt: new Date().toISOString(), expiresAt: Date.now() + 300_000 });
       persist();
       return id;
     },
-    take(id) {
+    claim(id) {
       refresh();
+      expire();
       const action = pending.get(id);
-      if (action) pending.delete(id);
+      if (!action || action.expiresAt <= Date.now()) {
+        persist();
+        return undefined;
+      }
+      if (action.status === "approved") return action;
+      pending.set(id, { ...action, status: "approved", approvedAt: new Date().toISOString(), runId: action.runId ?? `approval:${id}` });
       persist();
-      if (action && action.expiresAt <= Date.now()) return undefined;
+      return pending.get(id);
+    },
+    take(id) {
+      const action = this.claim(id);
+      if (!action) return undefined;
+      pending.delete(id);
+      persist();
       return action;
     },
     list() {
       refresh();
-      const now = Date.now();
-      for (const [id, action] of pending) if (action.expiresAt <= now) pending.delete(id);
+      expire();
       persist();
-      return Array.from(pending.values()).map(({ input, ...action }) => ({ ...action, input: redactBrowserInput(input) }));
+      return Array.from(pending.values()).filter((action) => action.status === "pending").map(({ input, ...action }) => ({ ...action, input: redactBrowserInput(input) }));
     }
   };
 }
@@ -1008,11 +1047,13 @@ async function browserPageSnapshot(page) {
 }
 
 async function browserAction(stateDir, approvalStore, tool, input = {}, security = {}) {
-  if (security.requireApproval !== false && input.confirmed !== true && !input.snapshotId) {
+  if (security.requireApproval !== false && input.confirmed !== true) {
     const approvalId = approvalStore.create({
       type: "approval.required",
       tool,
       summary: browserActionSummary(tool, input),
+      expectedUrl: input.expectedUrl,
+      snapshotId: input.snapshotId,
       input: { ...input, confirmed: true }
     });
     return { type: "approval.required", approvalId, tool, summary: browserActionSummary(tool, input), expiresInSeconds: 300 };
@@ -1388,7 +1429,7 @@ async function chatWithModel(modelConfig, input = {}, { stateDir, signal } = {})
       content: content || "",
       toolCalls,
       id: typeof payload.id === "string" ? payload.id : undefined,
-      usage: payload.usage ?? undefined
+      usage: normalizeUsage(payload.usage)
     };
   } catch (error) {
     if (error?.name === "AbortError") throw new Error("model provider request timed out");

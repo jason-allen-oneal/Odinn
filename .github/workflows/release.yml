@@ -78,6 +78,7 @@ jobs:
           output-file: dist/release/odinn.spdx.json
       - run: pnpm release:checksums
       - run: node scripts/release/verify.mjs
+      - run: pnpm release:install-smoke
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/release/*

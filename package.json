@@ -29,7 +29,8 @@
     "benchmark:ci": "node scripts/ci/benchmark.mjs",
     "release:preflight": "node scripts/release/preflight.mjs",
     "release:package": "node scripts/release/package.mjs",
-    "release:checksums": "node scripts/release/checksums.mjs"
+    "release:checksums": "node scripts/release/checksums.mjs",
+    "release:install-smoke": "node scripts/release/install-smoke.mjs"
   },
   "license": "MIT"
 }

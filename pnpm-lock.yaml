@@ -25,6 +25,9 @@ importers:
       '@odinn/policy':
         specifier: workspace:*
         version: link:../../packages/policy
+      '@odinn/store-file':
+        specifier: workspace:*
+        version: link:../../packages/store-file
 
   packages/kernel:
     dependencies:

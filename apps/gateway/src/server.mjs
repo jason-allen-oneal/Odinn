@@ -1,9 +1,11 @@
 import { createServer } from "node:http";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, listConfiguredModels, normalizeModelConfig, oauthTokenPath, runPlan, runTask } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeModelConfig, oauthTokenPath, runPlan, runTask } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
+import { FileJobStore } from "@odinn/store-file";
 
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
 const PUBLIC_DIR = fileURLToPath(new URL("../public/", import.meta.url));
@@ -24,17 +26,32 @@ export async function createGatewayServer({
   const config = await readConfig(state);
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
   const policy = createDefaultPolicy(config.policy);
-  const approvalStore = createApprovalStore();
+  const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
   const registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, approvalStore });
+  const gatewayToken = await loadGatewayToken(state);
+  const supervisor = new JobSupervisor({
+    store: new FileJobStore(join(state, "jobs.json")),
+    execute: createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy })
+  });
+  await supervisor.start();
 
-  return createServer(async (request, response) => {
+  const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
       if (request.method === "GET" && url.pathname === "/odinn-logo.png") {
         return image(response, 200, await readFile(join(PUBLIC_DIR, "odinn-logo.png")), "image/png");
       }
       if (request.method === "GET" && url.pathname === "/") {
-        return html(response, 200, renderConsoleHtml());
+        return html(response, 200, renderConsoleHtml(), {
+          "set-cookie": `odinn_gateway_token=${encodeURIComponent(gatewayToken)}; HttpOnly; SameSite=Strict; Path=/`,
+          "x-odinn-auth": "bootstrap-cookie"
+        });
+      }
+      if (process.env.ODINN_GATEWAY_AUTH !== "off" && !authorizedRequest(request, gatewayToken)) {
+        return json(response, 401, { ok: false, error: "gateway authentication required" });
+      }
+      if (isMutatingMethod(request.method) && !validOrigin(request)) {
+        return json(response, 403, { ok: false, error: "origin rejected for control-plane mutation" });
       }
       if (request.method === "GET" && url.pathname === "/status") {
         return json(response, 200, {
@@ -63,8 +80,48 @@ export async function createGatewayServer({
         const run = await auditStore.readRun(id);
         return run ? json(response, 200, run) : json(response, 404, { ok: false, error: "run not found" });
       }
+      if (request.method === "POST" && url.pathname.startsWith("/runs/") && url.pathname.endsWith("/replay")) {
+        const id = decodeURIComponent(url.pathname.slice("/runs/".length, -"/replay".length));
+        const original = await auditStore.readRun(id);
+        const started = original?.events?.find((event) => event.type === "task.started");
+        if (!original || !started?.tool || !started.data?.input) return json(response, 409, { ok: false, error: "run has no replayable task input" });
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const replayId = body.id || request.headers["idempotency-key"] || `${id}:replay:${Date.now()}`;
+        return json(response, 200, await runTask({
+          task: { id: replayId, tool: started.tool, input: started.data.input, actor: "gateway-replay", reason: `replay:${id}` },
+          auditStore,
+          policy,
+          registry
+        }));
+      }
+      if (request.method === "GET" && url.pathname === "/jobs") {
+        return json(response, 200, { jobs: await supervisor.list() });
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/jobs/")) {
+        const id = decodeURIComponent(url.pathname.slice("/jobs/".length));
+        const job = await supervisor.get(id);
+        return job ? json(response, 200, job) : json(response, 404, { ok: false, error: "job not found" });
+      }
+      if (request.method === "POST" && url.pathname === "/jobs") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const id = body.id || request.headers["idempotency-key"] || undefined;
+        if (id) {
+          const existing = await supervisor.get(String(id));
+          if (existing) return json(response, 200, { ok: true, replayed: true, job: existing });
+        }
+        const task = body.task && typeof body.task === "object" ? body.task : body;
+        const job = await supervisor.submit({ task: { ...task, ...(id ? { id: String(id) } : {}) } }, { id: id ? String(id) : undefined, timeoutMs: body.timeoutMs });
+        return json(response, 202, { ok: true, job });
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/jobs/") && url.pathname.endsWith("/cancel")) {
+        const id = decodeURIComponent(url.pathname.slice("/jobs/".length, -"/cancel".length));
+        return json(response, 200, { ok: true, job: await supervisor.cancel(id) });
+      }
       if (request.method === "GET" && url.pathname === "/audit") {
         return json(response, 200, await auditStore.readAll());
+      }
+      if (request.method === "GET" && url.pathname === "/events") {
+        return streamAuditEvents(request, response, auditStore, url);
       }
       if (request.method === "GET" && url.pathname === "/approvals") {
         return json(response, 200, approvalStore.list());
@@ -262,15 +319,16 @@ export async function createGatewayServer({
       if (request.method === "POST" && url.pathname === "/run") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         return json(response, 200, await runTask({
-          task: { ...body, actor: body.actor ?? "gateway" },
+          task: { ...body, id: body.id ?? request.headers["idempotency-key"], actor: body.actor ?? "gateway" },
           auditStore,
           policy,
           registry
         }));
       }
       if (request.method === "POST" && url.pathname === "/plan") {
+        const plan = await readJson(request, { maxBytes: requestMaxBytes });
         return json(response, 200, await runPlan({
-          plan: await readJson(request, { maxBytes: requestMaxBytes }),
+          plan: { ...plan, id: plan.id ?? request.headers["idempotency-key"] },
           auditStore,
           policy,
           registry,
@@ -282,6 +340,73 @@ export async function createGatewayServer({
       return json(response, error.status ?? 400, { ok: false, error: error.message });
     }
   });
+  server.on("close", () => supervisor.shutdown().catch(() => undefined));
+  server.odinnAuthToken = gatewayToken;
+  return server;
+}
+
+async function loadGatewayToken(state) {
+  const path = join(state, "gateway.token");
+  try {
+    return (await readFile(path, "utf8")).trim();
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  await mkdir(state, { recursive: true });
+  const token = randomBytes(32).toString("base64url");
+  await writeFile(path, `${token}\n`, { flag: "wx", mode: 0o600 }).catch(async (error) => {
+    if (error?.code !== "EEXIST") throw error;
+  });
+  await chmod(path, 0o600);
+  return (await readFile(path, "utf8")).trim();
+}
+
+function authorizedRequest(request, expectedToken) {
+  const bearer = request.headers.authorization?.startsWith("Bearer ") ? request.headers.authorization.slice(7) : "";
+  const cookie = String(request.headers.cookie ?? "").split(";").map((item) => item.trim()).find((item) => item.startsWith("odinn_gateway_token="))?.slice("odinn_gateway_token=".length) ?? "";
+  let decodedCookie = "";
+  try { decodedCookie = decodeURIComponent(cookie); } catch { return false; }
+  const presented = bearer || decodedCookie;
+  if (!presented || presented.length !== expectedToken.length) return false;
+  return timingSafeEqual(Buffer.from(presented), Buffer.from(expectedToken));
+}
+
+function isMutatingMethod(method) {
+  return ["POST", "PATCH", "PUT", "DELETE"].includes(method);
+}
+
+function validOrigin(request) {
+  const origin = request.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).origin === `http://${request.headers.host}`;
+  } catch {
+    return false;
+  }
+}
+
+async function streamAuditEvents(request, response, auditStore, url) {
+  const initial = Number.parseInt(request.headers["last-event-id"] ?? url.searchParams.get("since") ?? "-1", 10);
+  let cursor = Number.isFinite(initial) ? Math.max(-1, initial) : -1;
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-store",
+    connection: "keep-alive",
+    "x-content-type-options": "nosniff"
+  });
+  response.write("retry: 1000\n\n");
+  const poll = setInterval(async () => {
+    try {
+      const events = await auditStore.readAll();
+      for (let index = cursor + 1; index < events.length; index += 1) {
+        response.write(`id: ${index}\ndata: ${JSON.stringify(events[index])}\n\n`);
+      }
+      cursor = events.length - 1;
+    } catch (error) {
+      response.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`);
+    }
+  }, 500);
+  request.on("close", () => clearInterval(poll));
 }
 
 async function readConfig(state) {
@@ -324,11 +449,12 @@ function json(response, status, body) {
   response.end(`${JSON.stringify(body, null, 2)}\n`);
 }
 
-function html(response, status, body) {
+function html(response, status, body, extraHeaders = {}) {
   response.writeHead(status, {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
-    "x-content-type-options": "nosniff"
+    "x-content-type-options": "nosniff",
+    ...extraHeaders
   });
   response.end(body);
 }
@@ -2844,7 +2970,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const stateDir = resolve(invocationRoot(), process.env.ODINN_STATE_DIR ?? ".odinn");
   const server = await createGatewayServer({ stateDir, workspaceRoot: invocationRoot() });
   server.listen(port, host, () => {
-    console.log(JSON.stringify({ ok: true, host, port, stateDir }, null, 2));
+    console.log(JSON.stringify({ ok: true, host, port: server.address().port, stateDir }, null, 2));
   });
 }
 

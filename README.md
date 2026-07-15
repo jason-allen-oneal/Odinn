@@ -45,6 +45,8 @@ pnpm odinn runs
 pnpm odinn audit
 ```
 
+The packaged release gate is stronger than the local echo smoke: CI launches the gateway as a child process, configures a local OpenAI-compatible provider endpoint, sends a model request through the gateway, and verifies the assistant response was written to the run record. See [the P0 beta ledger](docs/P0-BETA-GATES.md) for what is implemented and what is still deliberately blocked.
+
 ## Model providers
 
 The normal provider path is intentionally short:
@@ -88,6 +90,8 @@ pnpm odinn import hermes --state .odinn
 ```
 
 Secrets stay outside `config.json`. OAuth tokens live in `.odinn/oauth/` with restrictive permissions.
+
+Gateway API clients bootstrap a per-state bearer token by requesting `/` once, which sets an `HttpOnly` same-site cookie. Browser clients use that cookie automatically; scripts should send `Authorization: Bearer <token>` or the bootstrap cookie. The token is stored in `.odinn/gateway.token` with mode `0600`.
 
 ## Memory
 
@@ -141,6 +145,22 @@ pnpm odinn config security set --surface browser --require-approval false
 ```
 
 The last command weakens the default posture. That is intentional: the user owns the dangerous decision, and the configuration makes the decision visible.
+
+State lifecycle commands are explicit and recoverable:
+
+```bash
+pnpm odinn state backup --output /secure/path/odinn-backup
+pnpm odinn state restore --input /secure/path/odinn-backup --confirm
+```
+
+Extension manifests are inert until reviewed and enabled with explicit grants:
+
+```bash
+pnpm odinn extension install --manifest ./extension.json
+pnpm odinn extension enable --id example-tool --grant web.read --trust
+pnpm odinn extension disable --id example-tool
+pnpm odinn extension rollback --id example-tool
+```
 
 ## Architecture
 

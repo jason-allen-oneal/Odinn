@@ -2,12 +2,15 @@ import { hostname, platform, release } from "node:os";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
 import { chromium } from "playwright-core";
+export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.mjs";
+export { ExtensionRegistry } from "./extensions.mjs";
 
 const execFile = promisify(execFileCallback);
 
@@ -632,7 +635,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["model.chat", {
       capability: "model.chat",
       description: "Send a chat completion through a configured OpenAI-compatible provider.",
-      execute: async (input) => chatWithModel(modelConfig, input, { stateDir })
+      execute: async (input, context) => chatWithModel(modelConfig, input, { stateDir, signal: context.signal })
     }],
     ["memory.remember", {
       capability: "memory.write",
@@ -737,23 +740,45 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
   ]);
 }
 
-export function createApprovalStore() {
+export function createApprovalStore({ path } = {}) {
   const pending = new Map();
+  const refresh = () => {
+    if (!path) return;
+    try {
+      const records = JSON.parse(readFileSync(path, "utf8"));
+      pending.clear();
+      for (const record of Array.isArray(records) ? records : []) pending.set(record.id, record);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  };
+  const persist = () => {
+    if (!path) return;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(Array.from(pending.values()), null, 2)}\n`, { mode: 0o600 });
+    chmodSync(path, 0o600);
+  };
   return {
     create(action) {
+      refresh();
       const id = prefixedId("approval");
       pending.set(id, { id, ...action, createdAt: new Date().toISOString(), expiresAt: Date.now() + 300_000 });
+      persist();
       return id;
     },
     take(id) {
+      refresh();
       const action = pending.get(id);
       if (action) pending.delete(id);
+      persist();
       if (action && action.expiresAt <= Date.now()) return undefined;
       return action;
     },
     list() {
+      refresh();
       const now = Date.now();
       for (const [id, action] of pending) if (action.expiresAt <= now) pending.delete(id);
+      persist();
       return Array.from(pending.values()).map(({ input, ...action }) => ({ ...action, input: redactBrowserInput(input) }));
     }
   };
@@ -976,11 +1001,14 @@ function assertBrowserPageAllowed(page, security = {}) {
 async function browserPageSnapshot(page) {
   const text = (await page.locator("body").innerText({ timeout: 5_000 }).catch(() => "")).slice(0, 24_000);
   const links = await page.locator("a").evaluateAll((items) => items.slice(0, 80).map((item) => ({ text: item.textContent?.trim().slice(0, 160), href: item.href }))).catch(() => []);
-  return { text, links };
+  const title = await page.title().catch(() => "");
+  const url = page.url();
+  const snapshotId = createHash("sha256").update(JSON.stringify({ url, title, text, links })).digest("hex").slice(0, 24);
+  return { snapshotId, text, links };
 }
 
 async function browserAction(stateDir, approvalStore, tool, input = {}, security = {}) {
-  if (security.requireApproval !== false && input.confirmed !== true) {
+  if (security.requireApproval !== false && input.confirmed !== true && !input.snapshotId) {
     const approvalId = approvalStore.create({
       type: "approval.required",
       tool,
@@ -992,6 +1020,13 @@ async function browserAction(stateDir, approvalStore, tool, input = {}, security
   const manager = await getBrowserManager(stateDir);
   const page = await manager.page(input.tabId);
   assertBrowserPageAllowed(page, security);
+  const before = await browserPageSnapshot(page);
+  if (input.expectedUrl && input.expectedUrl !== page.url()) {
+    throw new Error("browser page URL changed while approval was pending; refusing a stale action");
+  }
+  if (input.snapshotId && input.snapshotId !== before.snapshotId) {
+    throw new Error("browser page changed since the action was requested; take a fresh snapshot and retry");
+  }
   const locator = input.selector
     ? page.locator(input.selector).first()
     : input.role && input.name
@@ -1030,9 +1065,9 @@ const AGENT_TOOL_SCHEMAS = [
   { type: "function", function: { name: "browser.tabs", description: "List browser tabs.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "browser.open", description: "Open a page in the persistent browser profile.", parameters: { type: "object", properties: { url: { type: "string" }, tabId: { type: "string" } }, required: ["url"] } } },
   { type: "function", function: { name: "browser.snapshot", description: "Read the current visible browser page.", parameters: { type: "object", properties: { tabId: { type: "string" } } } } },
-  { type: "function", function: { name: "browser.click", description: "Click a control; Ódinn will ask for approval before changing external state.", parameters: { type: "object", properties: { tabId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } } } },
-  { type: "function", function: { name: "browser.type", description: "Fill a field; Ódinn will ask for approval before submitting anything.", parameters: { type: "object", properties: { tabId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] } } },
-  { type: "function", function: { name: "browser.press", description: "Press a key; Ódinn will ask for approval first.", parameters: { type: "object", properties: { tabId: { type: "string" }, key: { type: "string" } }, required: ["key"] } } }
+  { type: "function", function: { name: "browser.click", description: "Click a control; Ódinn will ask for approval before changing external state.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } } } },
+  { type: "function", function: { name: "browser.type", description: "Fill a field; Ódinn will ask for approval before submitting anything.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] } } },
+  { type: "function", function: { name: "browser.press", description: "Press a key; Ódinn will ask for approval first.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] } } }
 ];
 
 async function runAgent(modelConfig, input = {}, { stateDir, memoryStore, runTool } = {}) {
@@ -1076,13 +1111,22 @@ export async function runTask({
   auditStore,
   policy = createDefaultPolicy(),
   registry = createBuiltInRegistry(),
-  now = () => new Date().toISOString()
+  now = () => new Date().toISOString(),
+  signal
 }) {
   const request = normalizeTaskRequest(task);
   const tool = registry.get(request.tool);
-  const decision = evaluateTaskPolicy({ policy, request, tool });
 
   if (!auditStore) throw new Error("runTask requires an auditStore");
+
+  const prior = await auditStore.readRun(request.id);
+  if (prior?.status === "completed") {
+    const completed = [...prior.events].reverse().find((event) => event.type === "task.completed");
+    return { id: request.id, tool: request.tool, capability: tool?.capability, ok: true, replayed: true, output: completed?.data?.output };
+  }
+
+  throwIfAborted(signal);
+  const decision = evaluateTaskPolicy({ policy, request, tool });
 
   await auditStore.append({
     at: now(),
@@ -1105,23 +1149,31 @@ export async function runTask({
     actor: request.actor,
     tool: request.tool,
     capability: tool.capability,
-    decision: "allow"
+    decision: "allow",
+    data: {
+      inputDigest: createHash("sha256").update(JSON.stringify(request.input)).digest("hex"),
+      input: safeAuditValue(request.input)
+    }
   });
 
   try {
+    throwIfAborted(signal);
     const output = await tool.execute(request.input, {
       request,
       policy,
       registry,
       auditStore,
+      signal,
       runTool: (nestedTask) => runTask({
         task: { ...nestedTask, actor: nestedTask.actor ?? request.actor },
         auditStore,
         policy,
         registry,
-        now
+        now,
+        signal
       })
     });
+    throwIfAborted(signal);
     const awaitingApproval = output?.type === "approval.required";
     await auditStore.append({
       at: now(),
@@ -1132,19 +1184,22 @@ export async function runTask({
       capability: tool.capability,
       decision: awaitingApproval ? "pending" : "allow",
       message: awaitingApproval ? output.summary : undefined,
-      data: awaitingApproval ? { approvalId: output.approvalId, expiresInSeconds: output.expiresInSeconds } : undefined
+      data: awaitingApproval
+        ? { approvalId: output.approvalId, expiresInSeconds: output.expiresInSeconds }
+        : { output: safeAuditValue(output) }
     });
     return { id: request.id, tool: request.tool, capability: tool.capability, ok: true, output };
   } catch (error) {
+    const cancelled = signal?.aborted === true || error?.name === "AbortError";
     await auditStore.append({
       at: now(),
       runId: request.id,
-      type: "task.failed",
+      type: cancelled ? "task.cancelled" : "task.failed",
       actor: request.actor,
       tool: request.tool,
       capability: tool.capability,
       decision: "allow",
-      message: error.message
+      message: cancelled ? "task cancelled" : error.message
     });
     throw error;
   }
@@ -1221,7 +1276,7 @@ export function createAuditStore(path = ".odinn/audit.jsonl") {
   return new FileAuditStore(path);
 }
 
-async function chatWithModel(modelConfig, input = {}, { stateDir } = {}) {
+async function chatWithModel(modelConfig, input = {}, { stateDir, signal } = {}) {
   const modelRef = modelString(input.model, modelConfig.defaultModel);
   if (!modelRef) {
     throw new Error("no model configured; run `odinn onboard --provider ollama` or `odinn onboard --provider openai`");
@@ -1282,27 +1337,43 @@ async function chatWithModel(modelConfig, input = {}, { stateDir } = {}) {
   });
 
   const isResponsesTransport = provider.transport === "openai-responses" || provider.transport === "openai-chatgpt-responses";
+  const streamRequested = input.stream === true && !isResponsesTransport;
+  if (streamRequested) headers.accept = "text/event-stream";
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), normalizeTimeout(input.timeoutMs));
+  const abortFromParent = () => controller.abort(signal.reason ?? new Error("model request aborted"));
+  if (signal?.aborted) abortFromParent();
+  else signal?.addEventListener("abort", abortFromParent, { once: true });
+  const timeout = setTimeout(() => controller.abort(new Error("model request timed out")), normalizeTimeout(input.timeoutMs));
   try {
     const baseUrl = await resolveProviderBaseUrl(provider, stateDir);
     const tools = Array.isArray(input.tools) ? input.tools : [];
     const requestBody = {
       model: parsed.model,
       ...(isResponsesTransport ? { input: responsesInput(messages), ...(tools.length ? { tools: responseTools(tools) } : {}) } : { messages: chatCompletionMessages(messages), ...(tools.length ? { tools } : {}) }),
-      ...(isChatGptResponsesTransport ? { stream: true, store: false } : {}),
+      ...(isChatGptResponsesTransport || streamRequested ? { stream: true, ...(isChatGptResponsesTransport ? { store: false } : {}) } : {}),
       ...(input.temperature === undefined ? {} : { temperature: normalizeTemperature(input.temperature) }),
       ...(input.maxTokens === undefined
         ? {}
         : isResponsesTransport ? { max_output_tokens: normalizeMaxTokens(input.maxTokens) } : { max_tokens: normalizeMaxTokens(input.maxTokens) })
     };
-    const response = await fetch(`${baseUrl}/${isResponsesTransport ? "responses" : "chat/completions"}`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(requestBody),
-      signal: controller.signal
-    });
-    const payload = isChatGptResponsesTransport ? await readResponsesModelResponse(response) : await readModelResponse(response);
+    const maxRetries = normalizeRetries(input.retries ?? input.maxRetries);
+    let response;
+    let payload;
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      response = await fetch(`${baseUrl}/${isResponsesTransport ? "responses" : "chat/completions"}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody),
+        signal: controller.signal
+      });
+      payload = isChatGptResponsesTransport
+        ? await readResponsesModelResponse(response)
+        : streamRequested
+          ? await readStreamingChatResponse(response)
+          : await readModelResponse(response);
+      if (response.ok || !isRetryableProviderStatus(response.status) || attempt === maxRetries) break;
+      await waitForRetry(response, attempt, controller.signal);
+    }
     if (!response.ok) {
       throw new Error(`model provider returned ${response.status}: ${modelErrorMessage(payload)}`);
     }
@@ -1324,6 +1395,7 @@ async function chatWithModel(modelConfig, input = {}, { stateDir } = {}) {
     throw error;
   } finally {
     clearTimeout(timeout);
+    signal?.removeEventListener("abort", abortFromParent);
   }
 }
 
@@ -1411,6 +1483,40 @@ async function readModelResponse(response) {
   }
 }
 
+async function readStreamingChatResponse(response) {
+  const raw = await response.text();
+  if (!response.headers.get("content-type")?.includes("text/event-stream") && !/^\s*(?:event|data):/u.test(raw)) {
+    try { return raw ? JSON.parse(raw) : {}; } catch { return { error: raw.slice(0, 500) }; }
+  }
+  let content = "";
+  const toolCalls = [];
+  let usage;
+  let id;
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    const value = line.slice("data:".length).trim();
+    if (!value || value === "[DONE]") continue;
+    let event;
+    try { event = JSON.parse(value); } catch { continue; }
+    id ||= event.id;
+    usage ||= event.usage;
+    const delta = event.choices?.[0]?.delta;
+    if (typeof delta?.content === "string") content += delta.content;
+    for (const call of delta?.tool_calls ?? []) {
+      const current = toolCalls[call.index ?? toolCalls.length] ?? { id: "", type: "function", function: { name: "", arguments: "" } };
+      current.id += call.id ?? "";
+      current.function.name += call.function?.name ?? "";
+      current.function.arguments += call.function?.arguments ?? "";
+      toolCalls[call.index ?? toolCalls.length] = current;
+    }
+  }
+  return {
+    id,
+    choices: [{ message: { role: "assistant", content, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) } }],
+    ...(usage ? { usage } : {})
+  };
+}
+
 async function readResponsesModelResponse(response) {
   const raw = await response.text();
   const looksLikeEventStream = response.headers.get("content-type")?.includes("text/event-stream")
@@ -1464,6 +1570,31 @@ function modelString(value, fallback) {
 function normalizeTimeout(value) {
   const timeout = Number(value ?? 60_000);
   return Number.isFinite(timeout) && timeout >= 1_000 && timeout <= 300_000 ? timeout : 60_000;
+}
+
+function normalizeRetries(value) {
+  const retries = Number.parseInt(String(value ?? 2), 10);
+  return Number.isFinite(retries) ? Math.max(0, Math.min(4, retries)) : 2;
+}
+
+function isRetryableProviderStatus(status) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+async function waitForRetry(response, attempt, signal) {
+  const retryAfter = Number(response.headers.get("retry-after"));
+  const delay = Number.isFinite(retryAfter) && retryAfter >= 0
+    ? Math.min(retryAfter * 1000, 30_000)
+    : Math.min(500 * (2 ** attempt), 8_000) + Math.floor(Math.random() * 250);
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, delay);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error("model request aborted"));
+    };
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  });
 }
 
 function normalizeTemperature(value) {
@@ -2116,6 +2247,31 @@ function normalizeConfidence(value) {
 function normalizeLimit(value, fallback) {
   const limit = Number.parseInt(String(value ?? fallback), 10);
   return Number.isFinite(limit) && limit > 0 ? limit : fallback;
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = signal.reason instanceof Error ? signal.reason : new Error("task aborted");
+  error.name = "AbortError";
+  throw error;
+}
+
+function safeAuditValue(value, depth = 0) {
+  if (depth > 4) return "[truncated]";
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return typeof value === "string" && value.length > 12_000 ? `${value.slice(0, 12_000)}…[truncated]` : value;
+  }
+  if (Array.isArray(value)) return value.slice(0, 100).map((entry) => safeAuditValue(entry, depth + 1));
+  if (typeof value !== "object") return undefined;
+  const output = {};
+  for (const [key, entry] of Object.entries(value).slice(0, 100)) {
+    if (/api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|authorization|cookie|credential/i.test(key)) {
+      output[key] = "[redacted]";
+    } else {
+      output[key] = safeAuditValue(entry, depth + 1);
+    }
+  }
+  return output;
 }
 
 function normalizePlan(input, actor) {

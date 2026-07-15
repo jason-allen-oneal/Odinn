@@ -33,7 +33,7 @@ Before the first stable release:
 
 ### Secure defaults
 
-The default policy enables public web reading while blocking private-network URLs, leaves domain allowlists empty, uses a separate Chromium profile for browser work, and requires explicit approval before `browser.click`, `browser.type`, or `browser.press` can execute. Approval records expire after five minutes and are kept in memory; the corresponding request and decision are written to the audit log.
+The default policy enables public web reading while blocking private-network URLs, leaves domain allowlists empty, uses a separate Chromium profile for browser work, and requires explicit approval before `browser.click`, `browser.type`, or `browser.press` can execute. Gateway approval records expire after five minutes and are stored in the state directory with mode `0600`; the corresponding request and decision are written to the audit log. The gateway requires a per-state bearer token or same-site bootstrap cookie for control-plane access and rejects cross-origin mutations.
 
 The policy is configurable because local operators have different trust boundaries. The dangerous switches are intentionally explicit:
 
@@ -51,6 +51,7 @@ The web tools follow redirects through the same URL policy and enforce blocked/a
 
 - The local operator controls the config, provider credentials, browser login, and approval decisions.
 - Model output and imported skills are untrusted input; they cannot bypass the kernel policy evaluator.
+- Extension and MCP manifests are metadata, not trust. They are disabled by default, require provenance review, and receive only explicit capability grants when enabled.
 - Public web content is untrusted data and may contain prompt injection. Ódinn must not treat page instructions as operator authorization.
 - Browser read access is not action authorization. An external side effect requires the approval gate unless the operator explicitly disables it.
 - Loopback binding is the supported deployment. `ODINN_ALLOW_REMOTE=1` is an escape hatch for controlled experiments, not a security boundary.

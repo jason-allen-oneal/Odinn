@@ -1,3 +1,5 @@
+process.env.ODINN_GATEWAY_AUTH = "off";
+
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
@@ -138,6 +140,26 @@ test("gateway rejects invalid and oversized JSON bodies", async () => {
     });
     assert.equal(oversized.status, 413);
     assert.match((await oversized.json()).error, /exceeds 32 bytes/);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("gateway can replay a persisted task with a new id", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-replay-"));
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const original = await postJson(`${base}/run`, { id: "run_replay_source", tool: "text.echo", input: { text: "replay me" } });
+    assert.equal(original.output.text, "replay me");
+    const replay = await fetch(`${base}/runs/run_replay_source/replay`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "run_replay_copy" })
+    });
+    assert.equal(replay.status, 200);
+    assert.equal((await replay.json()).output.text, "replay me");
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }

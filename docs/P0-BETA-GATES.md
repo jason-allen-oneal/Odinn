@@ -15,7 +15,7 @@ This is the release ledger for the first local, single-user Ódinn beta. A check
 - [x] Browser approval gate, domain/private-network policy, input redaction, and stale snapshot checks when an action is based on a snapshot.
 - [ ] Durable approval transactions now survive restart and duplicate approval claims idempotently; the full page-action recovery matrix (tab loss, failed action retry, and browser restart) remains open.
 - [x] Store schema versions, atomic job writes, explicit corruption recovery, state backup, guarded restore, and persisted task output for replay.
-- [ ] Automated scheduled backup/restore drills and audit-journal key rotation.
+- [ ] Audit-journal key rotation. The nightly `storage:drill` now exercises backup, restore, and corruption recovery; key rotation remains open.
 - [x] Packaged gateway/provider smoke, onboarding smoke, checksums, SBOM/provenance workflow hooks, and cross-platform package tests.
 - [ ] Native installers and upgrade rollback testing on clean machines. Source archive extraction, dependency installation, onboarding, and CLI execution are now covered by `release:install-smoke`; native installers and upgrade rollback remain open.
 - [x] Structured audit events, run timelines, persisted output, replay endpoint, provider failure tests, and failure categorization for task lifecycle.

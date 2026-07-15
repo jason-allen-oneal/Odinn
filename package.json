@@ -26,6 +26,7 @@
     "gui:start": "pnpm --filter @odinn/gateway start",
     "smoke:inference": "node scripts/ci/inference-smoke.mjs",
     "smoke:onboarding": "node scripts/ci/onboarding-smoke.mjs",
+    "storage:drill": "node scripts/ci/storage-drill.mjs",
     "benchmark:ci": "node scripts/ci/benchmark.mjs",
     "release:preflight": "node scripts/release/preflight.mjs",
     "release:package": "node scripts/release/package.mjs",

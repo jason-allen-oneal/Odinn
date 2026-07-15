@@ -22,6 +22,8 @@ The project is a clean-room implementation. It does not copy OpenClaw, Hermes, O
 
 It is not a hosted multi-user service. Do not expose the gateway to the public internet yet. The default posture is loopback-only, private-network blocking, and approval-required browser actions.
 
+The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval claims, provider retries and usage normalization, trusted process/MCP extension adapters, cross-platform package smoke, and nightly storage recovery drills. Native installers, application upgrade rollback, audit-journal key rotation, and the full browser restart/tab-loss recovery matrix remain open. See [the P0 beta ledger](docs/P0-BETA-GATES.md).
+
 ## Quick start
 
 Requirements: Node.js 24+ and Corepack.
@@ -91,7 +93,7 @@ pnpm odinn import hermes --state .odinn
 
 Secrets stay outside `config.json`. OAuth tokens live in `.odinn/oauth/` with restrictive permissions.
 
-Gateway API clients bootstrap a per-state bearer token by requesting `/` once, which sets an `HttpOnly` same-site cookie. Browser clients use that cookie automatically; scripts should send `Authorization: Bearer <token>` or the bootstrap cookie. The token is stored in `.odinn/gateway.token` with mode `0600`.
+Gateway API clients bootstrap a per-state bearer token by requesting `/` once, which sets an `HttpOnly` same-site cookie. Browser clients use that cookie automatically; scripts should send `Authorization: Bearer <token>` or the bootstrap cookie. The token is stored in `.odinn/gateway.token` with mode `0600`. Mutating requests also require a valid same-origin request.
 
 ## Memory
 
@@ -158,9 +160,12 @@ Extension manifests are inert until reviewed and enabled with explicit grants:
 ```bash
 pnpm odinn extension install --manifest ./extension.json
 pnpm odinn extension enable --id example-tool --grant web.read --trust
+pnpm odinn extension run --id example-tool --capability web.read --input-json '{"query":"hello"}'
 pnpm odinn extension disable --id example-tool
 pnpm odinn extension rollback --id example-tool
 ```
+
+Only explicitly trusted `process` extensions can execute. Tool extensions use Ódinn's JSONL call contract; MCP extensions use a JSON-RPC `tools/call` JSONL contract. Container execution, unsandboxed execution, automatic installation, and implicit trust are not enabled by this beta.
 
 ## Architecture
 
@@ -217,6 +222,16 @@ pnpm build
 ```
 
 The beta currently targets Node.js 24 and supports Linux, macOS, and Windows paths through the platform layer.
+
+Release-package validation extracts both source archives, installs with the frozen lockfile, completes onboarding in a fresh state directory, and executes a real CLI tool from the extracted tree. Run it locally with:
+
+```bash
+pnpm release:package
+pnpm release:checksums
+node scripts/release/verify.mjs
+pnpm release:install-smoke
+pnpm storage:drill
+```
 
 ## Security
 

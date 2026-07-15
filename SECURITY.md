@@ -21,19 +21,19 @@ Reports will be acknowledged as soon as practical. Disclosure timing will be coo
 
 ## Security boundaries
 
-Ódinn's initial beta has explicit capability boundaries, append-only audit events, expiring approval records, an isolated browser profile, and local-first storage. It does not yet provide multi-user authentication or a remotely hardened control plane.
+Ódinn's initial beta has explicit capability boundaries, append-only audit events, restart-safe approval claims, isolated task workers, an isolated browser profile, durable local stores, and a local-only control plane. It does not provide multi-user authorization or a remotely hardened deployment model.
 
 Before the first stable release:
 
 - Do not expose the Gateway directly to the public internet.
-- Do not run untrusted tools, skills, MCP servers, or channel adapters.
+- Do not run unreviewed tools, skills, MCP servers, or channel adapters. Installed extensions are disabled and untrusted by default; only explicitly trusted, grant-scoped process adapters can execute in this beta.
 - Use dedicated credentials with minimal permissions.
 - Keep provider keys and channel tokens out of source control.
 - Treat generated skills and imported configuration as untrusted until reviewed.
 
 ### Secure defaults
 
-The default policy enables public web reading while blocking private-network URLs, leaves domain allowlists empty, uses a separate Chromium profile for browser work, and requires explicit approval before `browser.click`, `browser.type`, or `browser.press` can execute. Gateway approval records expire after five minutes and are stored in the state directory with mode `0600`; the corresponding request and decision are written to the audit log. The gateway requires a per-state bearer token or same-site bootstrap cookie for control-plane access and rejects cross-origin mutations.
+The default policy enables public web reading while blocking private-network URLs, leaves domain allowlists empty, uses a separate Chromium profile for browser work, and requires explicit approval before `browser.click`, `browser.type`, or `browser.press` can execute. Approval claims are persisted with atomic replacement, expire after five minutes, and use a stable run ID so duplicate approval requests do not execute the same action twice. Approval state is stored in the state directory with mode `0600`; the corresponding request and decision are written to the audit log. The gateway requires a per-state bearer token or same-site bootstrap cookie for control-plane access and rejects cross-origin mutations.
 
 The policy is configurable because local operators have different trust boundaries. The dangerous switches are intentionally explicit:
 
@@ -51,10 +51,14 @@ The web tools follow redirects through the same URL policy and enforce blocked/a
 
 - The local operator controls the config, provider credentials, browser login, and approval decisions.
 - Model output and imported skills are untrusted input; they cannot bypass the kernel policy evaluator.
-- Extension and MCP manifests are metadata, not trust. They are disabled by default, require provenance review, and receive only explicit capability grants when enabled.
+- Extension and MCP manifests are metadata, not trust. They are disabled by default, require provenance review, and receive only explicit capability grants when enabled. The process adapter validates the entrypoint stays inside the configured workspace, launches without a shell, enforces a timeout, and rejects disabled, untrusted, ungranted, container, and unsandboxed execution.
 - Public web content is untrusted data and may contain prompt injection. Ódinn must not treat page instructions as operator authorization.
 - Browser read access is not action authorization. An external side effect requires the approval gate unless the operator explicitly disables it.
 - Loopback binding is the supported deployment. `ODINN_ALLOW_REMOTE=1` is an escape hatch for controlled experiments, not a security boundary.
+
+### Known beta gaps
+
+The release ledger intentionally leaves these items open: full browser recovery after tab/process restart, audit-journal key rotation, native installers and application upgrade rollback, and remote or multi-user hosting. The source archives have cross-platform extraction/install smoke, but that is not proof of a native installer or rollback-safe upgrade. Keep Ódinn loopback-only and single-user until those boundaries are designed and tested.
 
 ## CI security gates
 

@@ -97,8 +97,12 @@ The current memory spine provides:
 
 - durable typed records for preferences, people, projects, decisions, procedures, artifacts, corrections, and system facts;
 - ranked lexical recall with subject, tag, confidence, and recency signals;
+- hierarchical namespaces such as `user/preferences`, `project/decisions`, and `sessions/<id>`;
+- three context tiers: L0 summaries, L1 durable facts, and L2 supporting evidence;
 - automatic recall injected into bounded agent turns as clearly marked context;
 - automatic extraction of strong user statements such as “remember that…”, “I prefer…”, and “we decided…”;
+- session compaction into durable L0 summaries once conversations become long;
+- namespace browsing and record inspection through the gateway, GUI, and CLI;
 - duplicate suppression, corrections/supersession, and expiry enforcement;
 - explicit `memory.recall`, `memory.remember`, `memory.search`, `memory.correct`, and `memory.curate` tools;
 - session provenance linking learned facts back to the originating turn.
@@ -113,6 +117,10 @@ pnpm odinn memory remember \
   --tags commands,ux
 
 pnpm odinn memory search --query "runnable commands"
+pnpm odinn memory recall --query "how should CLI output behave?"
+pnpm odinn memory browse --namespace user
+pnpm odinn memory open --id <memory-id>
+pnpm odinn memory compact --session <session-id>
 pnpm odinn memory curate
 ```
 

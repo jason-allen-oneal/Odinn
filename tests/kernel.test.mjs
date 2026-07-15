@@ -370,6 +370,35 @@ test("memory records are typed, searchable, curated, and superseded by correctio
   });
   assert.equal(curated.output.count, 1);
   assert.equal(curated.output.kinds.correction[0].text, "Prefer exact runnable commands with concise context.");
+
+  const browsed = await runTask({
+    task: { id: "run_memory_browse", tool: "memory.browse", input: { namespace: "user" }, actor: "test" },
+    auditStore,
+    registry
+  });
+  assert.ok(browsed.output.namespaces.some((entry) => entry.namespace === "user/preferences"));
+});
+
+test("memory compacts session context into an L0 summary", async () => {
+  const { auditStore, registry } = await fixture();
+  const session = await runTask({
+    task: { id: "run_compact_session", tool: "session.create", input: { title: "Compact me" }, actor: "test" },
+    auditStore,
+    registry
+  });
+  await runTask({
+    task: { id: "run_compact_message", tool: "session.message", input: { sessionId: session.output.id, role: "user", content: "We decided to keep the beta local-first." }, actor: "test" },
+    auditStore,
+    registry
+  });
+  const compacted = await runTask({
+    task: { id: "run_memory_compact", tool: "memory.compact", input: { sessionId: session.output.id }, actor: "test" },
+    auditStore,
+    registry
+  });
+  assert.equal(compacted.output.tier, "l0");
+  assert.equal(compacted.output.namespace, `sessions/${session.output.id}`);
+  assert.match(compacted.output.text, /local-first/);
 });
 
 test("agent auto-learns explicit facts and recalls them into later model context", async () => {

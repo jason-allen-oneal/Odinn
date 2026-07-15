@@ -76,6 +76,8 @@ test("gateway serves the local console shell", async () => {
     assert.match(html, /data-chat-prompt/);
     assert.match(html, /composer-footer/);
     assert.match(html, /renderMarkdown/);
+    assert.match(html, /memory-tree/);
+    assert.match(html, /memory-namespace/);
     assert.match(html, /Web &amp; browser/);
     assert.match(html, /web-search-run/);
     assert.match(html, /approval-gated/);
@@ -162,6 +164,9 @@ test("gateway exposes memory remember, search, correction, and curated views", a
 
     const recalled = await getJson(`${base}/memory/recall?query=preserve%20provenance`);
     assert.equal(recalled.memories[0].id, stored.id);
+
+    const browsed = await getJson(`${base}/memory/browse?namespace=project`);
+    assert.ok(browsed.namespaces.some((entry) => entry.namespace === "project/memory"));
 
     const corrected = await postJson(`${base}/memory/corrections`, {
       targetId: stored.id,

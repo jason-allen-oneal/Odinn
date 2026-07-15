@@ -103,6 +103,33 @@ export async function createGatewayServer({
           registry
         })).output);
       }
+      if (request.method === "GET" && url.pathname === "/memory/browse") {
+        const namespace = url.searchParams.get("namespace") ?? "";
+        const limit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+        return json(response, 200, (await runTask({
+          task: { tool: "memory.browse", input: { namespace, limit }, actor: "gateway" },
+          auditStore,
+          policy,
+          registry
+        })).output);
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/memory/") && !["/memory/recall", "/memory/browse", "/memory/curated"].includes(url.pathname)) {
+        const id = decodeURIComponent(url.pathname.slice("/memory/".length));
+        return json(response, 200, (await runTask({
+          task: { tool: "memory.open", input: { id }, actor: "gateway" },
+          auditStore,
+          policy,
+          registry
+        })).output);
+      }
+      if (request.method === "POST" && url.pathname === "/memory/compact") {
+        return json(response, 200, (await runTask({
+          task: { tool: "memory.compact", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
+          auditStore,
+          policy,
+          registry
+        })).output);
+      }
       if (request.method === "GET" && url.pathname === "/memory/curated") {
         return json(response, 200, (await runTask({
           task: { tool: "memory.curate", input: {}, actor: "gateway" },
@@ -1682,6 +1709,16 @@ function renderConsoleHtml() {
                 <input id="memory-subject" value="beta">
               </div>
             </div>
+            <div class="grid-2">
+              <div class="field">
+                <label for="memory-namespace">Namespace</label>
+                <input id="memory-namespace" value="project/odinn">
+              </div>
+              <div class="field">
+                <label for="memory-tier">Context tier</label>
+                <select id="memory-tier"><option value="l0">L0 · summary</option><option value="l1" selected>L1 · fact</option><option value="l2">L2 · evidence</option></select>
+              </div>
+            </div>
             <div class="field">
               <label for="memory-tags">Tags</label>
               <input id="memory-tags" value="beta,gateway">
@@ -1691,8 +1728,9 @@ function renderConsoleHtml() {
               <textarea id="memory-text">Gateway beta testing should expose clear run, audit, memory, goal, and improvement paths.</textarea>
             </div>
           </div>
-            <div class="panel stack"><div class="panel-head"><h2>Memory browser</h2><input id="memory-query" placeholder="Search subject, text, or tag"></div><div class="chip-row"><span class="chip">preference</span><span class="chip">project</span><span class="chip">decision</span><span class="chip">correction</span></div><div id="memory-list" class="list"></div></div>
+            <div class="panel stack"><div class="panel-head"><h2>Memory browser</h2><input id="memory-query" placeholder="Search subject, text, or tag"></div><div class="chip-row"><span class="chip">L0 summary</span><span class="chip">L1 fact</span><span class="chip">L2 evidence</span></div><div id="memory-list" class="list"></div></div>
           </div>
+          <div class="panel stack"><div class="panel-head"><div><h2>Context namespaces</h2><p class="muted">Durable context is organized by scope instead of becoming one undifferentiated memory swamp.</p></div><button class="secondary" id="refresh-memory-tree" type="button">Refresh</button></div><div id="memory-tree" class="record-grid"></div></div>
         </div>
       </section>
 
@@ -2386,8 +2424,12 @@ function renderConsoleHtml() {
       const data = query ? await api("/memory?query=" + encodeURIComponent(query)) : await api("/memory/curated");
       const memories = query ? (data.memories || []) : Object.values(data.kinds || {}).flat();
       $("memory-list").innerHTML = memories.slice(0, 16).map((memory) =>
-        renderRecord(memory, memory.subject || memory.kind, (memory.tags || []).join(", "), "")
+        renderRecord(memory, (memory.namespace ? memory.namespace + " · " : "") + (memory.subject || memory.kind), (memory.tier || "l1") + " · " + (memory.tags || []).join(", "), "")
       ).join("") || '<div class="muted">No memory records.</div>';
+      const tree = await api("/memory/browse");
+      $("memory-tree").innerHTML = (tree.namespaces || []).map((entry) =>
+        '<div class="item"><div class="item-line"><strong>' + escapeHtml(entry.namespace) + '</strong><span class="chip">' + escapeHtml(entry.count + " records") + '</span></div><div class="muted">' + escapeHtml(Object.entries(entry.tiers || {}).map(([tier, count]) => tier + ":" + count).join(" · ")) + '</div></div>'
+      ).join("") || '<div class="empty-state"><strong>No namespaces yet</strong><span>New durable context will appear here.</span></div>';
     }
 
     async function refreshSessions() {
@@ -2557,6 +2599,7 @@ function renderConsoleHtml() {
     });
     $("refresh-audit").addEventListener("click", refreshAudit);
     $("memory-query").addEventListener("input", () => refreshMemory().catch((error) => showOutput(error.message)));
+    $("refresh-memory-tree").addEventListener("click", () => refreshMemory().catch((error) => showOutput(error.message)));
     document.querySelectorAll(".audit-filter").forEach((button) => {
       button.addEventListener("click", () => {
         state.auditFilter = button.dataset.auditFilter || "all";
@@ -2659,6 +2702,8 @@ function renderConsoleHtml() {
           body: JSON.stringify({
             kind: $("memory-kind").value,
             subject: $("memory-subject").value,
+            namespace: $("memory-namespace").value,
+            tier: $("memory-tier").value,
             text: $("memory-text").value,
             tags: $("memory-tags").value.split(",").map((tag) => tag.trim()).filter(Boolean),
             source: "console"

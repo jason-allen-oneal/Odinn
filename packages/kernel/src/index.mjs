@@ -649,6 +649,21 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       description: "Recall ranked memories relevant to the current task.",
       execute: async (input) => recallMemory(recordStore, input)
     }],
+    ["memory.browse", {
+      capability: "memory.read",
+      description: "Browse the hierarchical memory namespace.",
+      execute: async (input) => browseMemory(recordStore, input)
+    }],
+    ["memory.open", {
+      capability: "memory.read",
+      description: "Open one durable memory record by id.",
+      execute: async (input) => openMemory(recordStore, input)
+    }],
+    ["memory.compact", {
+      capability: "memory.write",
+      description: "Compact a session into a durable context summary.",
+      execute: async (input) => compactMemory(recordStore, input)
+    }],
     ["memory.correct", {
       capability: "memory.write",
       description: "Supersede a memory record with a correction.",
@@ -1013,6 +1028,7 @@ function redactBrowserInput(input = {}) {
 const AGENT_TOOL_SCHEMAS = [
   { type: "function", function: { name: "memory.recall", description: "Recall durable user and project context relevant to the current task.", parameters: { type: "object", properties: { query: { type: "string" }, kind: { type: "string" }, limit: { type: "integer" } }, required: ["query"] } } },
   { type: "function", function: { name: "memory.remember", description: "Store an explicit user-approved fact. Only use this when the user asks to remember something or clearly states a durable preference or fact.", parameters: { type: "object", properties: { text: { type: "string" }, kind: { type: "string" }, subject: { type: "string" }, tags: { type: "array", items: { type: "string" } }, expiresAt: { type: "string" } }, required: ["text"] } } },
+  { type: "function", function: { name: "memory.browse", description: "Browse durable context namespaces before opening a specific memory.", parameters: { type: "object", properties: { namespace: { type: "string" } } } } },
   { type: "function", function: { name: "web.search", description: "Search the public web.", parameters: { type: "object", properties: { query: { type: "string" }, limit: { type: "integer" } }, required: ["query"] } } },
   { type: "function", function: { name: "web.fetch", description: "Read a public web page.", parameters: { type: "object", properties: { url: { type: "string" }, maxChars: { type: "integer" } }, required: ["url"] } } },
   { type: "function", function: { name: "browser.tabs", description: "List browser tabs.", parameters: { type: "object", properties: {} } } },
@@ -1029,18 +1045,22 @@ async function runAgent(modelConfig, input = {}, { stateDir, memoryStore, runToo
   const learned = memoryStore && memoryOptions.autoLearn
     ? await learnFromConversation(memoryStore, messages, { sessionId: input.sessionId })
     : { learned: [], skipped: [] };
+  const compacted = memoryStore && input.sessionId && memoryOptions.autoCompact && messages.length >= memoryOptions.compactAfter
+    ? await compactMemory(memoryStore, { sessionId: input.sessionId, messages })
+    : undefined;
   const latestUserMessage = [...messages].reverse().find((message) => message.role === "user");
   const recalled = memoryStore && memoryOptions.autoRecall && latestUserMessage?.content
     ? await recallMemory(memoryStore, { query: latestUserMessage.content, limit: memoryOptions.maxRecall })
     : { memories: [] };
   const systemMessage = "You are Ódinn. Use web tools for current public information. Use browser tools for private accounts only after the user has logged in. Never claim an external action completed until its tool result says so. Actions that change external state require approval. Use memory.recall when durable context is relevant. Only use memory.remember for explicit user-approved facts, preferences, or decisions.";
-  if (!messages.some((message) => message.role === "system")) messages.unshift({ role: "system", content: systemMessage });
+  const existingSystem = messages.find((message) => message.role === "system");
+  if (existingSystem) existingSystem.content = `${systemMessage}\n${existingSystem.content || ""}`.trim();
   else messages.unshift({ role: "system", content: systemMessage });
   if (recalled.memories.length) messages.splice(1, 0, { role: "system", content: formatMemoryContext(recalled.memories) });
   const maxTurns = Math.min(Math.max(Number(input.maxTurns) || 6, 1), 8);
   for (let turn = 0; turn < maxTurns; turn += 1) {
     const result = await chatWithModel(modelConfig, { model: input.model, messages, tools: AGENT_TOOL_SCHEMAS }, { stateDir });
-    if (!result.toolCalls?.length) return { ...result, memory: { recalled: recalled.memories.length, learned: learned.learned.length } };
+    if (!result.toolCalls?.length) return { ...result, memory: { recalled: recalled.memories.length, learned: learned.learned.length, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 } };
     messages.push({ role: "assistant", content: result.content || "", tool_calls: result.toolCalls });
     for (const call of result.toolCalls) {
       let args;
@@ -1463,6 +1483,7 @@ function normalizeMaxTokens(value) {
 }
 
 const MEMORY_KINDS = new Set(["project", "person", "artifact", "correction", "procedure", "decision", "preference", "system"]);
+const MEMORY_TIERS = new Set(["l0", "l1", "l2"]);
 const SESSION_ROLES = new Set(["system", "user", "assistant", "tool", "note"]);
 const GOAL_STATUSES = new Set(["active", "completed", "blocked", "paused", "cancelled"]);
 const IMPROVEMENT_DECISIONS = new Set(["approved", "rejected", "applied"]);
@@ -1473,8 +1494,11 @@ async function remember(store, input = {}) {
   if (!MEMORY_KINDS.has(kind)) throw new Error(`memory kind must be one of: ${Array.from(MEMORY_KINDS).join(", ")}`);
   const records = await store.readAll();
   const subject = cleanString(input.subject, "general");
+  const namespace = normalizeMemoryNamespace(input.namespace ?? input.path, kind, subject);
+  const tier = normalizeMemoryTier(input.tier);
+  const summary = cleanString(input.summary, text.slice(0, 280));
   const duplicate = activeMemoryRecords(records).find((record) =>
-    record.kind === kind && record.subject === subject && record.text.toLowerCase() === text.toLowerCase()
+    record.kind === kind && record.subject === subject && record.namespace === namespace && record.tier === tier && record.text.toLowerCase() === text.toLowerCase()
   );
   if (duplicate) return { ...duplicate, duplicate: true };
   return store.append({
@@ -1483,6 +1507,9 @@ async function remember(store, input = {}) {
     kind,
     status: "active",
     subject,
+    namespace,
+    tier,
+    summary,
     text,
     tags: normalizeTags(input.tags),
     source: cleanString(input.source, "local"),
@@ -1492,7 +1519,8 @@ async function remember(store, input = {}) {
     avoid: cleanString(input.avoid, ""),
     expiresAt: normalizeMemoryExpiry(input.expiresAt),
     sessionId: cleanString(input.sessionId, ""),
-    origin: input.origin && typeof input.origin === "object" ? input.origin : undefined
+    origin: input.origin && typeof input.origin === "object" ? input.origin : undefined,
+    supersedes: cleanString(input.supersedes, "") || undefined
   });
 }
 
@@ -1508,11 +1536,125 @@ async function recallMemory(store, input = {}) {
   return { query, memories, source: "odinn-memory", generatedAt: new Date().toISOString() };
 }
 
+async function browseMemory(store, input = {}) {
+  const prefix = normalizeMemoryPrefix(input.namespace ?? input.path);
+  const records = activeMemoryRecords(await store.readAll())
+    .filter((record) => !prefix || record.namespace === prefix || record.namespace.startsWith(`${prefix}/`));
+  const namespaces = new Map();
+  for (const record of records) {
+    const segments = record.namespace.split("/");
+    for (let index = 1; index <= segments.length; index += 1) {
+      const namespace = segments.slice(0, index).join("/");
+      const current = namespaces.get(namespace) ?? { namespace, count: 0, tiers: {}, kinds: {}, latestAt: record.at };
+      if (namespace === record.namespace) {
+        current.count += 1;
+        current.tiers[record.tier] = (current.tiers[record.tier] ?? 0) + 1;
+        current.kinds[record.kind] = (current.kinds[record.kind] ?? 0) + 1;
+      }
+      if (record.at > current.latestAt) current.latestAt = record.at;
+      namespaces.set(namespace, current);
+    }
+  }
+  return {
+    namespace: prefix || "",
+    namespaces: Array.from(namespaces.values()).sort((left, right) => left.namespace.localeCompare(right.namespace)),
+    records: records.slice().sort((left, right) => right.at.localeCompare(left.at)).slice(0, normalizeLimit(input.limit, 50)).map(memorySummary)
+  };
+}
+
+async function openMemory(store, input = {}) {
+  const id = cleanRequired(input.id, "memory.open requires id");
+  const record = activeMemoryRecords(await store.readAll()).find((entry) => entry.id === id);
+  if (!record) throw new Error(`memory not found: ${id}`);
+  return { memory: record };
+}
+
+async function compactMemory(store, input = {}) {
+  const sessionId = cleanRequired(input.sessionId, "memory.compact requires sessionId");
+  const records = await store.readAll();
+  const messages = Array.isArray(input.messages)
+    ? input.messages
+    : records.filter((record) => record.type === "message.appended" && record.sessionId === sessionId);
+  const summary = summarizeConversation(messages);
+  if (!summary) throw new Error(`session has no compactable messages: ${sessionId}`);
+  const previous = activeMemoryRecords(records)
+    .filter((record) => record.namespace === `sessions/${safeNamespaceSegment(sessionId)}` && record.tier === "l0")
+    .sort((left, right) => right.at.localeCompare(left.at))[0];
+  return remember(store, {
+    kind: "artifact",
+    subject: `session:${sessionId}`,
+    namespace: `sessions/${safeNamespaceSegment(sessionId)}`,
+    tier: "l0",
+    summary,
+    text: summary,
+    tags: ["session-summary", "auto-compacted"],
+    source: "session.compaction",
+    authority: "agent-derived",
+    confidence: 0.7,
+    sessionId,
+    supersedes: previous?.id,
+    origin: { messageCount: messages.length }
+  });
+}
+
+function summarizeConversation(messages) {
+  const relevant = messages
+    .filter((message) => ["user", "assistant"].includes(message?.role) && typeof message.content === "string")
+    .map((message) => `${message.role === "user" ? "User" : "Ódinn"}: ${message.content.replace(/\s+/g, " ").trim()}`)
+    .filter(Boolean);
+  if (!relevant.length) return "";
+  const tail = relevant.slice(-8).join("\n");
+  return `Session summary\n${tail.slice(0, 1800)}`;
+}
+
+function memorySummary(record) {
+  return {
+    id: record.id,
+    namespace: record.namespace,
+    tier: record.tier,
+    kind: record.kind,
+    subject: record.subject,
+    summary: record.summary,
+    tags: record.tags ?? [],
+    confidence: record.confidence,
+    source: record.source,
+    at: record.at
+  };
+}
+
+function normalizeMemoryTier(value) {
+  const tier = cleanString(value, "l1").toLowerCase();
+  if (!MEMORY_TIERS.has(tier)) throw new Error(`memory tier must be one of: ${Array.from(MEMORY_TIERS).join(", ")}`);
+  return tier;
+}
+
+function normalizeMemoryNamespace(value, kind, subject) {
+  const fallback = kind === "preference" || kind === "person" ? `user/${kind}s` : `${kind}/${subject}`;
+  return normalizeMemoryPrefix(value || fallback) || "general";
+}
+
+function normalizeMemoryPrefix(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^memory:\/\//, "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((segment) => segment.trim().replace(/[^a-zA-Z0-9._-]/g, "-").replace(/^-+|-+$/g, ""))
+    .filter(Boolean)
+    .join("/");
+}
+
+function safeNamespaceSegment(value) {
+  return String(value || "unknown").replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 120);
+}
+
 function normalizeMemoryOptions(value = {}) {
   const options = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   return {
     autoRecall: options.autoRecall !== false,
     autoLearn: options.autoLearn !== false,
+    autoCompact: options.autoCompact !== false,
+    compactAfter: Math.max(6, Math.min(Number.parseInt(String(options.compactAfter ?? 12), 10) || 12, 100)),
     maxRecall: normalizeLimit(options.maxRecall, 8)
   };
 }
@@ -1542,20 +1684,26 @@ function rankMemoryRecords(records, input = {}) {
   const queryTokens = memoryTokens(query);
   const kind = cleanString(input.kind, "");
   const subject = cleanString(input.subject, "").toLowerCase();
+  const namespace = normalizeMemoryPrefix(input.namespace ?? input.path);
   const scored = records
     .filter((record) => !kind || record.kind === kind)
     .filter((record) => !subject || String(record.subject ?? "").toLowerCase().includes(subject))
+    .filter((record) => !namespace || record.namespace === namespace || record.namespace.startsWith(`${namespace}/`))
     .map((record) => {
       const text = String(record.text || "").toLowerCase();
+      const summary = String(record.summary || "").toLowerCase();
       const recordSubject = String(record.subject || "").toLowerCase();
       const tags = (record.tags || []).map((tag) => String(tag).toLowerCase());
-      const terms = new Set(memoryTokens(`${recordSubject} ${text} ${tags.join(" ")}`));
+      const terms = new Set(memoryTokens(`${record.namespace} ${recordSubject} ${summary} ${text} ${tags.join(" ")}`));
       const matches = queryTokens.filter((token) => terms.has(token));
       let score = queryTokens.length ? matches.length / queryTokens.length : 0;
       score += query && text.includes(query.toLowerCase()) ? 2 : 0;
+      score += query && summary.includes(query.toLowerCase()) ? 1 : 0;
       score += query && recordSubject.includes(query.toLowerCase()) ? 3 : 0;
+      score += query && record.namespace.includes(query.toLowerCase()) ? 2 : 0;
       score += matches.filter((token) => recordSubject.includes(token)).length * 1.5;
       score += matches.filter((token) => tags.includes(token)).length;
+      score += record.tier === "l0" ? 0.35 : record.tier === "l1" ? 0.2 : 0.05;
       score += Math.min(Math.max(Number(record.confidence) || 0, 0), 1) * 0.25;
       score += recencyScore(record.at);
       return { ...record, score: Number(score.toFixed(4)), matchTerms: matches };
@@ -1641,6 +1789,9 @@ async function correctMemory(store, input = {}) {
     kind: "correction",
     status: "active",
     subject: target.subject ?? "general",
+    namespace: target.namespace ?? normalizeMemoryNamespace(undefined, "correction", target.subject ?? "general"),
+    tier: "l1",
+    summary: text.slice(0, 280),
     text,
     tags: normalizeTags(input.tags ?? target.tags ?? []),
     source: cleanString(input.source, "local"),
@@ -1659,7 +1810,10 @@ async function curateMemory(store, input = {}) {
     byKind[record.kind] ??= [];
     byKind[record.kind].push({
       id: record.id,
+      namespace: record.namespace,
+      tier: record.tier,
       subject: record.subject,
+      summary: record.summary,
       text: record.text,
       tags: record.tags ?? [],
       confidence: record.confidence,
@@ -1680,7 +1834,13 @@ function activeMemoryRecords(records) {
   return records.filter((record) => record.type === "memory"
     && record.status === "active"
     && !superseded.has(record.id)
-    && (!record.expiresAt || Date.parse(record.expiresAt) > now));
+    && (!record.expiresAt || Date.parse(record.expiresAt) > now))
+    .map((record) => ({
+      ...record,
+      namespace: normalizeMemoryNamespace(record.namespace, record.kind, record.subject),
+      tier: normalizeMemoryTier(record.tier),
+      summary: cleanString(record.summary, String(record.text || "").slice(0, 280))
+    }));
 }
 
 async function createSession(store, input = {}) {

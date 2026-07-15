@@ -94,8 +94,12 @@ function usage() {
   odinn audit [--state .odinn]
   odinn runs [--limit 20] [--state .odinn]
   odinn show --run <run-id> [--state .odinn]
-  odinn memory remember --text <text> [--kind project] [--subject general] [--tags a,b] [--state .odinn]
+  odinn memory remember --text <text> [--kind project] [--subject general] [--namespace path] [--tier l0|l1|l2] [--tags a,b] [--state .odinn]
   odinn memory search [--query <text>] [--kind <kind>] [--subject <text>] [--state .odinn]
+  odinn memory recall --query <text> [--namespace <path>] [--limit 8] [--state .odinn]
+  odinn memory browse [--namespace <path>] [--limit 50] [--state .odinn]
+  odinn memory open --id <memory-id> [--state .odinn]
+  odinn memory compact --session <session-id> [--state .odinn]
   odinn memory correct --target <memory-id> --text <text> [--state .odinn]
   odinn memory curate [--state .odinn]
   odinn session create [--title <title>] [--state .odinn]
@@ -118,6 +122,10 @@ Built-in tools:
   model.chat
   memory.remember
   memory.search
+  memory.recall
+  memory.browse
+  memory.open
+  memory.compact
   memory.correct
   memory.curate
   session.create
@@ -1026,6 +1034,10 @@ async function memory(args) {
       await runMemoryTool(rest, "memory.remember", {
         kind: option(rest, "--kind", "project"),
         subject: option(rest, "--subject", "general"),
+        namespace: option(rest, "--namespace", ""),
+        tier: option(rest, "--tier", "l1"),
+        summary: option(rest, "--summary", ""),
+        expiresAt: option(rest, "--expires-at", ""),
         text: option(rest, "--text"),
         tags: splitCsv(option(rest, "--tags", "")),
         source: option(rest, "--source", "cli"),
@@ -1042,6 +1054,26 @@ async function memory(args) {
         limit: Number.parseInt(option(rest, "--limit", "20"), 10)
       });
       break;
+    case "recall":
+      await runMemoryTool(rest, "memory.recall", {
+        query: option(rest, "--query"),
+        namespace: option(rest, "--namespace", ""),
+        kind: option(rest, "--kind", ""),
+        limit: Number.parseInt(option(rest, "--limit", "8"), 10)
+      });
+      break;
+    case "browse":
+      await runMemoryTool(rest, "memory.browse", {
+        namespace: option(rest, "--namespace", ""),
+        limit: Number.parseInt(option(rest, "--limit", "50"), 10)
+      });
+      break;
+    case "open":
+      await runMemoryTool(rest, "memory.open", { id: option(rest, "--id") });
+      break;
+    case "compact":
+      await runMemoryTool(rest, "memory.compact", { sessionId: option(rest, "--session") });
+      break;
     case "correct":
       await runMemoryTool(rest, "memory.correct", {
         targetId: option(rest, "--target"),
@@ -1057,7 +1089,7 @@ async function memory(args) {
       });
       break;
     default:
-      throw new Error("memory requires subcommand: remember, search, correct, or curate");
+      throw new Error("memory requires subcommand: remember, search, recall, browse, open, compact, correct, or curate");
   }
 }
 

@@ -9,8 +9,11 @@ import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/p
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
 import { chromium } from "playwright-core";
+import { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.mjs";
+import { toolSafetyDescriptor } from "./tool-safety.mjs";
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.mjs";
 export { ExtensionRegistry, ExtensionExecutor } from "./extensions.mjs";
+export { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
 
 const execFile = promisify(execFileCallback);
 
@@ -648,7 +651,8 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
         stateDir,
         memoryStore: recordStore,
         registry: context.registry,
-        runTool: context.runTool
+        runTool: context.runTool,
+        runLedger: context.runLedger
       })
     }],
     ["model.chat", {
@@ -1123,7 +1127,7 @@ const AGENT_TOOL_SCHEMAS = [
   { type: "function", function: { name: "browser.press", description: "Press a key; Ódinn will ask for approval first.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] } } }
 ];
 
-async function runAgent(modelConfig, input = {}, { stateDir, memoryStore, runTool } = {}) {
+async function runAgent(modelConfig, input = {}, { stateDir, memoryStore, runTool, runLedger } = {}) {
   const messages = Array.isArray(input.messages) ? input.messages.map((message) => ({ ...message })) : [{ role: "user", content: cleanRequired(input.prompt, "agent.run requires prompt") }];
   const memoryOptions = normalizeMemoryOptions(input.memory);
   const learned = memoryStore && memoryOptions.autoLearn
@@ -1149,7 +1153,7 @@ async function runAgent(modelConfig, input = {}, { stateDir, memoryStore, runToo
     for (const call of result.toolCalls) {
       let args;
       try { args = JSON.parse(call.arguments || "{}"); } catch { args = {}; }
-      const nested = await runTool({ tool: call.name, input: args, actor: "agent", reason: "agent tool call" });
+      const nested = await runTool({ tool: call.name, input: args, actor: "agent", reason: "agent tool call", runLedger });
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(nested.output) });
       if (nested.output?.type === "approval.required") {
         return { ...result, content: `I need your approval before I ${nested.output.summary.toLowerCase()}.`, pendingApproval: nested.output };
@@ -1165,7 +1169,8 @@ export async function runTask({
   policy = createDefaultPolicy(),
   registry = createBuiltInRegistry(),
   now = () => new Date().toISOString(),
-  signal
+  signal,
+  runLedger
 }) {
   const request = normalizeTaskRequest(task);
   const tool = registry.get(request.tool);
@@ -1179,6 +1184,19 @@ export async function runTask({
   }
 
   throwIfAborted(signal);
+  const safety = toolSafetyDescriptor(request.tool, tool);
+  let ledgerStep;
+  if (runLedger) {
+    const modelRef = typeof request.input?.model === "string" ? request.input.model : "";
+    const separator = modelRef.indexOf(":");
+    runLedger.ensureRun({
+      runId: request.id,
+      objective: request.reason ?? `execute ${request.tool}`,
+      providerId: separator > 0 ? modelRef.slice(0, separator) : "",
+      modelId: separator > 0 ? modelRef.slice(separator + 1) : modelRef
+    });
+    ledgerStep = runLedger.beginTool({ runId: request.id, toolName: request.tool, input: request.input, safety, metadata: { actor: request.actor } });
+  }
   const decision = evaluateTaskPolicy({ policy, request, tool });
 
   await auditStore.append({
@@ -1193,7 +1211,14 @@ export async function runTask({
     data: decision.details
   });
 
-  assertAllowed(decision);
+  runLedger?.recordPolicy({ runId: request.id, stepId: ledgerStep?.stepId, decision: decision.decision, reason: decision.reason, details: decision.details });
+
+  try {
+    assertAllowed(decision);
+  } catch (error) {
+    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: "blocked", error: error.message });
+    throw error;
+  }
 
   await auditStore.append({
     at: now(),
@@ -1217,13 +1242,15 @@ export async function runTask({
       registry,
       auditStore,
       signal,
+      runLedger,
       runTool: (nestedTask) => runTask({
         task: { ...nestedTask, actor: nestedTask.actor ?? request.actor },
         auditStore,
         policy,
         registry,
         now,
-        signal
+        signal,
+        runLedger: nestedTask.runLedger ?? runLedger
       })
     });
     throwIfAborted(signal);
@@ -1241,6 +1268,7 @@ export async function runTask({
         ? { approvalId: output.approvalId, expiresInSeconds: output.expiresInSeconds }
         : { output: safeAuditValue(output) }
     });
+    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, output, status: awaitingApproval ? "blocked" : "succeeded" });
     return { id: request.id, tool: request.tool, capability: tool.capability, ok: true, output };
   } catch (error) {
     const cancelled = signal?.aborted === true || error?.name === "AbortError";
@@ -1254,6 +1282,7 @@ export async function runTask({
       decision: "allow",
       message: cancelled ? "task cancelled" : error.message
     });
+    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: cancelled ? "failed" : "failed", error: cancelled ? "task cancelled" : error.message });
     throw error;
   }
 }
@@ -1264,10 +1293,14 @@ export async function runPlan({
   policy = createDefaultPolicy(),
   registry = createBuiltInRegistry(),
   actor = "local",
-  now = () => new Date().toISOString()
+  now = () => new Date().toISOString(),
+  runLedger
 }) {
   const normalized = normalizePlan(plan, actor);
   if (!auditStore) throw new Error("runPlan requires an auditStore");
+
+  runLedger?.ensureRun({ runId: normalized.id, objective: normalized.name });
+  runLedger?.appendEvent({ runId: normalized.id, type: "plan-started", payload: { name: normalized.name, steps: normalized.steps.length } });
 
   await auditStore.append({
     at: now(),
@@ -1294,7 +1327,8 @@ export async function runPlan({
         auditStore,
         policy,
         registry,
-        now
+        now,
+        runLedger
       });
       steps.push({ id: step.id, ok: true, result });
     }
@@ -1308,6 +1342,7 @@ export async function runPlan({
       decision: "allow",
       data: { name: normalized.name, steps: steps.length }
     });
+    runLedger?.appendEvent({ runId: normalized.id, type: "plan-completed", payload: { name: normalized.name, steps: steps.length } });
     return { id: normalized.id, name: normalized.name, ok: true, steps };
   } catch (error) {
     await auditStore.append({
@@ -1321,6 +1356,7 @@ export async function runPlan({
       message: error.message,
       data: { name: normalized.name, completedSteps: steps.length }
     });
+    runLedger?.appendEvent({ runId: normalized.id, type: "plan-failed", payload: { name: normalized.name, completedSteps: steps.length, error: error.message } });
     throw error;
   }
 }

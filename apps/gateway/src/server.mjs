@@ -416,7 +416,7 @@ async function readConfig(state) {
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
     await mkdir(state, { recursive: true });
-    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "" };
+    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: false, counterfactual: false } };
     await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx" }).catch((writeError) => {
       if (writeError?.code !== "EEXIST") throw writeError;
     });

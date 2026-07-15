@@ -86,6 +86,33 @@ test("CLI runs a deterministic JSON plan", async () => {
   assert.ok(summaries.some((summary) => summary.id === "plan_cli:echo" && summary.status === "completed"));
 });
 
+test("CLI run creates and inspects a durable Phase 0 ledger record", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-ledger-"));
+  const executed = spawnSync("node", [
+    "apps/cli/src/cli.mjs",
+    "run",
+    "--tool",
+    "text.echo",
+    "--input-json",
+    JSON.stringify({ text: "ODINN_CLI_LEDGER_OK" }),
+    "--state",
+    state
+  ], { cwd: root, encoding: "utf8" });
+  assert.equal(executed.status, 0, executed.stderr || executed.stdout);
+  const result = JSON.parse(executed.stdout);
+  assert.equal(result.output.text, "ODINN_CLI_LEDGER_OK");
+
+  const shown = spawnSync("node", ["apps/cli/src/cli.mjs", "run", "show", result.id, "--state", state], { cwd: root, encoding: "utf8" });
+  assert.equal(shown.status, 0, shown.stderr || shown.stdout);
+  const run = JSON.parse(shown.stdout);
+  assert.equal(run.status, "completed-unverified");
+  assert.equal(run.steps[0].type, "tool-request");
+
+  const verified = spawnSync("node", ["apps/cli/src/cli.mjs", "run", "verify", result.id, "--state", state], { cwd: root, encoding: "utf8" });
+  assert.equal(verified.status, 0, verified.stderr || verified.stdout);
+  assert.equal(JSON.parse(verified.stdout).valid, true);
+});
+
 test("CLI resolves filtered pnpm relative paths from the invocation root", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-filtered-"));
   const run = spawnSync("node", [

@@ -49,6 +49,18 @@ pnpm odinn audit
 
 The packaged release gate is stronger than the local echo smoke: CI launches the gateway as a child process, configures a local OpenAI-compatible provider endpoint, sends a model request through the gateway, and verifies the assistant response was written to the run record. See [the P0 beta ledger](docs/P0-BETA-GATES.md) for what is implemented and what is still deliberately blocked.
 
+### Phase 0 runtime ledger
+
+Every CLI and gateway tool boundary can now write a durable SQLite run ledger with ordered steps, redacted content-addressed artifacts, conservative tool-safety metadata, experimental feature flags, and a SHA-256 event chain. Inspect a run without reading raw JSONL:
+
+```bash
+pnpm odinn run show <run-id> --state .odinn
+pnpm odinn run events <run-id> --state .odinn
+pnpm odinn run verify <run-id> --state .odinn
+```
+
+This is the foundation for the candidate Proof, Rewind, Sentinel, Capsule, Darwin, Capability, and Counterfactual features. Those features remain disabled and unimplemented until their own vertical slices land. See [the event-ledger architecture note](docs/architecture/event-ledger.md).
+
 ## Model providers
 
 The normal provider path is intentionally short:

@@ -40,6 +40,9 @@ importers:
       '@odinn/store-file':
         specifier: workspace:*
         version: link:../store-file
+      '@odinn/store-sqlite':
+        specifier: workspace:*
+        version: link:../store-sqlite
       playwright-core:
         specifier: 1.61.1
         version: 1.61.1
@@ -53,6 +56,8 @@ importers:
       '@odinn/protocol':
         specifier: workspace:*
         version: link:../protocol
+
+  packages/store-sqlite: {}
 
 packages:
 

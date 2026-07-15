@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { access, copyFile, cp, lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { createAuditStore, createBuiltInRegistry, createOAuthAuthorizationRequest, exchangeOAuthCode, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeModelConfig, oauthTokenPath, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken } from "@odinn/kernel";
+import { createAuditStore, createBuiltInRegistry, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, oauthTokenPath, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 
 const rawArgs = process.argv.slice(2);
@@ -106,6 +106,9 @@ function usage() {
   odinn status [--state .odinn]
   odinn tui [--state .odinn] [--watch]
   odinn run --tool <tool> [--input-json <json>] [--input-file <json-file>] [--state .odinn]
+  odinn run show <run-id> [--state .odinn]
+  odinn run events <run-id> [--state .odinn]
+  odinn run verify <run-id> [--state .odinn]
   odinn plan --file <plan.json> [--state .odinn]
   odinn audit [--state .odinn]
   odinn runs [--limit 20] [--state .odinn]
@@ -213,6 +216,10 @@ async function status(args) {
     tools: Array.from(createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config }).keys()),
     allowedCapabilities: config.policy.allowedCapabilities,
     security: createDefaultPolicy(config.policy).security,
+    experimental: {
+      flags: normalizeExperimentalFlags(config.experimental),
+      warning: experimentalFeatureWarning(config.experimental)
+    },
     defaultModel: normalizeModelConfig(config).defaultModel,
     models,
     providers: await summarizeProviders(config, state)
@@ -1016,6 +1023,10 @@ async function tui(args) {
 }
 
 async function run(args) {
+  if (["show", "events", "verify"].includes(args[0])) {
+    await inspectRun(args);
+    return;
+  }
   const state = stateDir(args);
   const tool = option(args, "--tool");
   if (!tool) throw new Error("run requires --tool");
@@ -1023,13 +1034,19 @@ async function run(args) {
   const inputRaw = inputFile ? await readFile(resolveInvocationPath(inputFile), "utf8") : option(args, "--input-json", "{}");
   const input = JSON.parse(inputRaw);
   const config = await readConfig(state);
-  const result = await runTask({
-    task: { tool, input, actor: "cli" },
-    auditStore: createAuditStore(join(state, config.auditLog ?? "audit.jsonl")),
-    policy: createDefaultPolicy(config.policy),
-    registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config })
-  });
-  await printJson(result);
+  const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
+  try {
+    const result = await runTask({
+      task: { tool, input, actor: "cli" },
+      auditStore: createAuditStore(join(state, config.auditLog ?? "audit.jsonl")),
+      policy: createDefaultPolicy(config.policy),
+      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config }),
+      runLedger
+    });
+    await printJson(result);
+  } finally {
+    runLedger.close();
+  }
 }
 
 async function plan(args) {
@@ -1037,14 +1054,39 @@ async function plan(args) {
   const file = option(args, "--file");
   if (!file) throw new Error("plan requires --file");
   const config = await readConfig(state);
-  const result = await runPlan({
-    plan: JSON.parse(await readFile(resolveInvocationPath(file), "utf8")),
-    auditStore: createAuditStore(join(state, config.auditLog ?? "audit.jsonl")),
-    policy: createDefaultPolicy(config.policy),
-    registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config }),
-    actor: "cli"
-  });
-  await printJson(result);
+  const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
+  try {
+    const result = await runPlan({
+      plan: JSON.parse(await readFile(resolveInvocationPath(file), "utf8")),
+      auditStore: createAuditStore(join(state, config.auditLog ?? "audit.jsonl")),
+      policy: createDefaultPolicy(config.policy),
+      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config }),
+      actor: "cli",
+      runLedger
+    });
+    await printJson(result);
+  } finally {
+    runLedger.close();
+  }
+}
+
+async function inspectRun(args) {
+  const operation = args[0];
+  const rest = args.slice(1);
+  const runId = option(rest, "--run", rest.find((value) => !value.startsWith("--")));
+  if (!runId) throw new Error(`run ${operation} requires <run-id>`);
+  const state = stateDir(rest);
+  const config = await readConfig(state);
+  const ledger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
+  try {
+    const run = ledger.getRun(runId);
+    if (!run) throw new Error(`run not found: ${runId}`);
+    if (operation === "events") await printJson(run.events);
+    else if (operation === "verify") await printJson(ledger.verify(runId));
+    else await printJson(run);
+  } finally {
+    ledger.close();
+  }
 }
 
 async function memory(args) {
@@ -1298,13 +1340,19 @@ async function runMemoryTool(args, tool, input) {
 async function runRecordTool(args, tool, input) {
   const state = stateDir(args);
   const config = await readConfig(state);
-  const result = await runTask({
-    task: { tool, input, actor: "cli" },
-    auditStore: createAuditStore(join(state, config.auditLog ?? "audit.jsonl")),
-    policy: createDefaultPolicy(config.policy),
-    registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config })
-  });
-  await printJson(result.output);
+  const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
+  try {
+    const result = await runTask({
+      task: { tool, input, actor: "cli" },
+      auditStore: createAuditStore(join(state, config.auditLog ?? "audit.jsonl")),
+      policy: createDefaultPolicy(config.policy),
+      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config }),
+      runLedger
+    });
+    await printJson(result.output);
+  } finally {
+    runLedger.close();
+  }
 }
 
 async function audit(args) {
@@ -1339,7 +1387,7 @@ async function readConfig(state) {
     return JSON.parse(await readFile(path, "utf8"));
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
-    return { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "" };
+    return { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: normalizeExperimentalFlags() };
   }
 }
 

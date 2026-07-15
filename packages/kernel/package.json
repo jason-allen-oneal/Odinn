@@ -9,6 +9,7 @@
   "dependencies": {
     "@odinn/policy": "workspace:*",
     "@odinn/protocol": "workspace:*",
+    "@odinn/store-sqlite": "workspace:*",
     "@odinn/store-file": "workspace:*",
     "playwright-core": "1.61.1"
   }

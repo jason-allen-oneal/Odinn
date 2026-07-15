@@ -1,4 +1,4 @@
-import { createAuditStore, createApprovalStore, createBuiltInRegistry, closeBrowserManagers, runTask } from "./index.mjs";
+import { createAuditStore, createApprovalStore, createBuiltInRegistry, createRunLedger, closeBrowserManagers, normalizeExperimentalFlags, runTask } from "./index.mjs";
 import { join } from "node:path";
 
 let queue = Promise.resolve();
@@ -13,15 +13,19 @@ async function handle(message) {
   }
   if (message?.type !== "task") return;
   queue = queue.then(async () => {
+    let runLedger;
     try {
       const { payload, stateDir, workspaceRoot, config, policy } = message;
       const auditStore = createAuditStore(join(stateDir, config.auditLog ?? "audit.jsonl"));
       const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
       const registry = createBuiltInRegistry({ workspaceRoot, stateDir, config, approvalStore });
-      const result = await runTask({ task: payload.task, auditStore, policy, registry });
+      runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
+      const result = await runTask({ task: payload.task, auditStore, policy, registry, runLedger });
       process.send?.({ id: message.id, ok: true, result });
     } catch (error) {
       process.send?.({ id: message.id, ok: false, error: error.message });
+    } finally {
+      runLedger?.close();
     }
   });
   await queue;

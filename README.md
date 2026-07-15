@@ -59,7 +59,27 @@ pnpm odinn run events <run-id> --state .odinn
 pnpm odinn run verify <run-id> --state .odinn
 ```
 
-This is the foundation for the candidate Proof, Rewind, Sentinel, Capsule, Darwin, Capability, and Counterfactual features. Those features remain disabled and unimplemented until their own vertical slices land. See [the event-ledger architecture note](docs/architecture/event-ledger.md).
+This is the shared foundation for the experimental Proof, Rewind, Sentinel, Capsule, Darwin, Capability, and Counterfactual slices. They are disabled by default and must be enabled individually:
+
+```bash
+pnpm odinn config experimental enable proof
+pnpm odinn config experimental enable sentinel
+pnpm odinn config experimental enable capabilities
+```
+
+Use `pnpm odinn config experimental show` to inspect the posture. Read the feature notes under [docs/features](docs/features/) before enabling them. See [the event-ledger architecture note](docs/architecture/event-ledger.md).
+
+### Experimental runtime slices
+
+- **Proof** runs shell-free command and file acceptance assertions, stores bounded evidence, and is the only path that can mark a run verified.
+- **Sentinel** evaluates deterministic command, filesystem-root, and approval invariants before an operation.
+- **Capability Tokens** bind short-lived, one-use authority to a run, step, tool, and resource constraint.
+- **Rewind** snapshots selected local files and defaults to a dry-run restore preview.
+- **Capsules** export redacted ZIP-compatible run bundles with checksum verification and safe extraction.
+- **Counterfactual** creates physically isolated candidate workspaces and compares their durable run records.
+- **Darwin** scores models from recorded verification, reliability, speed, cost, and policy outcomes.
+
+These are initial local slices, not a claim that arbitrary remote effects can be reversed or perfectly replayed. Browser sessions, external mutations, nondeterministic models, and public hosting remain outside the safe beta boundary.
 
 ## Model providers
 
@@ -195,9 +215,11 @@ chat / CLI / plans
           │              ├─ OAuth / device OAuth
           │              ├─ local OpenAI-compatible servers
           │              └─ CLI adapters
-          ├── web and isolated browser tools
-          ├── durable sessions, goals, improvements
-          ├── original memory journal and ranked recall
+  ├── web and isolated browser tools
+  ├── durable sessions, goals, improvements
+  ├── original memory journal and ranked recall
+          ├── SQLite run ledger, artifacts, snapshots, and verification evidence
+          ├── Proof, Sentinel, capabilities, rewind, capsules, branches, and routing
           └── append-only audit events
 ```
 

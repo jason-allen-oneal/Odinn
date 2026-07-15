@@ -20,6 +20,20 @@ This is the release ledger for the first local, single-user Ódinn beta. A check
 - [ ] Native installers and upgrade rollback testing on clean machines. Source archive extraction, dependency installation, onboarding, and CLI execution are now covered by `release:install-smoke`; native installers and upgrade rollback remain open.
 - [x] Structured audit events, run timelines, persisted output, replay endpoint, provider failure tests, and failure categorization for task lifecycle.
 
+## Experimental runtime slices
+
+These are implemented as local vertical slices and remain disabled by default:
+
+- [x] Proof contract validation, shell-free command/file assertions, evidence artifacts, persisted assertion results, and verified/failed run transitions.
+- [x] Sentinel policy validation and pre-operation invariant decisions for denied commands, allowed roots, and approval-required tools.
+- [x] Capability tokens with local signing keys, expiry, run/step/tool binding, resource constraints, revocation, and one-use enforcement.
+- [x] Rewind snapshots with content-addressed file artifacts, dry-run previews, symlink rejection, and actual local restoration.
+- [x] Capsules with redaction, ZIP path validation, checksums, verification-only replay metadata, and tamper detection.
+- [x] Counterfactual workspace copies with independent runs, branch relationships, candidate comparison, and selection records.
+- [x] Darwin observations and transparent routing scores with uncertainty penalties and human-readable selection reasons.
+
+These slices do not claim to reverse arbitrary remote mutations, replay nondeterministic model calls, or provide multi-user isolation. Their remaining work is integration into every provider/tool path and broader platform-specific exercise.
+
 ## Required release proof
 
 The CI integration test launches `apps/gateway/src/server.mjs`, configures an OpenAI-compatible provider endpoint, calls the gateway, and verifies the response is present in the persisted run record. It does not call a cloud provider or pretend a direct fixture request is an end-to-end test.

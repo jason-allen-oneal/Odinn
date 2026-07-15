@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { access, copyFile, cp, lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { createAuditStore, createBuiltInRegistry, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, oauthTokenPath, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken } from "@odinn/kernel";
+import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 
 const rawArgs = process.argv.slice(2);
@@ -75,6 +76,36 @@ async function main() {
     case "improvements":
       await improve(args);
       break;
+    case "proof":
+      await proof(args);
+      break;
+    case "policy":
+      await policyCommand(args);
+      break;
+    case "capability":
+    case "capabilities":
+      await capabilityCommand(args);
+      break;
+    case "timeline":
+      await timeline(args);
+      break;
+    case "checkpoint":
+    case "rewind":
+      await rewindCommand(command, args);
+      break;
+    case "branch":
+    case "compare":
+      await branchCommand(command, args);
+      break;
+    case "capsule":
+      await capsuleCommand(args);
+      break;
+    case "counterfactual":
+      await counterfactualCommand(args);
+      break;
+    case "routing":
+      await routingCommand(args);
+      break;
     default:
       usage();
       process.exitCode = command ? 1 : 0;
@@ -109,6 +140,28 @@ function usage() {
   odinn run show <run-id> [--state .odinn]
   odinn run events <run-id> [--state .odinn]
   odinn run verify <run-id> [--state .odinn]
+  odinn proof run <run-id> --contract <contract.json|yml> [--state .odinn]
+  odinn proof show <run-id> [--state .odinn]
+  odinn proof contract validate <contract.json|yml>
+  odinn policy validate <policy.json|yml>
+  odinn policy test <policy.json|yml> --tool <tool> --input-json <json> [--state .odinn]
+  odinn capability issue --run <run-id> --step <step-id> --tool <tool> [--scope a,b] [--state .odinn]
+  odinn capability use --token <token> --run <run-id> --tool <tool> [--state .odinn]
+  odinn capability list <run-id> [--state .odinn]
+  odinn capability revoke <capability-id> [--state .odinn]
+  odinn timeline <run-id> [--state .odinn]
+  odinn checkpoint create <run-id> --path <path[,path]> [--label <label>] [--state .odinn]
+  odinn rewind <snapshot-id> [--apply] [--state .odinn]
+  odinn branch <run-id> --from <step-id> --plan-file <plan.json> [--state .odinn]
+  odinn compare <group-id> [--state .odinn]
+  odinn capsule export <run-id> --output <run.odinn> [--state .odinn]
+  odinn capsule inspect|verify|replay <run.odinn> [--mode verification-only|tool-mocked|full] [--state .odinn]
+  odinn counterfactual run --source-run <run-id> --from <step-id> --plan-file <plan.json> [--plan-file <plan.json>] [--state .odinn]
+  odinn counterfactual compare <group-id> [--state .odinn]
+  odinn counterfactual select <group-id> --run <run-id> [--state .odinn]
+  odinn routing observe --run <run-id> --provider <id> --model <id> --task-class <class> --verified true|false [--state .odinn]
+  odinn routing stats [--task-class <class>] [--state .odinn]
+  odinn routing choose --task-class <class> [--state .odinn]
   odinn plan --file <plan.json> [--state .odinn]
   odinn audit [--state .odinn]
   odinn runs [--limit 20] [--state .odinn]
@@ -228,13 +281,24 @@ async function status(args) {
 
 async function configCommand(args) {
   const [section, subcommand, ...rest] = args;
-  if (!["provider", "model", "security"].includes(section)) {
-    throw new Error("config requires provider, model, or security");
+  if (!["provider", "model", "security", "experimental"].includes(section)) {
+    throw new Error("config requires provider, model, security, or experimental");
   }
   const state = stateDir(rest);
   const config = await readConfig(state);
   if (section === "security") {
     await configSecurityCommand(state, config, subcommand, rest);
+    return;
+  }
+  if (section === "experimental") {
+    if (subcommand === "show" || !subcommand) { await printJson(normalizeExperimentalFlags(config.experimental)); return; }
+    if (subcommand !== "enable" && subcommand !== "disable") throw new Error("config experimental requires show, enable, or disable");
+    const feature = rest[0];
+    if (!EXPERIMENTAL_FEATURES.includes(feature)) throw new Error(`unknown experimental feature: ${feature}`);
+    config.experimental = { ...normalizeExperimentalFlags(config.experimental), [feature]: subcommand === "enable" };
+    await saveConfig(state, config);
+    console.error(experimentalFeatureWarning(config.experimental));
+    await printJson({ ok: true, feature, enabled: config.experimental[feature], warning: experimentalFeatureWarning(config.experimental) });
     return;
   }
   if (section === "provider") {
@@ -1043,6 +1107,13 @@ async function run(args) {
       registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config }),
       runLedger
     });
+    const contractPath = option(args, "--contract", "");
+    if (contractPath) {
+      const contract = parseStructuredDocument(await readFile(resolveInvocationPath(contractPath), "utf8"), contractPath);
+      const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
+      try { result.proof = await runtime.proof.run(result.id, contract, { workspaceRoot: invocationRoot() }); }
+      finally { runtime.ledger.close(); }
+    }
     await printJson(result);
   } finally {
     runLedger.close();
@@ -1355,6 +1426,105 @@ async function runRecordTool(args, tool, input) {
   }
 }
 
+function runtimeFor(args) {
+  const state = stateDir(args);
+  return { state, runtime: createDifferentiatedRuntime({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(readConfigSync(state).experimental) }) };
+}
+
+function readConfigSync(state) {
+  try { return JSON.parse(readFileSync(join(state, "config.json"), "utf8")); }
+  catch { return { experimental: normalizeExperimentalFlags() }; }
+}
+
+async function proof(args) {
+  const [subcommand, ...rest] = args;
+  if (subcommand === "contract" && rest[0] === "validate") {
+    const path = rest[1]; if (!path) throw new Error("proof contract validate requires a contract path");
+    const contract = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path); await printJson({ valid: true, contract: contract.schemaVersion === 1 ? validateVerificationContract(contract) : validateContract(contract) }); return;
+  }
+  const { runtime } = runtimeFor(rest);
+  try {
+    if (subcommand === "run") {
+      const runId = rest.find((value) => !value.startsWith("--")); const path = option(rest, "--contract"); if (!runId || !path) throw new Error("proof run requires <run-id> and --contract");
+      const contract = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path);
+      if (contract.schemaVersion === 1) {
+        if (contract.runId !== runId) throw new Error("proof contract runId must match the requested run");
+        await printJson(await new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: invocationRoot() }).verify(contract));
+      } else {
+        await printJson(await runtime.proof.run(runId, contract, { workspaceRoot: invocationRoot() }));
+      }
+      return;
+    }
+    if (subcommand === "show") { const runId = rest.find((value) => !value.startsWith("--")); if (!runId) throw new Error("proof show requires <run-id>"); await printJson(runtime.proof.show(runId)); return; }
+    throw new Error("proof requires run, show, or contract validate");
+  } finally { runtime.ledger.close(); }
+}
+
+async function policyCommand(args) {
+  const [subcommand, ...rest] = args; const path = rest.find((value) => !value.startsWith("--")); if (!path) throw new Error("policy requires a policy path");
+  const policy = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path); validatePolicy(policy);
+  if (subcommand === "validate") { await printJson({ valid: true, policy }); return; }
+  if (subcommand !== "test") throw new Error("policy requires validate or test");
+  const { runtime } = runtimeFor(rest); try { const runId = `policy-test-${randomUUID()}`; runtime.ledger.ensureRun({ runId, objective: "policy test" }); const result = runtime.sentinel.evaluate({ runId, toolName: option(rest, "--tool"), input: JSON.parse(option(rest, "--input-json", "{}")), policy }); await printJson(result); } finally { runtime.ledger.close(); }
+}
+
+async function capabilityCommand(args) {
+  const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest);
+  try {
+    if (subcommand === "issue") { const result = runtime.capabilities.issue({ runId: option(rest, "--run"), stepId: option(rest, "--step"), toolName: option(rest, "--tool"), scopes: splitCsv(option(rest, "--scope", "")), resourceConstraints: JSON.parse(option(rest, "--constraints", "{}")), expiresInMs: Number(option(rest, "--expires-ms", "60000")), maxUses: Number(option(rest, "--max-uses", "1")) }); await printJson(hasFlag(rest, "--show-token") ? result : { claims: result.claims, token: "[hidden; use --show-token only for a one-time local test]" }); return; }
+    if (subcommand === "use") { await printJson(runtime.capabilities.consume(option(rest, "--token"), { runId: option(rest, "--run"), toolName: option(rest, "--tool"), resource: JSON.parse(option(rest, "--resource", "{}")) })); return; }
+    if (subcommand === "list") { await printJson(runtime.capabilities.list(rest.find((value) => !value.startsWith("--")))); return; }
+    if (subcommand === "revoke") { await printJson(runtime.capabilities.revoke(rest.find((value) => !value.startsWith("--")))); return; }
+    throw new Error("capability requires issue, use, list, or revoke");
+  } finally { runtime.ledger.close(); }
+}
+
+async function timeline(args) {
+  const { runtime } = runtimeFor(args); try { const runId = args.find((value) => !value.startsWith("--")); const run = runtime.ledger.getRun(runId); if (!run) throw new Error(`run not found: ${runId}`); await printJson({ run: runtime.ledger.hydrateRun ? runtime.ledger.hydrateRun : undefined, steps: run.steps, events: run.events }); } finally { runtime.ledger.close(); }
+}
+
+async function rewindCommand(command, args) {
+  const { runtime } = runtimeFor(args); try {
+    if (command === "checkpoint") { if (args[0] !== "create") throw new Error("checkpoint requires create"); const runId = args[1] && !args[1].startsWith("--") ? args[1] : option(args, "--run"); await printJson(runtime.snapshots.create({ runId, paths: splitCsv(option(args, "--path", "")), label: option(args, "--label", "checkpoint"), workspaceRoot: invocationRoot() })); return; }
+    const snapshotId = args.find((value) => !value.startsWith("--")); if (!snapshotId) throw new Error("rewind requires <snapshot-id>"); await printJson(runtime.snapshots.restore(snapshotId, { apply: hasFlag(args, "--apply") }));
+  } finally { runtime.ledger.close(); }
+}
+
+async function branchCommand(command, args) {
+  const { runtime } = runtimeFor(args); try {
+    if (command === "branch") { const path = option(args, "--plan-file"); const plan = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path); await printJson(await runtime.counterfactual.create({ sourceRunId: args[0], sourceStepId: option(args, "--from"), plans: [plan], workspaceRoot: invocationRoot() })); return; }
+    await printJson(runtime.counterfactual.compare(args[0]));
+  } finally { runtime.ledger.close(); }
+}
+
+async function capsuleCommand(args) {
+  const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); try {
+    const path = rest.find((value) => !value.startsWith("--"));
+    if (subcommand === "export") await printJson(await runtime.capsules.export(path, { output: option(rest, "--output") }));
+    else if (subcommand === "inspect" || subcommand === "verify") await printJson(await runtime.capsules.verify(path));
+    else if (subcommand === "replay") await printJson(await runtime.capsules.replay(path, { mode: option(rest, "--mode", "verification-only"), workspace: option(rest, "--workspace", "") }));
+    else throw new Error("capsule requires export, inspect, verify, or replay");
+  } finally { runtime.ledger.close(); }
+}
+
+async function counterfactualCommand(args) {
+  const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); try {
+    if (subcommand === "run") { const files = []; for (let i = 0; i < rest.length; i += 1) if (rest[i] === "--plan-file") files.push(rest[i + 1]); await printJson(await runtime.counterfactual.create({ sourceRunId: option(rest, "--source-run"), sourceStepId: option(rest, "--from"), plans: await Promise.all(files.map(async (file) => parseStructuredDocument(await readFile(resolveInvocationPath(file), "utf8"), file))), workspaceRoot: invocationRoot() })); return; }
+    if (subcommand === "compare") { await printJson(runtime.counterfactual.compare(rest[0])); return; }
+    if (subcommand === "select") { await printJson(runtime.counterfactual.select(rest[0], option(rest, "--run"))); return; }
+    throw new Error("counterfactual requires run, compare, or select");
+  } finally { runtime.ledger.close(); }
+}
+
+async function routingCommand(args) {
+  const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); try {
+    if (subcommand === "observe") { await printJson(runtime.darwin.observe({ runId: option(rest, "--run"), providerId: option(rest, "--provider"), modelId: option(rest, "--model"), taskClass: option(rest, "--task-class", "general"), verified: option(rest, "--verified") === "true", partiallyVerified: option(rest, "--partial") === "true", durationMs: Number(option(rest, "--duration-ms", "0")), costUsd: Number(option(rest, "--cost-usd", "0")), toolCalls: Number(option(rest, "--tool-calls", "0")), toolErrors: Number(option(rest, "--tool-errors", "0")), retries: Number(option(rest, "--retries", "0")), policyViolations: Number(option(rest, "--policy-violations", "0")), rolledBack: hasFlag(rest, "--rolled-back") })); return; }
+    if (subcommand === "stats") { await printJson(runtime.darwin.stats(option(rest, "--task-class", "general"))); return; }
+    if (subcommand === "choose") { await printJson(runtime.darwin.choose(option(rest, "--task-class", "general"), { pinnedModel: option(rest, "--model", "") })); return; }
+    throw new Error("routing requires observe, stats, or choose");
+  } finally { runtime.ledger.close(); }
+}
+
 async function audit(args) {
   const state = stateDir(args);
   const config = await readConfig(state);
@@ -1399,7 +1569,8 @@ async function ensureConfig(state) {
     policy: createDefaultPolicy(),
     auditLog: "audit.jsonl",
     providers: {},
-    defaultModel: ""
+    defaultModel: "",
+    experimental: normalizeExperimentalFlags()
   }, null, 2)}\n`, { flag: "wx" }).catch((error) => {
     if (error?.code !== "EEXIST") throw error;
   });
@@ -1413,6 +1584,7 @@ async function saveConfig(state, config) {
     policy: config.policy ?? createDefaultPolicy(),
     auditLog: config.auditLog ?? "audit.jsonl",
     providers: config.providers ?? {},
+    experimental: normalizeExperimentalFlags(config.experimental),
     ...(config.defaultModel ? { defaultModel: config.defaultModel } : {})
   }, null, 2)}\n`);
 }

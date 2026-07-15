@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 
-export const SQLITE_SCHEMA_VERSION = 1;
+export const SQLITE_SCHEMA_VERSION = 2;
 
 const SECRET_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|credential|password|secret|private[_-]?key)/i;
 const SECRET_VALUE = /Bearer\s+[A-Za-z0-9._~+\/-]+|(?:sk|rk)-[A-Za-z0-9_-]{12,}/g;
@@ -83,6 +83,156 @@ const MIGRATIONS = [
   CREATE INDEX IF NOT EXISTS idx_run_steps_run ON run_steps(run_id, sequence);
   CREATE INDEX IF NOT EXISTS idx_ledger_events_run ON ledger_events(run_id, sequence);
   CREATE INDEX IF NOT EXISTS idx_ledger_events_type ON ledger_events(type, timestamp);`
+  ,
+  `CREATE TABLE IF NOT EXISTS verification_contracts (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    version INTEGER NOT NULL,
+    contract_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, id)
+  );
+  CREATE TABLE IF NOT EXISTS assertion_results (
+    id TEXT PRIMARY KEY,
+    contract_id TEXT NOT NULL REFERENCES verification_contracts(id),
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    assertion_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    evidence_artifact_ids_json TEXT NOT NULL,
+    message TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    UNIQUE(contract_id, assertion_id)
+  );
+  CREATE TABLE IF NOT EXISTS policies (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    policy_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS policy_evaluations (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    step_id TEXT,
+    policy_id TEXT,
+    invariant_id TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    enforcement TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS capabilities (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    step_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    scopes_json TEXT NOT NULL,
+    constraints_json TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    max_uses INTEGER NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0,
+    approval_id TEXT,
+    nonce TEXT NOT NULL UNIQUE,
+    revoked_at TEXT,
+    status TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS capability_uses (
+    id TEXT PRIMARY KEY,
+    capability_id TEXT NOT NULL REFERENCES capabilities(id),
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    tool_name TEXT NOT NULL,
+    resource_json TEXT NOT NULL,
+    used_at TEXT NOT NULL,
+    ok INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS snapshots (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    step_id TEXT,
+    label TEXT,
+    workspace_root TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS snapshot_entries (
+    id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES snapshots(id),
+    path TEXT NOT NULL,
+    existed INTEGER NOT NULL,
+    mode INTEGER,
+    digest TEXT,
+    artifact_digest TEXT,
+    UNIQUE(snapshot_id, path)
+  );
+  CREATE TABLE IF NOT EXISTS run_branches (
+    id TEXT PRIMARY KEY,
+    source_run_id TEXT NOT NULL REFERENCES runs(id),
+    source_step_id TEXT NOT NULL,
+    child_run_id TEXT NOT NULL REFERENCES runs(id),
+    label TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(source_run_id, child_run_id)
+  );
+  CREATE TABLE IF NOT EXISTS compensation_actions (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    step_id TEXT NOT NULL,
+    handler TEXT NOT NULL,
+    status TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    output_json TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+  );
+  CREATE TABLE IF NOT EXISTS capsules (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    path TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS model_observations (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    provider_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    task_class TEXT NOT NULL,
+    verified INTEGER NOT NULL,
+    partially_verified INTEGER NOT NULL,
+    cost_usd REAL,
+    duration_ms INTEGER NOT NULL,
+    tool_calls INTEGER NOT NULL,
+    tool_errors INTEGER NOT NULL,
+    retries INTEGER NOT NULL,
+    policy_violations INTEGER NOT NULL,
+    rolled_back INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS counterfactual_groups (
+    id TEXT PRIMARY KEY,
+    source_run_id TEXT NOT NULL REFERENCES runs(id),
+    contract_id TEXT,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS counterfactual_candidates (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES counterfactual_groups(id),
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    plan_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    selected_at TEXT,
+    UNIQUE(group_id, run_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_assertion_results_run ON assertion_results(run_id, completed_at);
+  CREATE INDEX IF NOT EXISTS idx_policy_evaluations_run ON policy_evaluations(run_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_capabilities_run ON capabilities(run_id, status);
+  CREATE INDEX IF NOT EXISTS idx_snapshots_run ON snapshots(run_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_model_observations_model ON model_observations(provider_id, model_id, task_class);`
 ];
 
 export class SqliteStore {

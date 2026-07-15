@@ -13,6 +13,8 @@ import { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, nor
 import { toolSafetyDescriptor } from "./tool-safety.mjs";
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.mjs";
 export { ExtensionRegistry, ExtensionExecutor } from "./extensions.mjs";
+export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.mjs";
+export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.mjs";
 export { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
 
 const execFile = promisify(execFileCallback);

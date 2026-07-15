@@ -92,6 +92,17 @@ export async function createGatewayServer({
           registry
         })).output);
       }
+      if (request.method === "GET" && url.pathname === "/memory/recall") {
+        const query = url.searchParams.get("query") ?? "";
+        const kind = url.searchParams.get("kind") ?? "";
+        const limit = Number.parseInt(url.searchParams.get("limit") ?? "8", 10);
+        return json(response, 200, (await runTask({
+          task: { tool: "memory.recall", input: { query, kind, limit }, actor: "gateway" },
+          auditStore,
+          policy,
+          registry
+        })).output);
+      }
       if (request.method === "GET" && url.pathname === "/memory/curated") {
         return json(response, 200, (await runTask({
           task: { tool: "memory.curate", input: {}, actor: "gateway" },
@@ -2186,6 +2197,7 @@ function renderConsoleHtml() {
             tool: "agent.run",
             input: {
               model: state.modelOverride || state.status?.defaultModel,
+              sessionId,
               messages: [...state.messages, { role: "user", content }]
                 .filter((message) => ["user", "assistant", "system", "tool"].includes(message.role))
                 .map((message) => ({ role: message.role, content: message.content }))

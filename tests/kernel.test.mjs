@@ -372,6 +372,74 @@ test("memory records are typed, searchable, curated, and superseded by correctio
   assert.equal(curated.output.kinds.correction[0].text, "Prefer exact runnable commands with concise context.");
 });
 
+test("agent auto-learns explicit facts and recalls them into later model context", async () => {
+  const requests = [];
+  const provider = createHttpServer(async (request, response) => {
+    let raw = "";
+    for await (const chunk of request) raw += chunk;
+    requests.push(JSON.parse(raw));
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: `agent_${requests.length}`,
+      choices: [{ message: { role: "assistant", content: "Memory-aware response." } }]
+    }));
+  });
+  await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
+  const { port } = provider.address();
+  const { root, auditStore } = await fixture();
+  const registry = createBuiltInRegistry({
+    workspaceRoot: root,
+    stateDir: join(root, ".odinn"),
+    config: {
+      defaultModel: "test:test-model",
+      providers: {
+        test: {
+          type: "openai-compatible",
+          baseUrl: `http://127.0.0.1:${port}/v1`,
+          models: ["test-model"]
+        }
+      }
+    }
+  });
+  try {
+    const learned = await runTask({
+      task: {
+        id: "run_agent_learn",
+        tool: "agent.run",
+        input: {
+          model: "test:test-model",
+          sessionId: "sess_memory",
+          messages: [{ role: "user", content: "Remember that I prefer dark themes." }]
+        },
+        actor: "test"
+      },
+      auditStore,
+      registry
+    });
+    assert.equal(learned.output.memory.learned, 1);
+
+    const recalled = await runTask({
+      task: {
+        id: "run_agent_recall",
+        tool: "agent.run",
+        input: {
+          model: "test:test-model",
+          sessionId: "sess_memory",
+          messages: [{ role: "user", content: "What visual style do I prefer?" }]
+        },
+        actor: "test"
+      },
+      auditStore,
+      registry
+    });
+    assert.equal(recalled.output.memory.recalled, 1);
+    const contextMessage = requests[1].messages.find((message) => message.content.includes("Durable context recalled"));
+    assert.match(contextMessage.content, /dark themes/);
+  } finally {
+    await new Promise((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test("kernel records sessions, goals, and self-improvement proposals", async () => {
   const { auditStore, registry } = await fixture();
 

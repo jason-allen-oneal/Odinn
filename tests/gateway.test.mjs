@@ -160,6 +160,9 @@ test("gateway exposes memory remember, search, correction, and curated views", a
     const found = await getJson(`${base}/memory?query=provenance`);
     assert.equal(found.memories[0].id, stored.id);
 
+    const recalled = await getJson(`${base}/memory/recall?query=preserve%20provenance`);
+    assert.equal(recalled.memories[0].id, stored.id);
+
     const corrected = await postJson(`${base}/memory/corrections`, {
       targetId: stored.id,
       text: "Memory records must preserve provenance and supersession.",

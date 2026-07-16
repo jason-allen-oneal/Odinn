@@ -3,6 +3,9 @@ import { spawn } from "node:child_process";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { redact } from "@odinn/store-sqlite";
+import type { RunLedger } from "@odinn/store-sqlite";
+import type { JsonObject } from "@odinn/protocol";
+import type { DatabaseSync } from "node:sqlite";
 
 export const PROOF_CONTRACT_SCHEMA_VERSION = 1;
 
@@ -20,31 +23,47 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 const DEFAULT_MAX_FILE_BYTES = 1_000_000;
 
-function isPlainObject(value) {
+type NodeError = Error & { code?: string };
+type Matcher = { equals: string } | { contains: string } | { matches: string; flags?: string };
+interface CommandAssertion { id: string; type: "command"; command: string[]; cwd?: string; timeoutMs: number; expect: { exitCode: number; stdout?: Matcher; stderr?: Matcher } }
+interface FileAssertion { id: string; type: "file"; path: string; expect: { exists: boolean; content?: Matcher } }
+interface HttpAssertion { id: string; type: "http"; url: string; method: "GET" | "HEAD"; timeoutMs: number; expect: { status: number; body?: Matcher } }
+interface GitAssertion { id: string; type: "git"; cwd?: string; expect: { clean: boolean } }
+export type ProofAssertion = CommandAssertion | FileAssertion | HttpAssertion | GitAssertion;
+export interface VerificationContract { schemaVersion: number; id: string; runId: string; description?: string; assertions: ProofAssertion[] }
+interface ProcessResult extends JsonObject { startedAt: string; completedAt: string; exitCode: number | null; signal?: string; stdout: string; stderr: string; timedOut: boolean; outputLimitExceeded: boolean; error?: string }
+interface AssertionResult { id: string; type: ProofAssertion["type"]; status: "passed" | "failed"; passed: boolean; message: string; expected: unknown; actual: JsonObject; startedAt: string; completedAt: string }
+interface StoredArtifact { digest: string; path: string; mediaType: string; sizeBytes: number }
+interface ProofVerifierOptions { runLedger: RunLedger; allowedRoot?: string; maxOutputBytes?: number; maxFileBytes?: number; allowExternalHttp?: boolean }
+
+const asObject = (value: unknown): JsonObject => value as JsonObject;
+const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
+
+function isPlainObject(value: unknown): value is JsonObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
 }
 
-function assertObject(value, label) {
+function assertObject(value: unknown, label: string): asserts value is JsonObject {
   if (!isPlainObject(value)) throw new TypeError(`${label} must be a plain object`);
 }
 
-function assertKnownKeys(value, allowed, label) {
+function assertKnownKeys(value: JsonObject, allowed: Set<string>, label: string) {
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== "string" || !allowed.has(key)) throw new TypeError(`${label} contains unknown field: ${String(key)}`);
     if (value[key] === undefined) throw new TypeError(`${label}.${key} cannot be undefined`);
   }
 }
 
-function requiredString(value, label, maxLength = 1_000, allowEmpty = false) {
+function requiredString(value: unknown, label: string, maxLength = 1_000, allowEmpty = false): string {
   if (typeof value !== "string" || (!allowEmpty && value.length === 0) || value.length > maxLength || value.includes("\0")) {
     throw new TypeError(`${label} must be ${allowEmpty ? "a" : "a non-empty"} string of at most ${maxLength} characters`);
   }
   return value;
 }
 
-function identifier(value, label) {
+function identifier(value: unknown, label: string): string {
   const normalized = requiredString(value, label, 128);
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(normalized)) {
     throw new TypeError(`${label} must start with an alphanumeric character and contain only letters, numbers, '.', '_', ':', or '-'`);
@@ -52,29 +71,29 @@ function identifier(value, label) {
   return normalized;
 }
 
-function optionalDescription(value) {
+function optionalDescription(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   return requiredString(value, "verification contract description", 1_000);
 }
 
-function normalizeMatcher(value, label) {
+function normalizeMatcher(value: unknown, label: string): Matcher {
   assertObject(value, label);
   assertKnownKeys(value, MATCHER_KEYS, label);
   const operators = ["equals", "contains", "matches"].filter((key) => value[key] !== undefined);
   if (operators.length !== 1) throw new TypeError(`${label} must contain exactly one of: equals, contains, matches`);
-  const operator = operators[0];
+  const operator = operators[0]!;
   const pattern = requiredString(value[operator], `${label}.${operator}`, operator === "matches" ? 2_000 : 100_000, operator === "equals");
   if (operator !== "matches" && value.flags !== undefined) throw new TypeError(`${label}.flags is only valid with matches`);
   if (operator === "matches") {
     const flags = value.flags === undefined ? "" : requiredString(value.flags, `${label}.flags`, 5, true);
     if (!/^(?!.*(.).*\1)[imsu]*$/.test(flags)) throw new TypeError(`${label}.flags may contain each of i, m, s, or u at most once`);
-    try { new RegExp(pattern, flags); } catch (error) { throw new TypeError(`${label}.matches is not a valid regular expression: ${error.message}`); }
+    try { new RegExp(pattern, flags); } catch (error) { throw new TypeError(`${label}.matches is not a valid regular expression: ${errorMessage(error)}`); }
     return { matches: pattern, ...(flags ? { flags } : {}) };
   }
-  return { [operator]: pattern };
+  return { [operator]: pattern } as Matcher;
 }
 
-function normalizeCommandAssertion(value, position) {
+function normalizeCommandAssertion(value: JsonObject, position: number): CommandAssertion {
   const label = `assertions[${position}]`;
   assertKnownKeys(value, COMMAND_KEYS, label);
   if (!Array.isArray(value.command) || value.command.length === 0 || value.command.length > 128) {
@@ -82,21 +101,22 @@ function normalizeCommandAssertion(value, position) {
   }
   const command = value.command.map((part, index) => requiredString(part, `${label}.command[${index}]`, 32_000, index > 0));
   const cwd = value.cwd === undefined ? undefined : requiredString(value.cwd, `${label}.cwd`, 4_096);
-  const timeoutMs = value.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : value.timeoutMs;
+  const timeoutMs = value.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : Number(value.timeoutMs);
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) {
     throw new TypeError(`${label}.timeoutMs must be an integer from 1 through 300000`);
   }
   assertObject(value.expect, `${label}.expect`);
   assertKnownKeys(value.expect, COMMAND_EXPECT_KEYS, `${label}.expect`);
   if (Object.keys(value.expect).length === 0) throw new TypeError(`${label}.expect must contain an exitCode, stdout, or stderr assertion`);
-  const exitCode = value.expect.exitCode === undefined ? 0 : value.expect.exitCode;
+  const exitCode = value.expect.exitCode === undefined ? 0 : Number(value.expect.exitCode);
   if (!Number.isInteger(exitCode) || exitCode < 0 || exitCode > 0xffff_ffff) {
     throw new TypeError(`${label}.expect.exitCode must be an unsigned 32-bit integer`);
   }
+  const rawExpect = asObject(value.expect);
   const expect = {
     exitCode,
-    ...(value.expect.stdout === undefined ? {} : { stdout: normalizeMatcher(value.expect.stdout, `${label}.expect.stdout`) }),
-    ...(value.expect.stderr === undefined ? {} : { stderr: normalizeMatcher(value.expect.stderr, `${label}.expect.stderr`) })
+    ...(rawExpect.stdout === undefined ? {} : { stdout: normalizeMatcher(rawExpect.stdout, `${label}.expect.stdout`) }),
+    ...(rawExpect.stderr === undefined ? {} : { stderr: normalizeMatcher(rawExpect.stderr, `${label}.expect.stderr`) })
   };
   return {
     id: identifier(value.id, `${label}.id`),
@@ -108,7 +128,7 @@ function normalizeCommandAssertion(value, position) {
   };
 }
 
-function normalizeFileAssertion(value, position) {
+function normalizeFileAssertion(value: JsonObject, position: number): FileAssertion {
   const label = `assertions[${position}]`;
   assertKnownKeys(value, FILE_KEYS, label);
   assertObject(value.expect, `${label}.expect`);
@@ -117,18 +137,19 @@ function normalizeFileAssertion(value, position) {
   if (value.expect.exists === false && value.expect.content !== undefined) {
     throw new TypeError(`${label}.expect.content cannot be used when exists is false`);
   }
+  const rawExpect = asObject(value.expect);
   return {
     id: identifier(value.id, `${label}.id`),
     type: "file",
     path: requiredString(value.path, `${label}.path`, 4_096),
     expect: {
-      exists: value.expect.exists,
-      ...(value.expect.content === undefined ? {} : { content: normalizeMatcher(value.expect.content, `${label}.expect.content`) })
+      exists: rawExpect.exists as boolean,
+      ...(rawExpect.content === undefined ? {} : { content: normalizeMatcher(rawExpect.content, `${label}.expect.content`) })
     }
   };
 }
 
-function normalizeHttpAssertion(value, position) {
+function normalizeHttpAssertion(value: JsonObject, position: number): HttpAssertion {
   const label = `assertions[${position}]`;
   assertKnownKeys(value, HTTP_KEYS, label);
   const url = requiredString(value.url, `${label}.url`, 4_096);
@@ -137,25 +158,27 @@ function normalizeHttpAssertion(value, position) {
   if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.hash) throw new TypeError(`${label}.url must be an http(s) URL without credentials or fragments`);
   const method = value.method === undefined ? "GET" : requiredString(value.method, `${label}.method`, 8).toUpperCase();
   if (!['GET', 'HEAD'].includes(method)) throw new TypeError(`${label}.method must be GET or HEAD`);
-  const timeoutMs = value.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : value.timeoutMs;
+  const timeoutMs = value.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : Number(value.timeoutMs);
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) throw new TypeError(`${label}.timeoutMs must be an integer from 1 through 300000`);
   assertObject(value.expect, `${label}.expect`);
   assertKnownKeys(value.expect, HTTP_EXPECT_KEYS, `${label}.expect`);
-  if (!Number.isInteger(value.expect.status) || value.expect.status < 100 || value.expect.status > 599) throw new TypeError(`${label}.expect.status must be an HTTP status code`);
-  return { id: identifier(value.id, `${label}.id`), type: "http", url, method, timeoutMs, expect: { status: value.expect.status, ...(value.expect.body === undefined ? {} : { body: normalizeMatcher(value.expect.body, `${label}.expect.body`) }) } };
+  const status = Number(value.expect.status);
+  if (!Number.isInteger(status) || status < 100 || status > 599) throw new TypeError(`${label}.expect.status must be an HTTP status code`);
+  const rawExpect = asObject(value.expect);
+  return { id: identifier(value.id, `${label}.id`), type: "http", url, method: method as "GET" | "HEAD", timeoutMs, expect: { status, ...(rawExpect.body === undefined ? {} : { body: normalizeMatcher(rawExpect.body, `${label}.expect.body`) }) } };
 }
 
-function normalizeGitAssertion(value, position) {
+function normalizeGitAssertion(value: JsonObject, position: number): GitAssertion {
   const label = `assertions[${position}]`;
   assertKnownKeys(value, GIT_KEYS, label);
   const cwd = value.cwd === undefined ? undefined : requiredString(value.cwd, `${label}.cwd`, 4_096);
   assertObject(value.expect, `${label}.expect`);
   assertKnownKeys(value.expect, GIT_EXPECT_KEYS, `${label}.expect`);
   if (typeof value.expect.clean !== "boolean") throw new TypeError(`${label}.expect.clean must be a boolean`);
-  return { id: identifier(value.id, `${label}.id`), type: "git", ...(cwd === undefined ? {} : { cwd }), expect: { clean: value.expect.clean } };
+  return { id: identifier(value.id, `${label}.id`), type: "git", ...(cwd === undefined ? {} : { cwd }), expect: { clean: asObject(value.expect).clean as boolean } };
 }
 
-export function validateVerificationContract(input) {
+export function validateVerificationContract(input: unknown): VerificationContract {
   assertObject(input, "verification contract");
   assertKnownKeys(input, CONTRACT_KEYS, "verification contract");
   if (input.schemaVersion !== PROOF_CONTRACT_SCHEMA_VERSION) {
@@ -172,7 +195,7 @@ export function validateVerificationContract(input) {
     if (assertion.type === "git") return normalizeGitAssertion(assertion, position);
     throw new TypeError(`assertions[${position}].type must be 'command', 'file', 'http', or 'git'`);
   });
-  const seen = new Set();
+  const seen = new Set<string>();
   for (const assertion of assertions) {
     if (seen.has(assertion.id)) throw new TypeError(`assertion id must be unique: ${assertion.id}`);
     seen.add(assertion.id);
@@ -189,12 +212,12 @@ export function validateVerificationContract(input) {
 
 export const validateProofContract = validateVerificationContract;
 
-function isWithin(root, target) {
+function isWithin(root: string, target: string) {
   const path = relative(root, target);
   return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
 }
 
-async function resolveAllowedPath(root, candidate) {
+async function resolveAllowedPath(root: string, candidate: string): Promise<{ path: string; exists: boolean }> {
   const lexical = resolve(root, candidate);
   if (!isWithin(root, lexical)) throw new Error(`path escapes allowed root: ${candidate}`);
   try {
@@ -202,7 +225,7 @@ async function resolveAllowedPath(root, candidate) {
     if (!isWithin(root, physical)) throw new Error(`path escapes allowed root through a symbolic link: ${candidate}`);
     return { path: physical, exists: true };
   } catch (error) {
-    if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    if (!['ENOENT', 'ENOTDIR'].includes((error as NodeError | undefined)?.code ?? "")) throw error;
   }
 
   let ancestor = dirname(lexical);
@@ -213,7 +236,7 @@ async function resolveAllowedPath(root, candidate) {
       if (!isWithin(root, physicalAncestor)) throw new Error(`path escapes allowed root through a symbolic link: ${candidate}`);
       return { path: lexical, exists: false };
     } catch (error) {
-      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+      if (!['ENOENT', 'ENOTDIR'].includes((error as NodeError | undefined)?.code ?? "")) throw error;
       const parent = dirname(ancestor);
       if (parent === ancestor) throw new Error(`cannot resolve path within allowed root: ${candidate}`);
       ancestor = parent;
@@ -221,28 +244,28 @@ async function resolveAllowedPath(root, candidate) {
   }
 }
 
-function matchesText(actual, matcher) {
-  if (matcher.equals !== undefined) return actual === matcher.equals;
-  if (matcher.contains !== undefined) return actual.includes(matcher.contains);
+function matchesText(actual: string, matcher: Matcher) {
+  if ("equals" in matcher) return actual === matcher.equals;
+  if ("contains" in matcher) return actual.includes(matcher.contains);
   return new RegExp(matcher.matches, matcher.flags ?? "").test(actual);
 }
 
-function isLoopbackUrl(value) {
+function isLoopbackUrl(value: string) {
   const parsed = new URL(value);
   const hostname = parsed.hostname.toLowerCase();
   return hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
 
-function captureProcess(command, { cwd, timeoutMs, maxOutputBytes }) {
-  return new Promise((resolveResult) => {
+function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes }: { cwd: string; timeoutMs: number; maxOutputBytes: number }): Promise<ProcessResult> {
+  return new Promise<ProcessResult>((resolveResult) => {
     const startedAt = new Date().toISOString();
-    const stdout = [];
-    const stderr = [];
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let timedOut = false;
     let outputLimitExceeded = false;
-    let spawnError;
+    let spawnError: Error | undefined;
     let settled = false;
     const child = spawn(command[0], command.slice(1), {
       cwd,
@@ -250,7 +273,7 @@ function captureProcess(command, { cwd, timeoutMs, maxOutputBytes }) {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true
     });
-    const collect = (chunks, chunk, stream) => {
+    const collect = (chunks: Buffer[], chunk: Buffer, stream: "stdout" | "stderr") => {
       const used = stream === "stdout" ? stdoutBytes : stderrBytes;
       const available = Math.max(0, maxOutputBytes - used);
       if (available > 0) chunks.push(chunk.subarray(0, available));
@@ -287,17 +310,23 @@ function captureProcess(command, { cwd, timeoutMs, maxOutputBytes }) {
   });
 }
 
-function registerArtifact(db, artifact, createdAt) {
+function registerArtifact(db: DatabaseSync, artifact: StoredArtifact, createdAt: string) {
   db.prepare("INSERT OR IGNORE INTO artifacts(digest, path, media_type, size_bytes, created_at) VALUES (?, ?, ?, ?, ?)")
     .run(artifact.digest, artifact.path, artifact.mediaType, artifact.sizeBytes, createdAt);
 }
 
-function assertionExpectation(assertion) {
+function assertionExpectation(assertion: ProofAssertion) {
   return assertion.expect;
 }
 
 export class ProofVerifier {
-  constructor({ runLedger, allowedRoot, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, maxFileBytes = DEFAULT_MAX_FILE_BYTES, allowExternalHttp = false } = {}) {
+  readonly runLedger: RunLedger;
+  readonly allowedRoot: string;
+  readonly maxOutputBytes: number;
+  readonly maxFileBytes: number;
+  readonly allowExternalHttp: boolean;
+
+  constructor({ runLedger, allowedRoot, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, maxFileBytes = DEFAULT_MAX_FILE_BYTES, allowExternalHttp = false }: ProofVerifierOptions) {
     if (!runLedger || typeof runLedger.getRun !== "function" || typeof runLedger.appendEvent !== "function") {
       throw new TypeError("ProofVerifier requires a RunLedger");
     }
@@ -317,7 +346,7 @@ export class ProofVerifier {
     this.allowExternalHttp = allowExternalHttp === true;
   }
 
-  async verify(input) {
+  async verify(input: unknown) {
     const contract = validateVerificationContract(input);
     if (this.runLedger.featureFlags?.proof !== true) throw new Error("experimental proof feature is disabled");
     const root = await realpath(this.allowedRoot);
@@ -345,7 +374,7 @@ export class ProofVerifier {
       payload: { contractId: contract.id, contractDigest: contractArtifact.digest, assertionCount: contract.assertions.length }
     });
 
-    const results = [];
+    const results: AssertionResult[] = [];
     for (let sequence = 0; sequence < contract.assertions.length; sequence += 1) {
       const assertion = contract.assertions[sequence];
       let result;
@@ -358,7 +387,7 @@ export class ProofVerifier {
               ? await this.verifyHttp(assertion)
               : await this.verifyGit(assertion, root);
       } catch (error) {
-        result = this.failedResult(assertion, `assertion execution failed: ${error.message}`, {});
+        result = this.failedResult(assertion, `assertion execution failed: ${errorMessage(error)}`, {});
       }
       results.push(result);
       this.persistAssertion(contract.id, assertion, result, sequence + 1);
@@ -384,12 +413,12 @@ export class ProofVerifier {
     return { contractId: contract.id, runId: contract.runId, status, passed, startedAt, completedAt, assertions: results };
   }
 
-  async verifyCommand(assertion, root) {
+  async verifyCommand(assertion: CommandAssertion, root: string): Promise<AssertionResult> {
     let cwdResult;
     try {
       cwdResult = await resolveAllowedPath(root, assertion.cwd ?? ".");
     } catch (error) {
-      return this.failedResult(assertion, error.message, { cwd: assertion.cwd ?? "." });
+      return this.failedResult(assertion, errorMessage(error), { cwd: assertion.cwd ?? "." });
     }
     if (!cwdResult.exists) {
       return this.failedResult(assertion, `command working directory does not exist: ${assertion.cwd ?? "."}`, { cwd: assertion.cwd ?? "." });
@@ -403,7 +432,7 @@ export class ProofVerifier {
       timeoutMs: assertion.timeoutMs,
       maxOutputBytes: this.maxOutputBytes
     });
-    const failures = [];
+    const failures: string[] = [];
     if (actual.error) failures.push(`command could not start: ${actual.error}`);
     if (actual.timedOut) failures.push(`command timed out after ${assertion.timeoutMs}ms`);
     if (actual.outputLimitExceeded) failures.push(`command output exceeded ${this.maxOutputBytes} bytes`);
@@ -423,12 +452,12 @@ export class ProofVerifier {
     };
   }
 
-  async verifyFile(assertion, root) {
+  async verifyFile(assertion: FileAssertion, root: string): Promise<AssertionResult> {
     let target;
     try {
       target = await resolveAllowedPath(root, assertion.path);
     } catch (error) {
-      return this.failedResult(assertion, error.message, { exists: false, path: assertion.path });
+      return this.failedResult(assertion, errorMessage(error), { exists: false, path: assertion.path });
     }
     if (target.exists !== assertion.expect.exists) {
       return this.failedResult(
@@ -442,7 +471,7 @@ export class ProofVerifier {
     }
     const metadata = await stat(target.path);
     if (!metadata.isFile()) return this.failedResult(assertion, `path is not a regular file: ${assertion.path}`, { exists: true, path: assertion.path });
-    const actual = { exists: true, path: assertion.path, sizeBytes: metadata.size };
+    const actual: JsonObject = { exists: true, path: assertion.path, sizeBytes: metadata.size };
     if (assertion.expect.content) {
       if (metadata.size > this.maxFileBytes) {
         return this.failedResult(assertion, `file exceeds content assertion limit of ${this.maxFileBytes} bytes`, actual);
@@ -454,7 +483,7 @@ export class ProofVerifier {
     return this.passedResult(assertion, "file assertion passed", actual);
   }
 
-  async verifyHttp(assertion) {
+  async verifyHttp(assertion: HttpAssertion): Promise<AssertionResult> {
     if (!this.allowExternalHttp && !isLoopbackUrl(assertion.url)) return this.failedResult(assertion, "external HTTP verification is disabled by default", { url: assertion.url });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), assertion.timeoutMs);
@@ -462,19 +491,20 @@ export class ProofVerifier {
     try {
       const response = await fetch(assertion.url, { method: assertion.method, redirect: "error", signal: controller.signal });
       const body = assertion.method === "HEAD" ? "" : (await response.text()).slice(0, this.maxOutputBytes);
-      const failures = [];
+      const failures: string[] = [];
       if (response.status !== assertion.expect.status) failures.push(`expected HTTP status ${assertion.expect.status}, received ${response.status}`);
       if (assertion.expect.body && !matchesText(body, assertion.expect.body)) failures.push("HTTP response body did not match expectation");
       return { id: assertion.id, type: assertion.type, status: failures.length ? "failed" : "passed", passed: failures.length === 0, message: failures.length ? failures.join("; ") : "HTTP assertion passed", expected: assertion.expect, actual: { status: response.status, body }, startedAt, completedAt: new Date().toISOString() };
     } catch (error) {
-      return this.failedResult(assertion, `HTTP assertion failed: ${error.name === "AbortError" ? `timed out after ${assertion.timeoutMs}ms` : error.message}`, { url: assertion.url });
+      const failure = error instanceof Error ? error : new Error(String(error));
+      return this.failedResult(assertion, `HTTP assertion failed: ${failure.name === "AbortError" ? `timed out after ${assertion.timeoutMs}ms` : failure.message}`, { url: assertion.url });
     } finally { clearTimeout(timer); }
   }
 
-  async verifyGit(assertion, root) {
+  async verifyGit(assertion: GitAssertion, root: string): Promise<AssertionResult> {
     let cwdResult;
     try { cwdResult = await resolveAllowedPath(root, assertion.cwd ?? "."); }
-    catch (error) { return this.failedResult(assertion, error.message, { cwd: assertion.cwd ?? "." }); }
+    catch (error) { return this.failedResult(assertion, errorMessage(error), { cwd: assertion.cwd ?? "." }); }
     if (!cwdResult.exists) return this.failedResult(assertion, `git working directory does not exist: ${assertion.cwd ?? "."}`, { cwd: assertion.cwd ?? "." });
     const actual = await captureProcess(["git", "status", "--porcelain"], { cwd: cwdResult.path, timeoutMs: DEFAULT_TIMEOUT_MS, maxOutputBytes: this.maxOutputBytes });
     const clean = actual.exitCode === 0 && actual.stdout.trim() === "";
@@ -482,34 +512,39 @@ export class ProofVerifier {
     return { id: assertion.id, type: assertion.type, status: passed ? "passed" : "failed", passed, message: passed ? "git assertion passed" : `expected clean=${assertion.expect.clean}, received clean=${clean}`, expected: assertion.expect, actual, startedAt: actual.startedAt, completedAt: actual.completedAt };
   }
 
-  passedResult(assertion, message, actual) {
+  passedResult(assertion: ProofAssertion, message: string, actual: JsonObject): AssertionResult {
     const now = new Date().toISOString();
     return { id: assertion.id, type: assertion.type, status: "passed", passed: true, message, expected: assertion.expect, actual, startedAt: now, completedAt: now };
   }
 
-  failedResult(assertion, message, actual) {
+  failedResult(assertion: ProofAssertion, message: string, actual: JsonObject): AssertionResult {
     const now = new Date().toISOString();
     return { id: assertion.id, type: assertion.type, status: "failed", passed: false, message, expected: assertion.expect, actual, startedAt: now, completedAt: now };
   }
 
-  persistAssertion(contractId, assertion, result, sequence) {
+  persistAssertion(contractId: string, assertion: ProofAssertion, result: AssertionResult, sequence: number) {
     const createdAt = result.startedAt ?? new Date().toISOString();
     const completedAt = result.completedAt ?? new Date().toISOString();
-    const stdoutArtifact = typeof result.actual.stdout === "string"
-      ? this.runLedger.artifacts.put(redact(result.actual.stdout), { mediaType: "text/plain; charset=utf-8" })
+    const stdout = result.actual.stdout;
+    const stderr = result.actual.stderr;
+    const content = result.actual.content;
+    const stdoutArtifact = typeof stdout === "string"
+      ? this.runLedger.artifacts.put(String(redact(stdout)), { mediaType: "text/plain; charset=utf-8" })
       : undefined;
-    const stderrArtifact = typeof result.actual.stderr === "string"
-      ? this.runLedger.artifacts.put(redact(result.actual.stderr), { mediaType: "text/plain; charset=utf-8" })
+    const stderrArtifact = typeof stderr === "string"
+      ? this.runLedger.artifacts.put(String(redact(stderr)), { mediaType: "text/plain; charset=utf-8" })
       : undefined;
-    const contentArtifact = typeof result.actual.content === "string"
-      ? this.runLedger.artifacts.put(redact(result.actual.content), { mediaType: "text/plain; charset=utf-8" })
+    const contentArtifact = typeof content === "string"
+      ? this.runLedger.artifacts.put(String(redact(content)), { mediaType: "text/plain; charset=utf-8" })
       : undefined;
     const evidenceArtifactIds = [stdoutArtifact?.digest, stderrArtifact?.digest, contentArtifact?.digest].filter(Boolean);
     this.runLedger.database.transaction((db) => {
       if (stdoutArtifact) registerArtifact(db, stdoutArtifact, completedAt);
       if (stderrArtifact) registerArtifact(db, stderrArtifact, completedAt);
       if (contentArtifact) registerArtifact(db, contentArtifact, completedAt);
-      const runId = db.prepare("SELECT run_id FROM verification_contracts WHERE id = ?").get(contractId).run_id;
+      const contractRow = db.prepare("SELECT run_id FROM verification_contracts WHERE id = ?").get(contractId) as { run_id: string } | undefined;
+      if (!contractRow) throw new Error(`verification contract not found: ${contractId}`);
+      const runId = contractRow.run_id;
       db.prepare(`INSERT INTO assertion_results
         (id, contract_id, run_id, assertion_id, status, started_at, completed_at, evidence_artifact_ids_json, message, result_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
@@ -528,7 +563,7 @@ export class ProofVerifier {
   }
 }
 
-export function verifyContract(contract, options) {
+export function verifyContract(contract: unknown, options: ProofVerifierOptions) {
   return new ProofVerifier(options).verify(contract);
 }
 

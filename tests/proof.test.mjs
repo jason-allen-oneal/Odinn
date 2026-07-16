@@ -12,7 +12,7 @@ import {
   validateVerificationContract,
   verifyContract,
   verifyProof
-} from "../packages/kernel/src/proof.mjs";
+} from "../packages/kernel/src/proof.ts";
 
 async function fixture(runId = "run_proof_test") {
   const root = await mkdtemp(join(tmpdir(), "odinn-proof-"));

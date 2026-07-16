@@ -8,7 +8,7 @@ Enable it explicitly:
 odinn config experimental enable proof
 ```
 
-Contracts use `schemaVersion: 1` and currently support shell-free command arrays and root-confined file assertions. Command output is bounded and captured as content-addressed evidence. Assertions, evidence references, and status transitions are written to the SQLite ledger.
+Contracts use `schemaVersion: 1` and support shell-free command arrays, root-confined file assertions, bounded HTTP `GET`/`HEAD` assertions, and Git working-tree assertions. Command and response output is bounded and captured as content-addressed evidence. Assertions, evidence references, and status transitions are written to the SQLite ledger.
 
 ```bash
 odinn proof contract validate ./contract.json
@@ -16,4 +16,6 @@ odinn proof run <run-id> --contract ./contract.json
 odinn proof show <run-id>
 ```
 
-HTTP and Git assertions are available in the broader runtime contract adapter; the strict `ProofVerifier` API intentionally accepts only command and file assertions until those schemas are promoted.
+The authenticated gateway exposes the same path through `POST /proof`, `GET /proof/<run-id>`, and `GET /runtime/runs/<run-id>/verify`.
+
+HTTP proof is loopback-only by default to prevent untrusted contracts from becoming an SSRF primitive. External verification requires an explicit runtime integration decision; it is not enabled by the beta gateway.

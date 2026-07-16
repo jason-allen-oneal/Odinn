@@ -1,9 +1,9 @@
 import { createServer } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeModelConfig, oauthTokenPath } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, oauthTokenPath, ProofVerifier, validateContract, validatePolicy } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { FileJobStore } from "@odinn/store-file";
 
@@ -24,6 +24,8 @@ export async function createGatewayServer({
 } = {}) {
   const state = resolve(stateDir);
   const config = await readConfig(state);
+  const featureFlags = normalizeExperimentalFlags(config.experimental);
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot, featureFlags });
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
   const policy = createDefaultPolicy(config.policy);
   const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
@@ -70,9 +72,104 @@ export async function createGatewayServer({
           defaultModel: normalizeModelConfig(config).defaultModel,
           models: listConfiguredModels(normalizeModelConfig(config)),
           providers: await summarizeProviders(config, state),
+          experimental: featureFlags,
           security: policy.security,
           pendingApprovals: approvalStore.list()
         });
+      }
+      if (request.method === "GET" && url.pathname === "/runtime/runs") {
+        return json(response, 200, runtime.ledger.listRuns({ limit: url.searchParams.get("limit") }));
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/runtime/runs/") && url.pathname.endsWith("/verify")) {
+        const runId = decodeURIComponent(url.pathname.slice("/runtime/runs/".length, -"/verify".length));
+        return json(response, 200, runtime.ledger.verify(runId));
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/runtime/runs/")) {
+        const runId = decodeURIComponent(url.pathname.slice("/runtime/runs/".length));
+        const run = runtime.ledger.getRun(runId);
+        return run ? json(response, 200, run) : json(response, 404, { ok: false, error: "runtime run not found" });
+      }
+      if (request.method === "POST" && url.pathname === "/proof") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        if (body?.schemaVersion === 1) {
+          const contract = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: workspaceRoot });
+          return json(response, 200, await contract.verify(body));
+        }
+        validateContract(body?.contract);
+        return json(response, 200, await runtime.proof.run(body.runId, body.contract, { workspaceRoot: body.workspaceRoot ?? workspaceRoot }));
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/proof/")) {
+        const runId = decodeURIComponent(url.pathname.slice("/proof/".length));
+        return json(response, 200, { runId, assertions: runtime.proof.show(runId) });
+      }
+      if (request.method === "POST" && url.pathname === "/policy/evaluate") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        validatePolicy(body.policy);
+        const runId = body.runId ?? `policy-${randomBytes(12).toString("hex")}`;
+        runtime.ledger.ensureRun({ runId, objective: "policy evaluation" });
+        return json(response, 200, runtime.sentinel.evaluate({ runId, stepId: body.stepId, toolName: body.toolName, input: body.input ?? {}, policy: body.policy, workspaceRoot }));
+      }
+      if (request.method === "POST" && url.pathname === "/capabilities/issue") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        runtime.ledger.ensureRun({ runId: body.runId, objective: body.objective ?? `capability: ${body.toolName}` });
+        return json(response, 200, runtime.capabilities.issue(body));
+      }
+      if (request.method === "POST" && url.pathname === "/capabilities/use") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, runtime.capabilities.consume(body.token, body));
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/capabilities/")) {
+        const runId = decodeURIComponent(url.pathname.slice("/capabilities/".length));
+        return json(response, 200, runtime.capabilities.list(runId));
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/capabilities/") && url.pathname.endsWith("/revoke")) {
+        const capabilityId = decodeURIComponent(url.pathname.slice("/capabilities/".length, -"/revoke".length));
+        return json(response, 200, runtime.capabilities.revoke(capabilityId));
+      }
+      if (request.method === "POST" && url.pathname === "/checkpoints") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        runtime.ledger.ensureRun({ runId: body.runId, objective: body.objective ?? "checkpoint" });
+        return json(response, 200, runtime.snapshots.create({ ...body, workspaceRoot: body.workspaceRoot ?? workspaceRoot }));
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/rewind/")) {
+        const snapshotId = decodeURIComponent(url.pathname.slice("/rewind/".length));
+        return json(response, 200, runtime.snapshots.restore(snapshotId, { apply: (await readJson(request, { maxBytes: requestMaxBytes })).apply === true }));
+      }
+      if (request.method === "POST" && url.pathname === "/capsules/export") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const output = body.output ? safeCapsulePath(state, body.output) : join(state, "capsules", `${body.runId}.odinn`);
+        return json(response, 200, await runtime.capsules.export(body.runId, { ...body, output }));
+      }
+      if (request.method === "POST" && url.pathname === "/capsules/verify") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, await runtime.capsules.verify(safeCapsulePath(state, body.path)));
+      }
+      if (request.method === "POST" && url.pathname === "/capsules/replay") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, await runtime.capsules.replay(safeCapsulePath(state, body.path), { mode: body.mode, workspace: body.workspace }));
+      }
+      if (request.method === "POST" && url.pathname === "/counterfactual") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, await runtime.counterfactual.create({ ...body, workspaceRoot: body.workspaceRoot ?? workspaceRoot }));
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/counterfactual/")) {
+        const groupId = decodeURIComponent(url.pathname.slice("/counterfactual/".length));
+        return json(response, 200, runtime.counterfactual.compare(groupId));
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/counterfactual/") && url.pathname.endsWith("/select")) {
+        const groupId = decodeURIComponent(url.pathname.slice("/counterfactual/".length, -"/select".length));
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, runtime.counterfactual.select(groupId, body.runId));
+      }
+      if (request.method === "POST" && url.pathname === "/routing/observe") {
+        return json(response, 200, runtime.darwin.observe(await readJson(request, { maxBytes: requestMaxBytes })));
+      }
+      if (request.method === "GET" && url.pathname === "/routing/stats") {
+        return json(response, 200, runtime.darwin.stats(url.searchParams.get("taskClass") ?? "general"));
+      }
+      if (request.method === "POST" && url.pathname === "/routing/choose") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, runtime.darwin.choose(body.taskClass ?? "general", { pinnedModel: body.pinnedModel }));
       }
       if (request.method === "GET" && url.pathname === "/runs") {
         return json(response, 200, await auditStore.readRuns());
@@ -341,6 +438,7 @@ export async function createGatewayServer({
     return server;
   };
   server.on("close", () => supervisor.shutdown().catch(() => undefined));
+  server.on("close", () => runtime.ledger.close());
   server.odinnAuthToken = gatewayToken;
   return server;
 }
@@ -383,6 +481,15 @@ function validOrigin(request) {
   } catch {
     return false;
   }
+}
+
+function safeCapsulePath(state, candidate) {
+  const capsulesRoot = resolve(join(state, "capsules"));
+  const target = resolve(capsulesRoot, candidate);
+  if (target !== capsulesRoot && !target.startsWith(`${capsulesRoot}${sep}`)) {
+    throw new GatewayError(400, "capsule paths must remain inside the gateway capsule store");
+  }
+  return target;
 }
 
 async function streamAuditEvents(request, response, auditStore, url) {

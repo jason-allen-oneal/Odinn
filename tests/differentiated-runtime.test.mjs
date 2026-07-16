@@ -33,6 +33,8 @@ test("capabilities are scoped and consumed exactly once", async () => {
     runtime.capabilities.consume(issued.token, { runId: "run-cap", toolName: "github.create", resource: { repository: "owner/repo" } });
     assert.throws(() => runtime.capabilities.consume(issued.token, { runId: "run-cap", toolName: "github.create", resource: { repository: "owner/repo" } }), /use limit/);
     assert.throws(() => runtime.capabilities.consume(issued.token, { runId: "run-other", toolName: "github.create", resource: { repository: "owner/repo" } }), /not valid/);
+    assert.throws(() => runtime.capabilities.issue({ runId: "run-cap", stepId: "step-2", toolName: "github.create", expiresInMs: 0 }), /expiresInMs/);
+    assert.throws(() => runtime.capabilities.issue({ runId: "run-cap", stepId: "step-3", toolName: "github.create", maxUses: 101 }), /maxUses/);
   } finally { runtime.ledger.close(); }
 });
 

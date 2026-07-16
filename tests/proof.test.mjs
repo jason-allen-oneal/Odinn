@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { access, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -125,6 +126,34 @@ test("Proof verifies command exit/output and file assertions without invoking a 
       "verification-completed"
     ]);
   } finally {
+    ledger.close();
+  }
+});
+
+test("Proof verifies HTTP and git assertions through bounded real operations", async () => {
+  const { root, ledger, runId } = await fixture("run_proof_http_git");
+  const server = createServer((request, response) => {
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.end("ODINN_HTTP_OK\n");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  try {
+    const normalized = validateVerificationContract(contract(runId, [
+      { id: "http", type: "http", url: `http://127.0.0.1:${port}/health`, expect: { status: 200, body: { contains: "HTTP_OK" } } },
+      { id: "git", type: "git", cwd: ".", expect: { clean: false } }
+    ], "proof_http_git"));
+    assert.equal(normalized.assertions[0].method, "GET");
+    assert.throws(() => validateVerificationContract(contract(runId, [{ id: "unsafe", type: "http", url: "http://user:pass@example.com/", expect: { status: 200 } }])), /without credentials/);
+    const result = await verifyContract(normalized, { runLedger: ledger, allowedRoot: root });
+    assert.equal(result.status, "failed");
+    assert.equal(result.assertions[0].status, "passed");
+    assert.equal(result.assertions[1].status, "failed");
+    const external = await verifyContract(contract(runId, [{ id: "external", type: "http", url: "https://example.com/", expect: { status: 200 } }], "proof_external"), { runLedger: ledger, allowedRoot: root });
+    assert.equal(external.assertions[0].passed, false);
+    assert.match(external.assertions[0].message, /external HTTP verification is disabled/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
     ledger.close();
   }
 });

@@ -81,6 +81,8 @@ Use `pnpm odinn config experimental show` to inspect the posture. Read the featu
 
 These are initial local slices, not a claim that arbitrary remote effects can be reversed or perfectly replayed. Browser sessions, external mutations, nondeterministic models, and public hosting remain outside the safe beta boundary.
 
+The authenticated gateway exposes the same experimental surfaces through `/runtime/runs`, `/proof`, `/policy/evaluate`, `/capabilities/*`, `/checkpoints`, `/rewind/*`, `/capsules/*`, `/counterfactual/*`, and `/routing/*`. Each surface remains disabled until its matching experimental flag is enabled in `.odinn/config.json`.
+
 ## Model providers
 
 The normal provider path is intentionally short:

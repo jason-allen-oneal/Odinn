@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { createRunLedger, redact } from "./run-ledger.mjs";
@@ -41,6 +41,12 @@ function safeExistingPath(root, candidate) {
   const real = resolve(realpathSync(cursor));
   if (real !== root && !real.startsWith(`${resolve(root)}${sep}`)) throw new OdinnRuntimeError("POLICY_VIOLATION", "symlink escapes allowed root", { path: candidate });
   return target;
+}
+
+function isLoopbackUrl(value) {
+  const parsed = new URL(value);
+  const hostname = parsed.hostname.toLowerCase();
+  return hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
 
 // Minimal JSON/YAML-shaped loader: JSON is canonical; simple YAML is accepted for
@@ -88,7 +94,14 @@ export function validateContract(contract) {
     if (!["command", "file", "http", "git"].includes(assertion.type)) throw new OdinnRuntimeError("CAPSULE_INVALID", `unsupported assertion type: ${assertion.type}`);
     if (assertion.type === "command" && (typeof assertion.command !== "string" || !Array.isArray(assertion.args ?? []))) throw new OdinnRuntimeError("CAPSULE_INVALID", `command assertion ${assertion.id} requires command and args`);
     if (assertion.type === "file" && typeof assertion.path !== "string") throw new OdinnRuntimeError("CAPSULE_INVALID", `file assertion ${assertion.id} requires path`);
-    if (assertion.type === "http" && typeof assertion.url !== "string") throw new OdinnRuntimeError("CAPSULE_INVALID", `http assertion ${assertion.id} requires url`);
+    if (assertion.type === "http") {
+      if (typeof assertion.url !== "string") throw new OdinnRuntimeError("CAPSULE_INVALID", `http assertion ${assertion.id} requires url`);
+      let parsedUrl;
+      try { parsedUrl = new URL(assertion.url); } catch { throw new OdinnRuntimeError("CAPSULE_INVALID", `http assertion ${assertion.id} requires a valid URL`); }
+      if (!['http:', 'https:'].includes(parsedUrl.protocol) || parsedUrl.username || parsedUrl.password || parsedUrl.hash) throw new OdinnRuntimeError("CAPSULE_INVALID", `http assertion ${assertion.id} URL is not safe`);
+      if (assertion.method !== undefined && !['GET', 'HEAD'].includes(String(assertion.method).toUpperCase())) throw new OdinnRuntimeError("CAPSULE_INVALID", `http assertion ${assertion.id} method must be GET or HEAD`);
+      if (!Number.isInteger(assertion.expect?.status) || assertion.expect.status < 100 || assertion.expect.status > 599) throw new OdinnRuntimeError("CAPSULE_INVALID", `http assertion ${assertion.id} requires an HTTP status expectation`);
+    }
   }
   return contract;
 }
@@ -116,7 +129,7 @@ function runProcess(command, args, { cwd, timeoutMs = 120_000 } = {}) {
 }
 
 export class ProofEngine {
-  constructor({ ledger, featureFlags = {} } = {}) { this.ledger = ledger; this.featureFlags = featureFlags; }
+  constructor({ ledger, featureFlags = {}, allowExternalHttp = false } = {}) { this.ledger = ledger; this.featureFlags = featureFlags; this.allowExternalHttp = allowExternalHttp === true; }
   async run(runId, contract, { workspaceRoot = process.cwd() } = {}) {
     requireExperimental(this.featureFlags, "proof");
     validateContract(contract);
@@ -161,6 +174,7 @@ export class ProofEngine {
       return { status: passed ? "passed" : "failed", message: passed ? "file assertion passed" : "file assertion failed", exists, digest: exists ? hash(content) : undefined };
     }
     if (assertion.type === "http") {
+      if (!this.allowExternalHttp && !isLoopbackUrl(assertion.url)) throw new OdinnRuntimeError("POLICY_VIOLATION", "external HTTP verification is disabled by default");
       const response = await fetch(assertion.url, { method: assertion.method ?? "GET", redirect: "manual" });
       const body = await response.text(); const expectedStatus = assertion.expect?.status ?? 200;
       const passed = response.status === expectedStatus && (!assertion.expect?.bodyContains || body.includes(assertion.expect.bodyContains));
@@ -188,11 +202,13 @@ export class Sentinel {
   constructor({ ledger, featureFlags = {} } = {}) { this.ledger = ledger; this.featureFlags = featureFlags; }
   evaluate({ runId, stepId, toolName, input, policy, workspaceRoot = process.cwd() }) {
     requireExperimental(this.featureFlags, "sentinel"); validatePolicy(policy);
+    const policyId = policy.id ?? `policy_${runId}_${hash(json(redact(policy))).slice(0, 16)}`;
+    this.ledger.database.db.prepare("INSERT OR IGNORE INTO policies(id, run_id, policy_json, created_at) VALUES (?, ?, ?, ?)").run(policyId, runId, json(redact(policy)), now());
     const evaluations = [];
     for (const invariant of policy.invariants) {
       const violated = policyMatch(invariant, toolName, input, workspaceRoot);
       const decision = violated ? (invariant.enforcement ?? "block") : "allow";
-      const evaluation = { id: randomUUID(), runId, stepId, policyId: policy.id ?? null, invariantId: invariant.id, decision, enforcement: invariant.enforcement ?? "block", reason: violated ? `invariant violated: ${invariant.id}` : "invariant satisfied", input: redact({ toolName, input }), createdAt: now() };
+      const evaluation = { id: randomUUID(), runId, stepId, policyId, invariantId: invariant.id, decision, enforcement: invariant.enforcement ?? "block", reason: violated ? `invariant violated: ${invariant.id}` : "invariant satisfied", input: redact({ toolName, input }), createdAt: now() };
       this.ledger.database.db.prepare("INSERT INTO policy_evaluations(id, run_id, step_id, policy_id, invariant_id, decision, enforcement, reason, input_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(evaluation.id, runId, stepId ?? null, evaluation.policyId, evaluation.invariantId, decision, evaluation.enforcement, evaluation.reason, json(evaluation.input), evaluation.createdAt);
       this.ledger.appendEvent({ runId, type: "policy-check", payload: evaluation }); evaluations.push(evaluation);
     }
@@ -207,6 +223,10 @@ export class CapabilityBroker {
   loadKey() { if (existsSync(this.keyPath)) return readFileSync(this.keyPath); const key = randomBytes(32); writeFileSync(this.keyPath, key, { mode: 0o600, flag: "wx" }); chmodSync(this.keyPath, 0o600); return key; }
   issue({ runId, stepId, toolName, scopes = [], resourceConstraints = {}, expiresInMs = 60_000, maxUses = 1, approvalId } = {}) {
     requireExperimental(this.featureFlags, "capabilities");
+    if (typeof runId !== "string" || !runId || typeof stepId !== "string" || !stepId || typeof toolName !== "string" || !toolName) throw new OdinnRuntimeError("CAPABILITY_DENIED", "runId, stepId, and toolName are required");
+    if (!Array.isArray(scopes) || scopes.some((scope) => typeof scope !== "string" || !scope)) throw new OdinnRuntimeError("CAPABILITY_DENIED", "capability scopes must be non-empty strings");
+    if (!Number.isInteger(expiresInMs) || expiresInMs < 1 || expiresInMs > 3_600_000) throw new OdinnRuntimeError("CAPABILITY_DENIED", "expiresInMs must be an integer from 1 through 3600000");
+    if (!Number.isInteger(maxUses) || maxUses < 1 || maxUses > 100) throw new OdinnRuntimeError("CAPABILITY_DENIED", "maxUses must be an integer from 1 through 100");
     const claims = { id: `cap_${randomUUID()}`, runId, stepId, toolName, scopes, resourceConstraints, issuedAt: now(), expiresAt: new Date(Date.now() + expiresInMs).toISOString(), maxUses, approvalId, nonce: randomBytes(16).toString("hex") };
     const encoded = Buffer.from(json(claims)).toString("base64url"); const signature = createHmac("sha256", this.key).update(encoded).digest("base64url");
     this.ledger.database.db.prepare("INSERT INTO capabilities(id, run_id, step_id, tool_name, scopes_json, constraints_json, issued_at, expires_at, max_uses, nonce, approval_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')").run(claims.id, runId, stepId, toolName, json(scopes), json(resourceConstraints), claims.issuedAt, claims.expiresAt, maxUses, claims.nonce, approvalId ?? null);
@@ -216,7 +236,7 @@ export class CapabilityBroker {
   consume(token, { runId, toolName, resource = {} } = {}) {
     requireExperimental(this.featureFlags, "capabilities");
     const [encoded, signature] = String(token ?? "").split("."); const expected = createHmac("sha256", this.key).update(encoded ?? "").digest("base64url");
-    if (!encoded || signature !== expected) throw new OdinnRuntimeError("CAPABILITY_DENIED", "invalid capability signature");
+    if (!encoded || !signature || signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) throw new OdinnRuntimeError("CAPABILITY_DENIED", "invalid capability signature");
     const claims = parse(Buffer.from(encoded, "base64url").toString("utf8"), null); if (!claims) throw new OdinnRuntimeError("CAPABILITY_DENIED", "invalid capability claims");
     const row = this.ledger.database.db.prepare("SELECT * FROM capabilities WHERE id = ?").get(claims.id);
     if (!row || row.run_id !== runId || row.tool_name !== toolName) throw new OdinnRuntimeError("CAPABILITY_SCOPE_MISMATCH", "capability is not valid for this run or tool");
@@ -224,7 +244,11 @@ export class CapabilityBroker {
     if (row.uses >= row.max_uses) throw new OdinnRuntimeError("CAPABILITY_DENIED", "capability use limit exceeded");
     if (row.status !== "active") throw new OdinnRuntimeError("CAPABILITY_DENIED", "capability is not active");
     const constraints = parse(row.constraints_json, {}); for (const [key, expectedValue] of Object.entries(constraints)) if (Array.isArray(expectedValue) ? !expectedValue.includes(resource[key]) : resource[key] !== expectedValue) throw new OdinnRuntimeError("CAPABILITY_SCOPE_MISMATCH", `resource constraint mismatch: ${key}`);
-    this.ledger.database.transaction((db) => { db.prepare("UPDATE capabilities SET uses = uses + 1, status = CASE WHEN uses + 1 >= max_uses THEN 'consumed' ELSE status END WHERE id = ?").run(claims.id); db.prepare("INSERT INTO capability_uses(id, capability_id, run_id, tool_name, resource_json, used_at, ok) VALUES (?, ?, ?, ?, ?, ?, 1)").run(randomUUID(), claims.id, runId, toolName, json(redact(resource)), now()); });
+    this.ledger.database.transaction((db) => {
+      const update = db.prepare("UPDATE capabilities SET uses = uses + 1, status = CASE WHEN uses + 1 >= max_uses THEN 'consumed' ELSE status END WHERE id = ? AND status = 'active' AND uses < max_uses").run(claims.id);
+      if (Number(update.changes ?? 0) !== 1) throw new OdinnRuntimeError("CAPABILITY_DENIED", "capability was already consumed or revoked");
+      db.prepare("INSERT INTO capability_uses(id, capability_id, run_id, tool_name, resource_json, used_at, ok) VALUES (?, ?, ?, ?, ?, ?, 1)").run(randomUUID(), claims.id, runId, toolName, json(redact(resource)), now());
+    });
     this.ledger.appendEvent({ runId, type: "capability-consumed", payload: { capabilityId: claims.id, toolName, resource: redact(resource) } });
     return claims;
   }
@@ -260,12 +284,50 @@ export class CapsuleManager {
     requireExperimental(this.featureFlags, "capsules");
     if (!output) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output is required");
     const run = this.ledger.getRun(runId); if (!run) throw new OdinnRuntimeError("CAPSULE_INVALID", "run not found", { runId });
-    const destination = resolve(output); const staging = join(this.root, `.staging-${randomUUID()}`); mkdirSync(join(staging, "artifacts"), { recursive: true }); mkdirSync(join(staging, "verification"), { recursive: true });
-    const manifest = { formatVersion: 1, odinnVersion: "0.1.0", runId, createdAt: now(), sourcePlatform: `${process.platform}-${process.arch}`, model: { provider: run.providerId, modelId: run.modelId }, replayMode, redactions: ["api keys", "tokens", "cookies", "authorization headers"], requiredSecrets: [], checksumsFile: "checksums.sha256" };
-    writeFileSync(join(staging, "manifest.json"), `${json(manifest)}\n`); writeFileSync(join(staging, "run.json"), `${json(redact(run))}\n`); writeFileSync(join(staging, "events.jsonl"), `${(run.events ?? []).map((event) => json(redact(event))).join("\n")}\n`); if (contract) writeFileSync(join(staging, "contract.json"), `${json(redact(contract))}\n`); if (policy) writeFileSync(join(staging, "policy.json"), `${json(redact(policy))}\n`);
-    const files = []; for (const name of readdirSync(staging, { recursive: true })) { if (name === "checksums.sha256") continue; const file = join(staging, name); if (lstatSync(file).isFile()) files.push(name.replaceAll("\\", "/")); }
-    writeFileSync(join(staging, "checksums.sha256"), `${files.map((name) => `${hash(readFileSync(join(staging, name)))}  ${name}`).join("\n")}\n`); mkdirSync(dirname(destination), { recursive: true }); const zipped = await runProcess("zip", ["-q", "-r", destination, "."], { cwd: staging, timeoutMs: 120_000 }); if (zipped.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", `zip failed: ${zipped.stderr}`);
-    const digest = hash(readFileSync(destination)); this.ledger.database.db.prepare("INSERT OR REPLACE INTO capsules(id, run_id, path, manifest_json, digest, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`capsule_${randomUUID()}`, runId, destination, json(manifest), digest, now()); this.ledger.appendEvent({ runId, type: "artifact-created", payload: { kind: "capsule", path: destination, digest } }); await rm(staging, { recursive: true, force: true }); return { path: destination, digest, manifest };
+    const destination = resolve(output);
+    const allowedRoots = [this.root, this.ledger.workspaceRoot].map((root) => resolve(root));
+    if (!allowedRoots.some((root) => destination === root || destination.startsWith(`${root}${sep}`))) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output must remain inside the workspace or .odinn/capsules directory", { output });
+    if (existsSync(destination) && lstatSync(destination).isSymbolicLink()) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output cannot be a symbolic link", { output });
+    const staging = join(this.root, `.staging-${randomUUID()}`); mkdirSync(join(staging, "artifacts"), { recursive: true }); mkdirSync(join(staging, "snapshots"), { recursive: true }); mkdirSync(join(staging, "verification"), { recursive: true });
+    try {
+      const storedContract = this.ledger.database.db.prepare("SELECT contract_json FROM verification_contracts WHERE run_id = ? ORDER BY created_at DESC LIMIT 1").get(runId);
+      const storedPolicy = this.ledger.database.db.prepare("SELECT policy_json FROM policies WHERE run_id = ? ORDER BY created_at DESC LIMIT 1").get(runId);
+      const effectiveContract = contract ?? parse(storedContract?.contract_json, null);
+      const effectivePolicy = policy ?? parse(storedPolicy?.policy_json, null);
+      const manifest = { formatVersion: 1, odinnVersion: "0.1.0", runId, createdAt: now(), sourcePlatform: `${process.platform}-${process.arch}`, model: { provider: run.providerId, modelId: run.modelId }, replayMode, redactions: ["api keys", "tokens", "cookies", "authorization headers"], requiredSecrets: [], checksumsFile: "checksums.sha256" };
+      writeFileSync(join(staging, "manifest.json"), `${json(manifest)}\n`);
+      writeFileSync(join(staging, "run.json"), `${json(redact(run))}\n`);
+      writeFileSync(join(staging, "events.jsonl"), `${(run.events ?? []).map((event) => json(redact(event))).join("\n")}\n`);
+      writeFileSync(join(staging, "environment.json"), `${json({ platform: process.platform, arch: process.arch, node: process.version })}\n`);
+      writeFileSync(join(staging, "README.txt"), "This Odinn capsule is content-addressed, redacted, and safe to inspect before replay.\n");
+      if (effectiveContract) writeFileSync(join(staging, "contract.json"), `${json(redact(effectiveContract))}\n`);
+      if (effectivePolicy) writeFileSync(join(staging, "policy.json"), `${json(redact(effectivePolicy))}\n`);
+      const referenced = this.referencedArtifactRows(runId);
+      for (const artifact of referenced) {
+        const source = resolve(this.ledger.artifacts.root, artifact.path);
+        if (!source.startsWith(`${resolve(this.ledger.artifacts.root)}${sep}`) || !existsSync(source)) continue;
+        const target = join(staging, "artifacts", artifact.digest);
+        copyFileSync(source, target);
+      }
+      const verification = this.ledger.database.db.prepare("SELECT * FROM assertion_results WHERE run_id = ? ORDER BY completed_at").all(runId).map((row) => redact({ ...row, evidenceArtifactIds: parse(row.evidence_artifact_ids_json, []), result: parse(row.result_json) }));
+      writeFileSync(join(staging, "verification", "results.json"), `${json(verification)}\n`);
+      const snapshots = this.ledger.database.db.prepare("SELECT * FROM snapshots WHERE run_id = ? ORDER BY created_at").all(runId).map((row) => redact({ ...row, manifest: parse(row.manifest_json, {}) }));
+      writeFileSync(join(staging, "snapshots", "index.json"), `${json(snapshots)}\n`);
+      const files = []; for (const name of readdirSync(staging, { recursive: true })) { if (name === "checksums.sha256") continue; const file = join(staging, name); if (lstatSync(file).isFile()) files.push(name.replaceAll("\\", "/")); }
+      writeFileSync(join(staging, "checksums.sha256"), `${files.sort().map((name) => `${hash(readFileSync(join(staging, name)))}  ${name}`).join("\n")}\n`);
+      mkdirSync(dirname(destination), { recursive: true });
+      const zipped = await runProcess("zip", ["-q", "-r", destination, "."], { cwd: staging, timeoutMs: 120_000 });
+      if (zipped.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", `zip failed: ${zipped.stderr}`);
+      const digest = hash(readFileSync(destination)); this.ledger.database.db.prepare("INSERT OR REPLACE INTO capsules(id, run_id, path, manifest_json, digest, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`capsule_${randomUUID()}`, runId, destination, json(manifest), digest, now()); this.ledger.appendEvent({ runId, type: "artifact-created", payload: { kind: "capsule", path: destination, digest } }); return { path: destination, digest, manifest };
+    } finally { await rm(staging, { recursive: true, force: true }); }
+  }
+  referencedArtifactRows(runId) {
+    const digests = new Set();
+    const run = this.ledger.getRun(runId);
+    for (const event of run?.events ?? []) for (const key of ["inputDigest", "outputDigest", "contractDigest"]) if (typeof event.payload?.[key] === "string") digests.add(event.payload[key]);
+    for (const row of this.ledger.database.db.prepare("SELECT evidence_artifact_ids_json FROM assertion_results WHERE run_id = ?").all(runId)) for (const digest of parse(row.evidence_artifact_ids_json, [])) if (typeof digest === "string") digests.add(digest);
+    for (const row of this.ledger.database.db.prepare("SELECT se.artifact_digest FROM snapshot_entries se JOIN snapshots s ON s.id = se.snapshot_id WHERE s.run_id = ? AND se.artifact_digest IS NOT NULL").all(runId)) digests.add(row.artifact_digest);
+    return [...digests].map((digest) => this.ledger.database.db.prepare("SELECT digest, path FROM artifacts WHERE digest = ?").get(digest)).filter(Boolean);
   }
   async verify(path) {
     requireExperimental(this.featureFlags, "capsules");

@@ -1480,7 +1480,13 @@ async function capabilityCommand(args) {
 }
 
 async function timeline(args) {
-  const { runtime } = runtimeFor(args); try { const runId = args.find((value) => !value.startsWith("--")); const run = runtime.ledger.getRun(runId); if (!run) throw new Error(`run not found: ${runId}`); await printJson({ run: runtime.ledger.hydrateRun ? runtime.ledger.hydrateRun : undefined, steps: run.steps, events: run.events }); } finally { runtime.ledger.close(); }
+  const { runtime } = runtimeFor(args); try {
+    const runId = args.find((value) => !value.startsWith("--"));
+    const run = runtime.ledger.getRun(runId);
+    if (!run) throw new Error(`run not found: ${runId}`);
+    const { steps, events, ...metadata } = run;
+    await printJson({ run: metadata, steps, events });
+  } finally { runtime.ledger.close(); }
 }
 
 async function rewindCommand(command, args) {

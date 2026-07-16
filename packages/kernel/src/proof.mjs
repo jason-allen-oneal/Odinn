@@ -9,8 +9,12 @@ export const PROOF_CONTRACT_SCHEMA_VERSION = 1;
 const CONTRACT_KEYS = new Set(["schemaVersion", "id", "runId", "description", "assertions"]);
 const COMMAND_KEYS = new Set(["id", "type", "command", "cwd", "timeoutMs", "expect"]);
 const FILE_KEYS = new Set(["id", "type", "path", "expect"]);
+const HTTP_KEYS = new Set(["id", "type", "url", "method", "timeoutMs", "expect"]);
+const GIT_KEYS = new Set(["id", "type", "cwd", "expect"]);
 const COMMAND_EXPECT_KEYS = new Set(["exitCode", "stdout", "stderr"]);
 const FILE_EXPECT_KEYS = new Set(["exists", "content"]);
+const HTTP_EXPECT_KEYS = new Set(["status", "body"]);
+const GIT_EXPECT_KEYS = new Set(["clean"]);
 const MATCHER_KEYS = new Set(["equals", "contains", "matches", "flags"]);
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
@@ -124,6 +128,33 @@ function normalizeFileAssertion(value, position) {
   };
 }
 
+function normalizeHttpAssertion(value, position) {
+  const label = `assertions[${position}]`;
+  assertKnownKeys(value, HTTP_KEYS, label);
+  const url = requiredString(value.url, `${label}.url`, 4_096);
+  let parsed;
+  try { parsed = new URL(url); } catch { throw new TypeError(`${label}.url must be a valid URL`); }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.hash) throw new TypeError(`${label}.url must be an http(s) URL without credentials or fragments`);
+  const method = value.method === undefined ? "GET" : requiredString(value.method, `${label}.method`, 8).toUpperCase();
+  if (!['GET', 'HEAD'].includes(method)) throw new TypeError(`${label}.method must be GET or HEAD`);
+  const timeoutMs = value.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : value.timeoutMs;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) throw new TypeError(`${label}.timeoutMs must be an integer from 1 through 300000`);
+  assertObject(value.expect, `${label}.expect`);
+  assertKnownKeys(value.expect, HTTP_EXPECT_KEYS, `${label}.expect`);
+  if (!Number.isInteger(value.expect.status) || value.expect.status < 100 || value.expect.status > 599) throw new TypeError(`${label}.expect.status must be an HTTP status code`);
+  return { id: identifier(value.id, `${label}.id`), type: "http", url, method, timeoutMs, expect: { status: value.expect.status, ...(value.expect.body === undefined ? {} : { body: normalizeMatcher(value.expect.body, `${label}.expect.body`) }) } };
+}
+
+function normalizeGitAssertion(value, position) {
+  const label = `assertions[${position}]`;
+  assertKnownKeys(value, GIT_KEYS, label);
+  const cwd = value.cwd === undefined ? undefined : requiredString(value.cwd, `${label}.cwd`, 4_096);
+  assertObject(value.expect, `${label}.expect`);
+  assertKnownKeys(value.expect, GIT_EXPECT_KEYS, `${label}.expect`);
+  if (typeof value.expect.clean !== "boolean") throw new TypeError(`${label}.expect.clean must be a boolean`);
+  return { id: identifier(value.id, `${label}.id`), type: "git", ...(cwd === undefined ? {} : { cwd }), expect: { clean: value.expect.clean } };
+}
+
 export function validateVerificationContract(input) {
   assertObject(input, "verification contract");
   assertKnownKeys(input, CONTRACT_KEYS, "verification contract");
@@ -137,7 +168,9 @@ export function validateVerificationContract(input) {
     assertObject(assertion, `assertions[${position}]`);
     if (assertion.type === "command") return normalizeCommandAssertion(assertion, position);
     if (assertion.type === "file") return normalizeFileAssertion(assertion, position);
-    throw new TypeError(`assertions[${position}].type must be 'command' or 'file'`);
+    if (assertion.type === "http") return normalizeHttpAssertion(assertion, position);
+    if (assertion.type === "git") return normalizeGitAssertion(assertion, position);
+    throw new TypeError(`assertions[${position}].type must be 'command', 'file', 'http', or 'git'`);
   });
   const seen = new Set();
   for (const assertion of assertions) {
@@ -192,6 +225,12 @@ function matchesText(actual, matcher) {
   if (matcher.equals !== undefined) return actual === matcher.equals;
   if (matcher.contains !== undefined) return actual.includes(matcher.contains);
   return new RegExp(matcher.matches, matcher.flags ?? "").test(actual);
+}
+
+function isLoopbackUrl(value) {
+  const parsed = new URL(value);
+  const hostname = parsed.hostname.toLowerCase();
+  return hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
 
 function captureProcess(command, { cwd, timeoutMs, maxOutputBytes }) {
@@ -258,7 +297,7 @@ function assertionExpectation(assertion) {
 }
 
 export class ProofVerifier {
-  constructor({ runLedger, allowedRoot, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, maxFileBytes = DEFAULT_MAX_FILE_BYTES } = {}) {
+  constructor({ runLedger, allowedRoot, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, maxFileBytes = DEFAULT_MAX_FILE_BYTES, allowExternalHttp = false } = {}) {
     if (!runLedger || typeof runLedger.getRun !== "function" || typeof runLedger.appendEvent !== "function") {
       throw new TypeError("ProofVerifier requires a RunLedger");
     }
@@ -275,6 +314,7 @@ export class ProofVerifier {
     this.allowedRoot = resolve(allowedRoot ?? runLedger.workspaceRoot ?? process.cwd());
     this.maxOutputBytes = maxOutputBytes;
     this.maxFileBytes = maxFileBytes;
+    this.allowExternalHttp = allowExternalHttp === true;
   }
 
   async verify(input) {
@@ -312,7 +352,11 @@ export class ProofVerifier {
       try {
         result = assertion.type === "command"
           ? await this.verifyCommand(assertion, root)
-          : await this.verifyFile(assertion, root);
+          : assertion.type === "file"
+            ? await this.verifyFile(assertion, root)
+            : assertion.type === "http"
+              ? await this.verifyHttp(assertion)
+              : await this.verifyGit(assertion, root);
       } catch (error) {
         result = this.failedResult(assertion, `assertion execution failed: ${error.message}`, {});
       }
@@ -408,6 +452,34 @@ export class ProofVerifier {
       if (!matchesText(content, assertion.expect.content)) return this.failedResult(assertion, "file content did not match expectation", actual);
     }
     return this.passedResult(assertion, "file assertion passed", actual);
+  }
+
+  async verifyHttp(assertion) {
+    if (!this.allowExternalHttp && !isLoopbackUrl(assertion.url)) return this.failedResult(assertion, "external HTTP verification is disabled by default", { url: assertion.url });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), assertion.timeoutMs);
+    const startedAt = new Date().toISOString();
+    try {
+      const response = await fetch(assertion.url, { method: assertion.method, redirect: "error", signal: controller.signal });
+      const body = assertion.method === "HEAD" ? "" : (await response.text()).slice(0, this.maxOutputBytes);
+      const failures = [];
+      if (response.status !== assertion.expect.status) failures.push(`expected HTTP status ${assertion.expect.status}, received ${response.status}`);
+      if (assertion.expect.body && !matchesText(body, assertion.expect.body)) failures.push("HTTP response body did not match expectation");
+      return { id: assertion.id, type: assertion.type, status: failures.length ? "failed" : "passed", passed: failures.length === 0, message: failures.length ? failures.join("; ") : "HTTP assertion passed", expected: assertion.expect, actual: { status: response.status, body }, startedAt, completedAt: new Date().toISOString() };
+    } catch (error) {
+      return this.failedResult(assertion, `HTTP assertion failed: ${error.name === "AbortError" ? `timed out after ${assertion.timeoutMs}ms` : error.message}`, { url: assertion.url });
+    } finally { clearTimeout(timer); }
+  }
+
+  async verifyGit(assertion, root) {
+    let cwdResult;
+    try { cwdResult = await resolveAllowedPath(root, assertion.cwd ?? "."); }
+    catch (error) { return this.failedResult(assertion, error.message, { cwd: assertion.cwd ?? "." }); }
+    if (!cwdResult.exists) return this.failedResult(assertion, `git working directory does not exist: ${assertion.cwd ?? "."}`, { cwd: assertion.cwd ?? "." });
+    const actual = await captureProcess(["git", "status", "--porcelain"], { cwd: cwdResult.path, timeoutMs: DEFAULT_TIMEOUT_MS, maxOutputBytes: this.maxOutputBytes });
+    const clean = actual.exitCode === 0 && actual.stdout.trim() === "";
+    const passed = clean === assertion.expect.clean && actual.exitCode === 0;
+    return { id: assertion.id, type: assertion.type, status: passed ? "passed" : "failed", passed, message: passed ? "git assertion passed" : `expected clean=${assertion.expect.clean}, received clean=${clean}`, expected: assertion.expect, actual, startedAt: actual.startedAt, completedAt: actual.completedAt };
   }
 
   passedResult(assertion, message, actual) {

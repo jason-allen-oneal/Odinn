@@ -44,7 +44,7 @@ const errorMessage = (error: unknown): string => error instanceof Error ? error.
 
 function isPlainObject(value: unknown): value is JsonObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
+  const prototype = Reflect.getPrototypeOf(value as object);
   return prototype === Object.prototype || prototype === null;
 }
 
@@ -93,7 +93,7 @@ function normalizeMatcher(value: unknown, label: string): Matcher {
     try { new RegExp(pattern, flags); } catch (error) { throw new TypeError(`${label}.matches is not a valid regular expression: ${errorMessage(error)}`); }
     return { matches: pattern, ...(flags ? { flags } : {}) };
   }
-  return { [operator]: pattern } as Matcher;
+  return operator === "equals" ? { equals: pattern } : { contains: pattern };
 }
 
 function normalizeCommandAssertion(value: JsonObject, position: number): CommandAssertion {
@@ -259,7 +259,7 @@ function isLoopbackUrl(value: string) {
   return hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
 
-function terminateProcessTree(child: any) {
+function terminateProcessTree(child: { pid?: number; kill(signal?: NodeJS.Signals | number): boolean }) {
   if (!child?.pid) return;
   if (process.platform === "win32") {
     const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
@@ -299,8 +299,8 @@ function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes, env
         terminateProcessTree(child);
       }
     };
-    child.stdout.on("data", (chunk) => collect(stdout, chunk, "stdout"));
-    child.stderr.on("data", (chunk) => collect(stderr, chunk, "stderr"));
+    child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk, "stdout"));
+    child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk, "stderr"));
     child.once("error", (error) => { spawnError = error; });
     const timer = setTimeout(() => {
       timedOut = true;

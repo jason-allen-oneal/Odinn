@@ -2,7 +2,7 @@
 import { createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { chmod, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { chmod, lstat, readFile, realpath, readdir, rename, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -23,13 +23,28 @@ export async function verifyPassword(password: any, record: any) {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-export async function createMultiUserHost({ stateDir = ".odinn-host", users, publicOrigin, tls, loginLimits = {} }: any = {}) {
+export async function createMultiUserHost({ stateDir = ".odinn-host", users, publicOrigin, tls, loginLimits = {}, tenantLimits = {} }: any = {}) {
   const root = resolve(stateDir);
   await ensureSecureStateDirectory(root);
-  const records: any = users ?? JSON.parse(await readFile(join(root, "users.json"), "utf8"));
-  const usersById: Map<string, any> = new Map((records.users ?? []).filter((user: any) => !user.disabled).map((user: any) => [user.id, user]));
+  const usersPath = join(root, "users.json");
+  let usersById: Map<string, any> = new Map();
+  const loadUsers = async () => {
+    const records: any = users ?? JSON.parse(await readFile(usersPath, "utf8"));
+    const active = [];
+    for (const user of records.users ?? []) {
+      if (user.disabled) continue;
+      active.push({ ...user, workspaceRoot: await realpath(resolve(user.workspaceRoot)) });
+    }
+    assertNonOverlappingWorkspaces(active);
+    usersById = new Map(active.map((user: any) => [user.id, user]));
+    return usersById;
+  };
+  await loadUsers();
   const sessions: Map<string, any> = new Map();
   const tenants: Map<string, any> = new Map();
+  const tenantIdleMs = Math.max(30_000, Number(tenantLimits.idleMs ?? 15 * 60 * 1000));
+  const maximumTenantStorageBytes = Math.max(1_000_000, Number(tenantLimits.maximumStorageBytes ?? 2 * 1024 * 1024 * 1024));
+  const maximumActiveTenants = Math.max(1, Number(tenantLimits.maximumActiveTenants ?? 50));
   const attemptsPath = join(root, "login-attempts.json");
   const loginAttempts: Map<string, any> = new Map();
   const sessionKey = randomBytes(32);
@@ -57,19 +72,33 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
   };
 
   async function tenant(user: any) {
-    if (tenants.has(user.id)) return tenants.get(user.id);
+    if (tenants.has(user.id)) {
+      const current = tenants.get(user.id);
+      current.lastUsedAt = Date.now();
+      return current;
+    }
+    if (tenants.size >= maximumActiveTenants) await evictOldestTenant(tenants);
     const userState = resolve(root, "users", user.id);
     if (!userState.startsWith(`${root}${sep}`)) throw new Error("invalid tenant state path");
     const workspaceRoot = await realpath(resolve(user.workspaceRoot));
-    const gateway = await createGatewayServer({ stateDir: userState, workspaceRoot });
+    const gateway = await createGatewayServer({ stateDir: userState, workspaceRoot, quotas: user.quotas ?? tenantLimits });
     await new Promise((resolveListen: any) => gateway.listen(0, "127.0.0.1", resolveListen));
-    const value = { gateway, port: (gateway.address() as any).port, token: (gateway as any).odinnAuthToken };
+    const value = { gateway, port: (gateway.address() as any).port, token: (gateway as any).odinnAuthToken, stateDir: userState, lastUsedAt: Date.now() };
     tenants.set(user.id, value);
     return value;
   }
 
+  const evictionTimer = setInterval(() => {
+    const cutoff = Date.now() - tenantIdleMs;
+    for (const [id, value] of tenants) {
+      if (value.lastUsedAt < cutoff) closeTenant(id, value, tenants).catch(() => undefined);
+    }
+  }, Math.min(tenantIdleMs, 60_000));
+  evictionTimer.unref();
+
   const handler = async (request: any, response: any) => {
     try {
+      if (!users) await loadUsers();
       const origin = request.headers.origin;
       const mutating = !["GET", "HEAD", "OPTIONS"].includes(request.method || "GET");
       if (publicOrigin && mutating && origin !== publicOrigin) return send(response, 403, { error: "origin rejected" });
@@ -114,8 +143,14 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
         return send(response, 200, { ok: true });
       }
       const user = usersById.get(session.userId);
-      if (!user) return send(response, 403, { error: "user disabled" });
+      if (!user) {
+        sessions.delete(session.id);
+        const current = tenants.get(session.userId);
+        if (current) await closeTenant(session.userId, current, tenants);
+        return send(response, 403, { error: "user disabled" });
+      }
       const backend = await tenant(user);
+      if (!['GET', 'HEAD'].includes(request.method || 'GET') && await directorySize(backend.stateDir) > maximumTenantStorageBytes) return send(response, 507, { error: "tenant storage quota exceeded" });
       proxy(request, response, backend);
     } catch (error: any) {
       console.error("Odinn host request failed:", error);
@@ -125,7 +160,8 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
   const server: any = tls ? createHttpsServer(tls, handler) : createHttpServer(handler);
   const close = server.close.bind(server);
   server.close = (callback: any) => {
-    Promise.allSettled([...tenants.values()].map(({ gateway }: any) => new Promise((done: any) => gateway.close(() => done())))).then(() => close(callback));
+    clearInterval(evictionTimer);
+    void Promise.allSettled([...tenants.values()].map(({ gateway }: any) => new Promise((done: any) => gateway.close(() => done())))).then(() => close(callback));
     return server;
   };
   return server;
@@ -146,10 +182,20 @@ export async function addHostUser({ stateDir = ".odinn-host", id, password, work
 }
 
 function proxy(incoming: any, outgoing: any, backend: any) {
-  const headers = { ...incoming.headers, host: `127.0.0.1:${backend.port}`, authorization: `Bearer ${backend.token}` };
-  delete headers.cookie;
-  if (headers.origin) headers.origin = `http://127.0.0.1:${backend.port}`;
-  const request = httpRequest({ hostname: "127.0.0.1", port: backend.port, path: incoming.url, method: incoming.method, headers }, (response: any) => {
+  const headers: Record<string, string | string[] | undefined> = {
+    host: `127.0.0.1:${backend.port}`,
+    authorization: `Bearer ${backend.token}`,
+    "content-type": incoming.headers["content-type"],
+    "content-length": incoming.headers["content-length"],
+    accept: incoming.headers.accept,
+    "accept-encoding": incoming.headers["accept-encoding"],
+    "last-event-id": incoming.headers["last-event-id"],
+    "idempotency-key": incoming.headers["idempotency-key"],
+    origin: incoming.headers.origin ? `http://127.0.0.1:${backend.port}` : undefined,
+    "sec-fetch-site": incoming.headers["sec-fetch-site"]
+  };
+  const sanitizedHeaders = Object.fromEntries(Object.entries(headers).filter(([, value]) => value !== undefined));
+  const request = httpRequest({ hostname: "127.0.0.1", port: backend.port, path: incoming.url, method: incoming.method, headers: sanitizedHeaders }, (response: any) => {
     const forwarded = { ...response.headers }; delete forwarded["set-cookie"];
     outgoing.writeHead(response.statusCode ?? 502, forwarded); response.pipe(outgoing);
   });
@@ -158,6 +204,43 @@ function proxy(incoming: any, outgoing: any, backend: any) {
     send(outgoing, 502, { error: "tenant gateway unavailable" });
   });
   incoming.pipe(request);
+}
+
+function assertNonOverlappingWorkspaces(users: any[]) {
+  for (let leftIndex = 0; leftIndex < users.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < users.length; rightIndex += 1) {
+      const left = resolve(users[leftIndex].workspaceRoot);
+      const right = resolve(users[rightIndex].workspaceRoot);
+      if (left === right || left.startsWith(`${right}${sep}`) || right.startsWith(`${left}${sep}`)) {
+        throw new Error(`tenant workspaces overlap: ${users[leftIndex].id} and ${users[rightIndex].id}`);
+      }
+    }
+  }
+}
+
+async function directorySize(root: string): Promise<number> {
+  let total = 0;
+  const walk = async (directory: string) => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const metadata = await lstat(path);
+      if (metadata.isSymbolicLink()) continue;
+      if (metadata.isDirectory()) await walk(path);
+      else if (metadata.isFile()) total += metadata.size;
+    }
+  };
+  try { await walk(root); } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+  return total;
+}
+
+async function closeTenant(id: string, value: any, tenants: Map<string, any>) {
+  tenants.delete(id);
+  await new Promise<void>((resolveClose) => value.gateway.close(() => resolveClose()));
+}
+
+async function evictOldestTenant(tenants: Map<string, any>) {
+  const oldest = [...tenants.entries()].sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)[0];
+  if (oldest) await closeTenant(oldest[0], oldest[1], tenants);
 }
 
 function authenticate(request: any, sessions: any, key: any) {

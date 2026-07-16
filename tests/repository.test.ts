@@ -36,6 +36,20 @@ test("third-party workflow actions are pinned to immutable commit SHAs", async (
   }
 });
 
+test("workflow Node entrypoints exist after source migrations", async () => {
+  const workflowRoot = new URL("../.github/workflows/", import.meta.url);
+  for (const file of await readdir(workflowRoot)) {
+    if (!file.endsWith(".yml") && !file.endsWith(".yaml")) continue;
+    const content = await readFile(new URL(file, workflowRoot), "utf8");
+    for (const match of content.matchAll(/\bnode\s+(scripts\/[A-Za-z0-9_./-]+\.[cm]?[jt]s)\b/g)) {
+      await assert.doesNotReject(
+        readFile(new URL(`../${match[1]}`, import.meta.url)),
+        `${file} references missing Node entrypoint ${match[1]}`
+      );
+    }
+  }
+});
+
 test("obsolete technical identifiers are absent from canonical metadata", async () => {
   for (const file of ["package.json", "pnpm-workspace.yaml", "README.md"]) {
     const content = await read(file);

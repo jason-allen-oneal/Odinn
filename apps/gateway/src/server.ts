@@ -1,14 +1,51 @@
 import { createServer } from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { access, chmod, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, toolSafetyDescriptor, validatePolicy } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, runTask as executeTask, toolSafetyDescriptor, validatePolicy } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
 const PUBLIC_DIR = fileURLToPath(new URL("../public/", import.meta.url));
+
+function createQuotaGate(value: any = {}) {
+  const maximumActiveJobs = Math.max(1, Number(value.maximumActiveJobs ?? 8));
+  const maximumBrowserActionsPerHour = Math.max(1, Number(value.maximumBrowserActionsPerHour ?? 200));
+  const maximumModelCallsPerHour = Math.max(1, Number(value.maximumModelCallsPerHour ?? 120));
+  const maximumModelTokensPerDay = Math.max(1_000, Number(value.maximumModelTokensPerDay ?? 2_000_000));
+  const browserActions: number[] = [];
+  const modelCalls: number[] = [];
+  const tokenUsage: Array<{ at: number; tokens: number }> = [];
+  const prune = (entries: number[], horizon: number) => {
+    const cutoff = Date.now() - horizon;
+    while (entries[0] !== undefined && entries[0] < cutoff) entries.shift();
+  };
+  return {
+    maximumActiveJobs,
+    checkTool(tool: string) {
+      if (String(tool).startsWith("browser.") && !["browser.tabs", "browser.snapshot", "browser.recovery.status"].includes(tool)) {
+        prune(browserActions, 60 * 60 * 1000);
+        if (browserActions.length >= maximumBrowserActionsPerHour) throw new GatewayError(429, "tenant browser-action quota exceeded");
+        browserActions.push(Date.now());
+      }
+      if (["model.chat", "agent.run"].includes(tool)) {
+        prune(modelCalls, 60 * 60 * 1000);
+        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        while (tokenUsage[0] && tokenUsage[0].at < cutoff) tokenUsage.shift();
+        if (modelCalls.length >= maximumModelCallsPerHour) throw new GatewayError(429, "tenant model-call quota exceeded");
+        if (tokenUsage.reduce((sum, item) => sum + item.tokens, 0) >= maximumModelTokensPerDay) throw new GatewayError(429, "tenant model-token quota exceeded");
+        modelCalls.push(Date.now());
+      }
+    },
+    recordUsage(tool: string, usage: any) {
+      if (!["model.chat", "agent.run"].includes(tool)) return;
+      const tokens = Number(usage?.totalTokens ?? usage?.total_tokens ?? 0);
+      if (Number.isFinite(tokens) && tokens > 0) tokenUsage.push({ at: Date.now(), tokens });
+    }
+  };
+}
 
 class GatewayError extends Error {
   status: number;
@@ -18,10 +55,262 @@ class GatewayError extends Error {
   }
 }
 
+class CronStore {
+  path: string;
+  writeChain: Promise<unknown> = Promise.resolve();
+  constructor(path: string) { this.path = path; }
+  async read() {
+    try {
+      const value = JSON.parse(await readFile(this.path, "utf8"));
+      return value?.schemaVersion === 1 && Array.isArray(value.jobs) ? value : { schemaVersion: 1, jobs: [] };
+    } catch (error: any) {
+      if (error?.code === "ENOENT") return { schemaVersion: 1, jobs: [] };
+      throw error;
+    }
+  }
+  async list() { return (await this.read()).jobs.sort((left: any, right: any) => String(left.name).localeCompare(String(right.name))); }
+  async mutate(operation: (jobs: any[]) => any) {
+    const pending = this.writeChain.then(async () => {
+      const state = await this.read();
+      const result = await operation(state.jobs);
+      await mkdir(dirname(this.path), { recursive: true });
+      const temporary = `${this.path}.${process.pid}.${Date.now()}.tmp`;
+      await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+      await rename(temporary, this.path);
+      await chmod(this.path, 0o600);
+      return result;
+    });
+    this.writeChain = pending.catch(() => undefined);
+    return pending;
+  }
+  async create(input: any) {
+    return this.mutate((jobs) => {
+      const job = normalizeCronJob({ ...input, id: input.id || `cron_${randomBytes(8).toString("hex")}`, createdAt: new Date().toISOString() });
+      if (jobs.some((item) => item.id === job.id)) throw new GatewayError(409, "cron job id already exists");
+      jobs.push(job);
+      return job;
+    });
+  }
+  async update(id: string, patch: any) {
+    return this.mutate((jobs) => {
+      const index = jobs.findIndex((item) => item.id === id);
+      if (index < 0) throw new GatewayError(404, "cron job not found");
+      jobs[index] = normalizeCronJob({ ...jobs[index], ...patch, id, updatedAt: new Date().toISOString() });
+      return jobs[index];
+    });
+  }
+  async remove(id: string) {
+    return this.mutate((jobs) => {
+      const index = jobs.findIndex((item) => item.id === id);
+      if (index < 0) throw new GatewayError(404, "cron job not found");
+      jobs.splice(index, 1);
+    });
+  }
+  async nextWake() {
+    const enabled = (await this.list()).filter((job: any) => job.enabled);
+    const values = enabled.map((job: any) => nextCronWake(job.schedule, job.timezone)).filter(Boolean).sort();
+    return values[0] ?? null;
+  }
+}
+
+class AgentPackageStore {
+  path: string;
+  writeChain: Promise<unknown> = Promise.resolve();
+  constructor(path: string) { this.path = path; }
+  async read() {
+    try {
+      const value = JSON.parse(await readFile(this.path, "utf8"));
+      return value?.schemaVersion === 1 && Array.isArray(value.agents) ? value : { schemaVersion: 1, agents: [] };
+    } catch (error: any) {
+      if (error?.code === "ENOENT") return { schemaVersion: 1, agents: [] };
+      throw error;
+    }
+  }
+  async list() { return (await this.read()).agents; }
+  async mutate(operation: (agents: any[]) => any) {
+    const pending = this.writeChain.then(async () => {
+      const state = await this.read();
+      const result = await operation(state.agents);
+      await mkdir(dirname(this.path), { recursive: true });
+      const temporary = `${this.path}.${process.pid}.${Date.now()}.tmp`;
+      await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+      await rename(temporary, this.path);
+      await chmod(this.path, 0o600);
+      return result;
+    });
+    this.writeChain = pending.catch(() => undefined);
+    return pending;
+  }
+  async install(input: any) {
+    const manifest = validateAgentPackage(input);
+    return this.mutate((agents) => {
+      const current = agents.find((agent) => agent.id === manifest.id);
+      const record = { ...manifest, status: "disabled", installedAt: new Date().toISOString(), previousVersion: current?.version };
+      const index = agents.findIndex((agent) => agent.id === manifest.id);
+      if (index >= 0) agents[index] = record; else agents.push(record);
+      return record;
+    });
+  }
+  async transition(id: string, action: string) {
+    return this.mutate((agents) => {
+      const agent = agents.find((item) => item.id === id);
+      if (!agent) throw new GatewayError(404, "agent package not found");
+      if (!['enable', 'disable', 'quarantine'].includes(action)) throw new GatewayError(400, "unsupported agent lifecycle action");
+      agent.status = action === 'enable' ? 'enabled' : action === 'disable' ? 'disabled' : 'quarantined';
+      agent.updatedAt = new Date().toISOString();
+      return agent;
+    });
+  }
+}
+
+function validateAgentPackage(input: any) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new GatewayError(400, "agent package manifest must be an object");
+  const id = String(input.id || "").trim();
+  const version = String(input.version || "").trim();
+  if (!/^[a-z0-9][a-z0-9._-]{1,63}$/u.test(id)) throw new GatewayError(400, "agent id must be lowercase and 2-64 characters");
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) throw new GatewayError(400, "agent version must be semantic");
+  const manifest = {
+    sdkVersion: String(input.sdkVersion || "0.3"), id, version,
+    name: String(input.name || id).slice(0, 120),
+    identity: input.identity && typeof input.identity === "object" ? input.identity : {},
+    instructions: Array.isArray(input.instructions) ? input.instructions.map(String) : [],
+    tools: Array.isArray(input.tools) ? input.tools.map(String) : [],
+    plugins: Array.isArray(input.plugins) ? input.plugins.map(String) : [],
+    secrets: Array.isArray(input.secrets) ? input.secrets.map(String) : [],
+    sandbox: input.sandbox && typeof input.sandbox === "object" ? input.sandbox : { mode: "workspace-write" },
+    network: input.network && typeof input.network === "object" ? input.network : { default: "deny", allow: [] },
+    schedules: Array.isArray(input.schedules) ? input.schedules : [],
+    channels: Array.isArray(input.channels) ? input.channels : [],
+    memory: input.memory && typeof input.memory === "object" ? input.memory : {},
+    tests: Array.isArray(input.tests) ? input.tests : []
+  };
+  const integrity = createHash("sha256").update(stableManifestJson(manifest)).digest("hex");
+  if (input.integrity && input.integrity !== integrity) throw new GatewayError(400, "agent package integrity mismatch");
+  return { ...manifest, integrity, validation: { valid: true, checkedAt: new Date().toISOString() } };
+}
+
+function stableManifestJson(value: any): string {
+  if (Array.isArray(value)) return `[${value.map(stableManifestJson).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableManifestJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value) ?? "null";
+}
+
+async function discoverSkills(root: string, state: string) {
+  const results: any[] = [];
+  const roots = [root, join(state, "skill-workshop")];
+  const walk = async (directory: string, depth: number) => {
+    if (depth > 5 || results.length >= 250) return;
+    let entries;
+    try { entries = await readdir(directory, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if ([".git", "node_modules", "dist", "coverage"].includes(entry.name)) continue;
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) await walk(path, depth + 1);
+      else if (entry.isFile() && entry.name === "SKILL.md") {
+        const content = await readFile(path, "utf8");
+        const frontmatter = /^---\s*\n([\s\S]*?)\n---/u.exec(content)?.[1] || "";
+        const name = /^name:\s*["']?([^\n"']+)/mu.exec(frontmatter)?.[1]?.trim() || path.split(sep).at(-2) || "skill";
+        const description = /^description:\s*["']?([^\n"']+)/mu.exec(frontmatter)?.[1]?.trim() || "No description";
+        results.push({ id: createHash("sha256").update(path).digest("hex").slice(0, 16), name, description, path, bytes: Buffer.byteLength(content), status: path.startsWith(join(state, "skill-workshop")) ? "draft" : "ready" });
+      }
+    }
+  };
+  for (const directory of roots) await walk(directory, 0);
+  return results;
+}
+
+function validateSkillDraft(input: any) {
+  const name = String(input.name || "").trim();
+  const description = String(input.description || "").trim();
+  const instructions = String(input.instructions || "").trim();
+  const errors = [];
+  if (!/^[a-z0-9][a-z0-9-]{1,63}$/u.test(name)) errors.push("name must be 2-64 lowercase letters, digits, or hyphens");
+  if (description.length < 12) errors.push("description must explain when the skill applies");
+  if (instructions.length < 40) errors.push("instructions must contain an actionable workflow");
+  const content = `---\nname: ${JSON.stringify(name)}\ndescription: ${JSON.stringify(description)}\n---\n\n# ${name}\n\n${instructions}\n`;
+  return { valid: errors.length === 0, errors, content, digest: createHash("sha256").update(content).digest("hex") };
+}
+
+function normalizeCronJob(value: any) {
+  const schedule = String(value.schedule || "").trim();
+  if (!cronParts(schedule)) throw new GatewayError(400, "cron schedule must contain five valid fields");
+  const tool = String(value.tool || "agent.run").trim();
+  if (!tool) throw new GatewayError(400, "cron job requires a tool");
+  return {
+    ...value,
+    schemaVersion: 1,
+    id: String(value.id),
+    name: String(value.name || value.id).trim().slice(0, 120),
+    schedule,
+    timezone: String(value.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"),
+    enabled: value.enabled !== false,
+    tool,
+    input: value.input && typeof value.input === "object" ? value.input : {},
+    updatedAt: value.updatedAt || new Date().toISOString()
+  };
+}
+
+function cronParts(schedule: string) {
+  const parts = schedule.split(/\s+/u);
+  if (parts.length !== 5 || parts.some((part) => !/^(?:\*|\*\/\d+|\d+(?:,\d+)*)$/u.test(part))) return null;
+  return parts;
+}
+
+function cronFieldMatches(field: string, value: number) {
+  if (field === "*") return true;
+  if (field.startsWith("*/")) return value % Number(field.slice(2)) === 0;
+  return field.split(",").map(Number).includes(value);
+}
+
+function cronDateParts(date: Date, timezone = "UTC") {
+  const values = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: timezone, minute: "numeric", hour: "numeric", day: "numeric", month: "numeric", weekday: "short", hourCycle: "h23" }).formatToParts(date).map((part) => [part.type, part.value]));
+  return { minute: Number(values.minute), hour: Number(values.hour), day: Number(values.day), month: Number(values.month), weekday: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(values.weekday) };
+}
+
+function cronMatches(schedule: string, date: Date, timezone = "UTC") {
+  const parts = cronParts(schedule);
+  const local = cronDateParts(date, timezone);
+  return Boolean(parts && cronFieldMatches(parts[0], local.minute) && cronFieldMatches(parts[1], local.hour) && cronFieldMatches(parts[2], local.day) && cronFieldMatches(parts[3], local.month) && cronFieldMatches(parts[4], local.weekday));
+}
+
+function nextCronWake(schedule: string, timezone = "UTC") {
+  const candidate = new Date();
+  candidate.setSeconds(0, 0);
+  candidate.setMinutes(candidate.getMinutes() + 1);
+  for (let index = 0; index < 366 * 24 * 60; index += 1) {
+    if (cronMatches(schedule, candidate, timezone)) return candidate.toISOString();
+    candidate.setMinutes(candidate.getMinutes() + 1);
+  }
+  return null;
+}
+
+async function runCronJob(store: CronStore, id: string, executor: any) {
+  const job = (await store.list()).find((item: any) => item.id === id);
+  if (!job) throw new GatewayError(404, "cron job not found");
+  const startedAt = new Date().toISOString();
+  try {
+    const result = await executor({ task: { id: `${job.id}:${Date.now()}`, tool: job.tool, input: job.input, actor: "cron", reason: `cron:${job.id}` } });
+    await store.update(id, { lastRunAt: startedAt, lastStatus: "ok", lastError: "", lastMinuteKey: startedAt.slice(0, 16) });
+    return result;
+  } catch (error) {
+    await store.update(id, { lastRunAt: startedAt, lastStatus: "error", lastError: error instanceof Error ? error.message : String(error), lastMinuteKey: startedAt.slice(0, 16) });
+    throw error;
+  }
+}
+
+async function runDueCronJobs(store: CronStore, executor: any) {
+  const now = new Date();
+  const minuteKey = now.toISOString().slice(0, 16);
+  for (const job of await store.list()) {
+    if (job.enabled && job.lastMinuteKey !== minuteKey && cronMatches(job.schedule, now, job.timezone)) await runCronJob(store, job.id, executor).catch(() => undefined);
+  }
+}
+
 export async function createGatewayServer({
   stateDir = ".odinn",
   workspaceRoot = process.cwd(),
-  requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES
+  requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES,
+  quotas = {}
 }: any = {}) {
   const state = resolve(stateDir);
   const root = resolve(workspaceRoot);
@@ -41,7 +330,13 @@ export async function createGatewayServer({
     execute: isolatedTaskExecutor
   });
   const runTask = (request: any): Promise<any> => isolatedTaskExecutor(request) as Promise<any>;
+  const quotaGate = createQuotaGate(quotas);
+  const cronStore = new CronStore(join(state, "cron-jobs.json"));
+  const agentStore = new AgentPackageStore(join(state, "agents.json"));
+  const extensionRegistry = new ExtensionRegistry(join(state, "extensions.json"));
   await supervisor.start();
+  const cronTimer = setInterval(() => runDueCronJobs(cronStore, isolatedTaskExecutor).catch(() => undefined), 30_000);
+  cronTimer.unref();
   const selfImprovement = normalizeSelfImprovementConfig(config.selfImprovement);
   const improvementTimer = selfImprovement.enabled && selfImprovement.mode === "auto"
     ? setInterval(() => runTask({ task: { tool: "improve.learn", input: { limit: 1000 }, actor: "autonomous-controller" } }).catch(() => undefined), selfImprovement.intervalMs)
@@ -88,6 +383,37 @@ export async function createGatewayServer({
           selfImprovement,
           pendingApprovals: approvalStore.list()
         });
+      }
+      if (request.method === "GET" && url.pathname === "/agents") {
+        return json(response, 200, { agents: await agentStore.list(), sdkVersion: "0.3" });
+      }
+      if (request.method === "POST" && url.pathname === "/agents/validate") {
+        return json(response, 200, { ok: true, manifest: validateAgentPackage(await readJson(request, { maxBytes: requestMaxBytes })) });
+      }
+      if (request.method === "POST" && url.pathname === "/agents") {
+        return json(response, 200, { ok: true, agent: await agentStore.install(await readJson(request, { maxBytes: requestMaxBytes })) });
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/agents/") && url.pathname.endsWith("/lifecycle")) {
+        const id = decodeURIComponent(url.pathname.slice("/agents/".length, -"/lifecycle".length));
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, { ok: true, agent: await agentStore.transition(id, body.action) });
+      }
+      if (request.method === "GET" && url.pathname === "/skills") {
+        const [files, extensions] = await Promise.all([discoverSkills(root, state), extensionRegistry.list()]);
+        return json(response, 200, { skills: [...files, ...extensions.filter((extension: any) => extension.type === "skill").map((extension: any) => ({ ...extension, status: extension.enabled ? "ready" : "disabled", path: extension.entrypoint }))] });
+      }
+      if (request.method === "POST" && url.pathname === "/skills/workshop/validate") {
+        return json(response, 200, validateSkillDraft(await readJson(request, { maxBytes: requestMaxBytes })));
+      }
+      if (request.method === "POST" && url.pathname === "/skills/workshop/save") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const validation = validateSkillDraft(body);
+        if (!validation.valid) throw new GatewayError(400, validation.errors.join("; "));
+        const directory = join(state, "skill-workshop", body.name);
+        await mkdir(directory, { recursive: true });
+        const path = join(directory, "SKILL.md");
+        await writeFile(path, validation.content, { mode: 0o600 });
+        return json(response, 200, { ok: true, path, digest: validation.digest, status: "draft" });
       }
       if (request.method === "GET" && url.pathname === "/runtime/runs") {
         return json(response, 200, runtime.ledger.listRuns({ limit: Number.parseInt(url.searchParams.get("limit") ?? "100", 10) }));
@@ -213,6 +539,25 @@ export async function createGatewayServer({
       if (request.method === "GET" && url.pathname === "/jobs") {
         return json(response, 200, { jobs: await supervisor.list() });
       }
+      if (request.method === "GET" && url.pathname === "/cron") {
+        return json(response, 200, { enabled: true, jobs: await cronStore.list(), nextWake: await cronStore.nextWake() });
+      }
+      if (request.method === "POST" && url.pathname === "/cron") {
+        return json(response, 200, { ok: true, job: await cronStore.create(await readJson(request, { maxBytes: requestMaxBytes })) });
+      }
+      if (request.method === "PATCH" && url.pathname.startsWith("/cron/")) {
+        const id = decodeURIComponent(url.pathname.slice("/cron/".length));
+        return json(response, 200, { ok: true, job: await cronStore.update(id, await readJson(request, { maxBytes: requestMaxBytes })) });
+      }
+      if (request.method === "DELETE" && url.pathname.startsWith("/cron/")) {
+        const id = decodeURIComponent(url.pathname.slice("/cron/".length));
+        await cronStore.remove(id);
+        return json(response, 200, { ok: true });
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/cron/") && url.pathname.endsWith("/run")) {
+        const id = decodeURIComponent(url.pathname.slice("/cron/".length, -"/run".length));
+        return json(response, 200, { ok: true, result: await runCronJob(cronStore, id, isolatedTaskExecutor) });
+      }
       if (request.method === "GET" && url.pathname.startsWith("/jobs/")) {
         const id = decodeURIComponent(url.pathname.slice("/jobs/".length));
         const job = await supervisor.get(id);
@@ -220,6 +565,8 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname === "/jobs") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const activeJobs = (await supervisor.list()).filter((job: any) => ["queued", "running"].includes(job.status)).length;
+        if (activeJobs >= quotaGate.maximumActiveJobs) throw new GatewayError(429, "tenant active-job quota exceeded");
         const id = body.id || request.headers["idempotency-key"] || undefined;
         const requestHash = hashRequest(body);
         if (id) {
@@ -454,14 +801,49 @@ export async function createGatewayServer({
           registry
         })).output);
       }
+      if (request.method === "POST" && url.pathname === "/run/stream") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        quotaGate.checkTool(body.tool);
+        response.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-store, no-transform",
+          connection: "keep-alive",
+          "x-accel-buffering": "no"
+        });
+        const controller = new AbortController();
+        request.once("aborted", () => controller.abort(new Error("client disconnected")));
+        response.once("close", () => { if (!response.writableEnded) controller.abort(new Error("client disconnected")); });
+        const sendEvent = (event: string, value: any) => response.write(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`);
+        try {
+          const result = await executeTask({
+            task: { ...body, id: body.id ?? request.headers["idempotency-key"], actor: body.actor ?? "gateway" },
+            auditStore,
+            policy,
+            registry,
+            signal: controller.signal,
+            runLedger: runtime.ledger,
+            onModelDelta: (delta: string) => sendEvent("delta", { delta })
+          });
+          quotaGate.recordUsage(body.tool, result.output?.usage);
+          sendEvent("result", result);
+        } catch (error) {
+          sendEvent("error", { error: error instanceof Error ? error.message : String(error) });
+        } finally {
+          response.end();
+        }
+        return;
+      }
       if (request.method === "POST" && url.pathname === "/run") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, await runTask({
+        quotaGate.checkTool(body.tool);
+        const result = await runTask({
           task: { ...body, id: body.id ?? request.headers["idempotency-key"], actor: body.actor ?? "gateway" },
           auditStore,
           policy,
           registry
-        }));
+        });
+        quotaGate.recordUsage(body.tool, result.output?.usage);
+        return json(response, 200, result);
       }
       if (request.method === "POST" && url.pathname === "/plan") {
         const plan = await readJson(request, { maxBytes: requestMaxBytes });
@@ -478,6 +860,7 @@ export async function createGatewayServer({
   const close = server.close.bind(server);
   server.close = (callback: any) => {
     if (improvementTimer) clearInterval(improvementTimer);
+    clearInterval(cronTimer);
     Promise.allSettled([supervisor.shutdown(), isolatedTaskExecutor.shutdown?.()])
       .then(() => close(callback))
       .catch((error: any) => callback?.(error));
@@ -1917,6 +2300,47 @@ function renderConsoleHtml() {
       .message.user { max-width: 88%; margin-right: 0; }
       .composer { width: calc(100% - 20px); margin-bottom: 10px; }
     }
+    .oc-page { max-width: 1320px; }
+    .oc-page .page-head h1 { color: #ff6969; }
+    .summary-bar { display: flex; align-items: center; gap: 34px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: #151a22; }
+    .summary-bar span { display: flex; align-items: center; gap: 10px; }
+    .summary-bar small { color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .08em; }
+    .summary-bar strong { color: var(--text); }
+    .table-panel { padding: 14px 18px; }
+    .data-table { min-width: 760px; overflow-x: auto; }
+    .data-row { display: grid; grid-template-columns: minmax(260px, 2fr) 110px 120px 130px minmax(120px, 1fr) 160px; align-items: center; gap: 12px; min-height: 58px; padding: 8px 10px; border-bottom: 1px solid #242b35; }
+    .data-row:last-child { border-bottom: 0; }
+    .data-head { min-height: 40px; color: var(--muted); background: #171c24; font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+    .session-table .data-row { grid-template-columns: minmax(280px, 2fr) 90px 100px 110px 120px 90px 150px; }
+    .data-primary { display: grid; gap: 4px; min-width: 0; }
+    .data-primary strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .data-primary small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .count-badge { display: inline-grid; place-items: center; min-width: 24px; height: 24px; border-radius: 999px; background: #222936; color: var(--muted); font-size: 12px; }
+    .session-filters { display: grid; grid-template-columns: minmax(260px, 1fr) 170px 170px; gap: 10px; padding: 12px 0; }
+    .session-detail { margin-top: 14px; }
+    .usage-grid, .agent-layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(320px, .8fr); gap: 14px; }
+    .bar-chart { display: flex; align-items: end; gap: 8px; min-height: 220px; padding-top: 20px; }
+    .bar-column { display: grid; flex: 1; grid-template-rows: 1fr auto; align-items: end; gap: 8px; height: 190px; text-align: center; color: var(--muted); font-size: 10px; }
+    .bar-column i { display: block; width: 100%; min-height: 3px; border-radius: 5px 5px 2px 2px; background: linear-gradient(180deg, #58c9ac, #277d69); }
+    .cron-card { display: grid; gap: 8px; padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: #12171f; }
+    .cron-card .cron-meta { display: flex; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: 12px; }
+    .editor-dialog { width: min(760px, calc(100vw - 40px)); padding: 0; border: 1px solid var(--line); border-radius: 14px; background: #11161e; color: var(--text); }
+    .editor-dialog::backdrop { background: rgba(0, 0, 0, .68); }
+    .editor-dialog form { display: grid; gap: 14px; padding: 20px; }
+    .editor-dialog textarea { min-height: 150px; }
+    .manifest-editor, .workshop-editor { min-height: 320px !important; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .danger-button { border-color: #71323c; background: #351b22; color: #ff9da8; }
+    .agent-package { cursor: pointer; }
+    .agent-package.selected { border-color: var(--accent); background: #14231f; }
+    .agent-inspector { display: grid; gap: 12px; }
+    .agent-section { padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #0d1218; }
+    .skill-card { min-height: 150px; }
+    .skill-path { word-break: break-all; }
+    @media (max-width: 900px) {
+      .usage-grid, .agent-layout, .workshop-grid { grid-template-columns: 1fr; }
+      .session-filters { grid-template-columns: 1fr; }
+      .summary-bar { align-items: flex-start; flex-direction: column; gap: 10px; }
+    }
   </style>
 </head>
 <body>
@@ -1971,14 +2395,13 @@ function renderConsoleHtml() {
         <details class="nav-more" open>
           <summary><span class="nav-group-label">More</span><span class="nav-chevron">⌄</span></summary>
           <button data-view="audit" data-title="Activity" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-activity"></use></svg></span><span class="nav-label">Activity</span></button>
-          <button data-view="runtime" data-title="Instances" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-servers"></use></svg></span><span class="nav-label">Instances</span></button>
           <button data-view="sessions" data-title="Sessions" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-session"></use></svg></span><span class="nav-label">Sessions</span></button>
-          <button data-view="runtime" data-title="Usage" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-usage"></use></svg></span><span class="nav-label">Usage</span></button>
-          <button data-view="plans" data-title="Cron Jobs" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-clock"></use></svg></span><span class="nav-label">Cron Jobs</span></button>
-          <button data-view="run" data-title="Tasks / Run Tool" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span><span class="nav-label">Tasks</span></button>
-          <button data-view="capabilities" data-title="Agents" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-agent"></use></svg></span><span class="nav-label">Agents</span></button>
-          <button data-view="capabilities" data-title="Skills" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-skill"></use></svg></span><span class="nav-label">Skills</span></button>
-          <button data-view="improvements" data-title="Skill Workshop" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Skill Workshop</span></button>
+          <button data-view="usage" data-title="Usage" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-usage"></use></svg></span><span class="nav-label">Usage</span></button>
+          <button data-view="cron" data-title="Cron Jobs" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-clock"></use></svg></span><span class="nav-label">Cron Jobs</span></button>
+          <button data-view="tasks" data-title="Tasks" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span><span class="nav-label">Tasks</span></button>
+          <button data-view="agents" data-title="Agents" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-agent"></use></svg></span><span class="nav-label">Agents</span></button>
+          <button data-view="skills" data-title="Skills" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-skill"></use></svg></span><span class="nav-label">Skills</span></button>
+          <button data-view="workshop" data-title="Skill Workshop" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Skill Workshop</span></button>
         </details>
         <div class="nav-group-label nav-advanced-label">Workspace</div>
         <button data-view="memory" data-title="Memory" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-memory"></use></svg></span><span class="nav-label">Memory</span></button>
@@ -2025,7 +2448,7 @@ function renderConsoleHtml() {
               <textarea id="chat-input" placeholder="Message Ódinn Forge..."></textarea>
               <div class="composer-footer">
                 <div class="row composer-tools">
-                  <button class="secondary" data-view-jump="run" title="Open tools" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span></button>
+                  <button class="secondary" data-view-jump="tasks" title="Open tasks" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span></button>
                   <select id="model-select" aria-label="Model">
                     <option value="">Configure a provider first</option>
                   </select>
@@ -2066,33 +2489,21 @@ function renderConsoleHtml() {
         </div>
       </section>
 
-      <section id="view-run" class="view">
-        <div class="page">
-          <div class="page-head">
-            <div><div class="section-kicker">Operator surface</div><h1>Run tools</h1><p>Execute an audited capability with a visible input and a inspectable result.</p></div>
-            <span class="chip ok">policy checked</span>
-          </div>
-          <div class="split">
-            <div class="panel stack">
-              <div class="panel-head"><h2>Tool runner</h2><button id="run" type="button">Execute</button></div>
-              <div class="field"><label for="tool">Capability</label><select id="tool"></select></div>
-              <div class="field"><label for="input">Input JSON</label><textarea id="input">{"text":"Hello, Ódinn Forge"}</textarea></div>
-              <div class="chip-row"><span class="chip">actor: gateway</span><span class="chip">audit: on</span><span class="chip">approval: policy</span></div>
-            </div>
-            <div class="panel stack"><div class="panel-head"><h2>Tool catalog</h2><span class="muted" id="tool-count">Loading</span></div><div id="tool-list" class="record-grid"></div></div>
-          </div>
-          <div class="panel stack"><div class="panel-head"><h2>Recent executions</h2><button class="secondary" data-view-jump="runtime" type="button">Open runtime</button></div><div id="run-history" class="record-grid"></div></div>
+      <section id="view-tasks" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Proof &amp; execution ledger</div><h1>Tasks</h1><p>Inspect work, verify captured proof, replay safe runs, and resolve failures without exposing an arbitrary tool shell.</p></div><button class="secondary" id="refresh-tasks" type="button">Refresh</button></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="task-total">0</strong><span>captured runs</span></div><div class="stat-card"><strong id="task-running">0</strong><span>running</span></div><div class="stat-card"><strong id="task-passed">0</strong><span>completed</span></div><div class="stat-card"><strong id="task-failed">0</strong><span>needs review</span></div></div>
+          <div class="panel table-panel"><div class="toolbar"><input id="task-query" placeholder="Filter by run, tool, actor, or status"><div class="chip-row"><button class="secondary task-filter active" data-task-filter="all" type="button">All</button><button class="secondary task-filter" data-task-filter="running" type="button">Running</button><button class="secondary task-filter" data-task-filter="failed" type="button">Failed</button></div></div><div class="data-table"><div class="data-row data-head"><span>Task</span><span>Status</span><span>Actor</span><span>Updated</span><span>Evidence</span><span>Actions</span></div><div id="task-table"></div></div></div>
+          <div class="panel stack"><div class="panel-head"><div><h2>Selected evidence</h2><span class="muted" id="task-detail-label">Select a task to inspect its audit and proof record.</span></div><div class="row"><button class="secondary" id="task-verify" type="button" disabled>Verify chain</button><button class="secondary" id="task-replay" type="button" disabled>Replay safe task</button></div></div><pre id="task-evidence" class="output">No task selected.</pre></div>
         </div>
       </section>
 
-      <section id="view-plans" class="view">
-        <div class="page">
-          <div class="page-head"><div><div class="section-kicker">Composable work</div><h1>Plans</h1><p>Chain capabilities into repeatable, auditable workflows.</p></div><span class="chip">local execution</span></div>
-          <div class="stat-strip"><div class="stat-card"><strong id="plan-count">2</strong><span>starter templates</span></div><div class="stat-card"><strong id="plan-run-count">0</strong><span>plan runs</span></div><div class="stat-card"><strong id="plan-last-status">—</strong><span>last result</span></div><div class="stat-card"><strong>JSON</strong><span>portable format</span></div></div>
-          <div class="split">
-            <div class="panel stack"><div class="panel-head"><h2>Plan studio</h2><button id="run-plan" type="button">Run plan</button></div><div class="tabs"><button class="active" data-plan-template="smoke" type="button">Smoke</button><button data-plan-template="readme" type="button">Read README</button></div><div class="field"><label for="plan">Plan definition</label><textarea id="plan"></textarea></div><div class="chip-row"><span class="chip ok">sequential steps</span><span class="chip">each step audited</span></div></div>
-            <div class="panel stack"><div class="panel-head"><h2>Recent plan runs</h2><span class="muted">click for detail</span></div><div id="plan-runs" class="list"></div></div>
-          </div>
+      <section id="view-cron" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Scheduled automation</div><h1>Cron Jobs</h1><p>Wakeups and recurring runs.</p></div><div class="row"><button id="new-cron" type="button">New Job</button><button class="secondary" id="refresh-cron" type="button">Refresh</button></div></div>
+          <div class="summary-bar"><span><small>ENABLED</small><strong id="cron-enabled">Yes</strong></span><span><small>JOBS</small><strong id="cron-count">0</strong></span><span><small>NEXT WAKE</small><strong id="cron-next">—</strong></span></div>
+          <div class="panel stack"><div class="panel-head"><div><h2>Jobs</h2><p class="muted">Persisted in the gateway and evaluated in each job's timezone.</p></div><span class="muted" id="cron-shown">0 shown</span></div><input id="cron-query" placeholder="Filter jobs"><div id="cron-list" class="list"></div></div>
+          <dialog id="cron-dialog" class="editor-dialog"><form method="dialog" id="cron-form"><div class="panel-head"><h2>Schedule a job</h2><button class="secondary" value="cancel" type="submit">Close</button></div><div class="grid-2"><div class="field"><label for="cron-name">Name</label><input id="cron-name" required></div><div class="field"><label for="cron-schedule">Cron expression</label><input id="cron-schedule" value="0 9 * * 1" required></div></div><div class="grid-2"><div class="field"><label for="cron-timezone">Timezone</label><input id="cron-timezone" value="America/New_York"></div><div class="field"><label for="cron-tool">Tool</label><select id="cron-tool"></select></div></div><div class="field"><label for="cron-input">Input JSON</label><textarea id="cron-input">{}</textarea></div><div class="row"><button id="save-cron" value="default" type="submit">Save Job</button></div></form></dialog>
         </div>
       </section>
 
@@ -2145,23 +2556,10 @@ function renderConsoleHtml() {
       </section>
 
       <section id="view-sessions" class="view">
-        <div class="page">
-          <div class="page-head"><div><div class="section-kicker">Conversation archive</div><h1>Sessions</h1><p>Browse transcripts, inspect routing, and resume work without digging through state files.</p></div><span class="chip">local records</span></div>
-          <div class="split">
-            <div class="panel stack"><div class="panel-head"><h2>New session</h2><button id="create-session" type="button">Create</button></div>
-            <div class="field">
-              <label for="session-title">Title</label>
-              <input id="session-title" value="Gateway beta session">
-            </div>
-            <div class="field">
-              <label for="session-message">Message</label>
-              <textarea id="session-message">Record a beta testing note.</textarea>
-            </div>
-            <button class="secondary" id="append-session-message" type="button">Append Message</button>
-          </div>
-            <div class="panel stack"><div class="panel-head"><h2>Session records</h2><span class="muted" id="session-page-count">Loading</span></div><div id="session-list" class="list"></div></div>
-          </div>
-          <div class="panel stack"><div class="panel-head"><h2>Selected transcript</h2><span class="chip" id="selected-session-route">No session selected</span></div><div id="session-transcript" class="timeline"><div class="empty-state"><strong>Select a session</strong><span>Its messages and model route will appear here.</span></div></div></div>
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Conversation archive</div><h1>Sessions</h1><p>Active sessions and defaults.</p></div><div class="row"><button id="create-session" type="button">New Session</button><button class="secondary" id="refresh-sessions" type="button">Refresh</button></div></div>
+          <div class="panel table-panel"><div class="panel-head"><div><h2>Sessions <span class="count-badge" id="session-count-badge">0</span></h2><span class="muted" id="session-page-count">Loading</span></div></div><div class="session-filters"><input id="session-query" placeholder="Filter by key, agent, label, kind..."><select id="session-status-filter"><option value="all">All statuses</option><option value="open">Open</option><option value="archived">Archived</option></select><select id="session-group"><option value="none">Group by None</option><option value="source">Group by source</option><option value="status">Group by status</option></select></div><div class="data-table session-table"><div class="data-row data-head"><span>Session</span><span>Kind</span><span>Status</span><span>Runtime</span><span>Updated</span><span>Messages</span><span>Actions</span></div><div id="session-list"></div></div></div>
+          <div class="panel stack session-detail"><div class="panel-head"><h2>Selected transcript</h2><span class="chip" id="selected-session-route">No session selected</span></div><div id="session-transcript" class="timeline"><div class="empty-state"><strong>Select a session</strong><span>Its messages and model route will appear here.</span></div></div></div>
         </div>
       </section>
 
@@ -2195,33 +2593,10 @@ function renderConsoleHtml() {
         </div>
       </section>
 
-      <section id="view-improvements" class="view">
-        <div class="page">
-          <div class="page-head"><div><div class="section-kicker">Autonomous learning</div><h1>Skill Workshop</h1><p>Observe repeated failures, apply bounded reliability tuning, and roll back from captured configuration snapshots.</p></div><span class="chip" id="improvement-mode">review mode</span></div>
-          <div class="split">
-            <div class="panel stack"><div class="panel-head"><div><h2>Evidence loop</h2><span class="muted">Mine repeated failures into reviewable proposals.</span></div><button id="learn-improvements" type="button">Analyze activity</button></div>
-            <div class="chip-row"><span class="chip ok">automatic observation</span><span class="chip">allowlisted changes only</span><span class="chip warn">never widens authority</span></div>
-            <div class="panel-head"><h2>Propose an improvement</h2><button id="propose-improvement" type="button">Propose</button></div>
-            <div class="field">
-              <label for="improvement-title">Title</label>
-              <input id="improvement-title" value="Make gateway console testable">
-            </div>
-            <div class="field">
-              <label for="improvement-rationale">Rationale</label>
-              <textarea id="improvement-rationale">Beta users need visible run history, state, records, and audit output without raw endpoint guessing.</textarea>
-            </div>
-            <div class="row">
-              <select id="improvement-decision" aria-label="Improvement decision">
-                <option>approved</option>
-                <option>rejected</option>
-                <option>applied</option>
-              </select>
-              <button class="secondary" id="decide-improvement" type="button">Decide Selected</button>
-              <button class="secondary" id="rollback-improvement" type="button">Rollback Selected</button>
-            </div>
-          </div>
-            <div class="panel stack"><div class="panel-head"><h2>Decision queue</h2><span class="muted">select a proposal to decide</span></div><div id="improvement-list" class="list"></div></div>
-          </div>
+      <section id="view-workshop" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Skill authoring pipeline</div><h1>Skill Workshop</h1><p>Draft, validate, and stage a real SKILL.md package. No vague self-improvement theater.</p></div><span class="chip warn" id="workshop-status">not validated</span></div>
+          <div class="split workshop-grid"><div class="panel stack"><div class="panel-head"><h2>Skill definition</h2><button id="validate-skill" type="button">Validate</button></div><div class="field"><label for="skill-draft-name">Package name</label><input id="skill-draft-name" value="odinn-operator-workflow"></div><div class="field"><label for="skill-draft-description">Trigger description</label><textarea id="skill-draft-description">Use when an operator needs a repeatable, audited Ódinn Forge workflow.</textarea></div><div class="field"><label for="skill-draft-instructions">Instructions</label><textarea id="skill-draft-instructions" class="workshop-editor">## Workflow\n\n1. Inspect the live state.\n2. Execute the bounded operation.\n3. Capture evidence and verify the result.\n4. Stop on unknown external outcomes.</textarea></div><div class="row"><button id="save-skill-draft" type="button" disabled>Save Draft Package</button><span class="muted">Saved drafts appear in Skills.</span></div></div><div class="panel stack"><div class="panel-head"><h2>Validation report</h2><span class="chip">SKILL.md</span></div><div id="skill-validation" class="empty-state"><strong>Run validation</strong><span>Frontmatter, trigger quality, workflow depth, and digest will appear here.</span></div><pre id="skill-preview" class="output">No generated package.</pre></div></div>
         </div>
       </section>
 
@@ -2233,54 +2608,16 @@ function renderConsoleHtml() {
         </div>
       </section>
 
-      <section id="view-runtime" class="view">
-        <div class="page">
-          <div class="page-head"><div><div class="section-kicker">Gateway operations</div><h1>Runtime</h1><p>Provider readiness, policy boundaries, filesystem paths, and recent execution health.</p></div><span class="pill" id="status-pill">Unknown</span></div>
-        <div class="runtime-grid">
-          <div class="stack">
-            <div class="panel">
-              <div class="panel-head">
-                <h2>Health snapshot</h2>
-                <span class="chip ok">loopback</span>
-              </div>
-              <div class="overview-grid">
-                <div class="metric"><span>Tools</span><strong id="metric-tools">0</strong></div>
-                <div class="metric"><span>Runs</span><strong id="metric-runs">0</strong></div>
-                <div class="metric"><span>Done</span><strong id="metric-completed">0</strong></div>
-                <div class="metric"><span>Caps</span><strong id="metric-policy">0</strong></div>
-              </div>
-              <div class="chip-row" id="runtime-chips"></div>
-            </div>
-            <div class="panel">
-              <div class="panel-head">
-                <h2>Recent Runs</h2>
-                <button class="secondary" data-view-jump="audit" type="button"><span class="icon">A</span> Audit</button>
-              </div>
-              <div id="runs" class="list"></div>
-            </div>
-            <div class="panel stack"><div class="panel-head"><h2>Configured providers</h2><span class="muted">credentials never shown</span></div><div id="provider-list" class="list"></div></div>
-          </div>
-          <div class="stack">
-            <div class="panel">
-              <div class="panel-head"><h2>Paths & policy</h2><span class="chip ok">enforced</span></div>
-              <div class="stack">
-                <div class="item">
-                  <span class="muted">Workspace</span>
-                  <strong id="status-workspace">...</strong>
-                </div>
-                <div class="item">
-                  <span class="muted">State</span>
-                  <strong id="status-state">...</strong>
-                </div>
-              </div>
-            </div>
-            <div class="panel">
-              <div class="panel-head"><h2>Inspector</h2><button class="secondary" id="clear-output" type="button">Clear</button></div>
-              <pre id="output" class="output">Ready.</pre>
-            </div>
-          </div>
-        </div>
-        </div>
+      <section id="view-usage" class="view">
+        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Runtime consumption</div><h1>Usage</h1><p>Model tokens, tool activity, failures, and provider routing from the signed audit trail.</p></div><span class="pill" id="status-pill">Unknown</span></div><div class="stat-strip"><div class="stat-card"><strong id="usage-total-tokens">0</strong><span>total tokens</span></div><div class="stat-card"><strong id="usage-model-calls">0</strong><span>model calls</span></div><div class="stat-card"><strong id="metric-runs">0</strong><span>runs</span></div><div class="stat-card"><strong id="usage-errors">0</strong><span>errors</span></div></div><div class="usage-grid"><div class="panel stack"><div class="panel-head"><h2>Activity by day</h2><span class="muted">last 14 days</span></div><div id="usage-chart" class="bar-chart"></div></div><div class="panel stack"><div class="panel-head"><h2>Provider routes</h2><span class="muted">credentials never shown</span></div><div id="provider-list" class="list"></div></div></div><div class="panel table-panel"><div class="panel-head"><h2>Recent metered runs</h2><button class="secondary" data-view-jump="audit" type="button">Open Audit</button></div><div id="runs" class="list"></div></div><div hidden><span id="metric-tools"></span><span id="metric-completed"></span><span id="metric-policy"></span><span id="runtime-chips"></span><span id="status-workspace"></span><span id="status-state"></span><span id="tool-count"></span><select id="tool"></select><div id="tool-list"></div><div id="run-history"></div><span id="plan-run-count"></span><span id="plan-last-status"></span><div id="plan-runs"></div></div><div class="panel" hidden><button id="clear-output" type="button">Clear</button><pre id="output">Ready.</pre></div></div>
+      </section>
+
+      <section id="view-agents" class="view">
+        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Agent SDK v0.3</div><h1>Agents</h1><p>Install, validate, enable, disable, quarantine, and inspect declarative agent packages.</p></div><div class="row"><button id="new-agent" type="button">Install Package</button><button class="secondary" id="refresh-agents" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="agent-total">0</strong><span>packages</span></div><div class="stat-card"><strong id="agent-enabled">0</strong><span>enabled</span></div><div class="stat-card"><strong id="agent-quarantined">0</strong><span>quarantined</span></div><div class="stat-card"><strong>v0.3</strong><span>SDK contract</span></div></div><div class="agent-layout"><div class="panel stack"><div class="panel-head"><h2>Package registry</h2><input id="agent-query" placeholder="Filter agents"></div><div id="agent-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Package inspector</h2><span class="chip" id="agent-detail-status">No selection</span></div><div id="agent-detail" class="empty-state"><strong>Select an agent package</strong><span>Identity, instructions, tools, plugins, secrets, sandbox, network, schedules, channels, memory, integrity, and tests will appear here.</span></div><div class="row"><button id="agent-enable" type="button" disabled>Enable</button><button class="secondary" id="agent-disable" type="button" disabled>Disable</button><button class="danger-button" id="agent-quarantine" type="button" disabled>Quarantine</button></div></div></div><dialog id="agent-dialog" class="editor-dialog"><form method="dialog" id="agent-form"><div class="panel-head"><h2>Install Agent SDK package</h2><button class="secondary" value="cancel">Close</button></div><div class="field"><label for="agent-manifest">Manifest JSON</label><textarea id="agent-manifest" class="manifest-editor">{"sdkVersion":"0.3","id":"example-agent","version":"1.0.0","name":"Example Agent","identity":{"name":"Example"},"instructions":["AGENTS.md"],"tools":["workspace.readText"],"plugins":[],"secrets":[],"sandbox":{"mode":"workspace-write"},"network":{"default":"deny","allow":[]},"schedules":[],"channels":[],"memory":{},"tests":[]}</textarea></div><div class="row"><button id="validate-agent" value="default" type="submit">Validate &amp; Install</button></div></form></dialog></div>
+      </section>
+
+      <section id="view-skills" class="view">
+        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Capability instructions</div><h1>Skills</h1><p>Discovered SKILL.md packages and installed skill extensions.</p></div><button class="secondary" id="refresh-skills" type="button">Refresh</button></div><div class="panel stack"><div class="toolbar"><input id="skill-query" placeholder="Filter by name, description, status, or path"><div class="chip-row"><button class="secondary skill-filter active" data-skill-filter="all" type="button">All</button><button class="secondary skill-filter" data-skill-filter="ready" type="button">Ready</button><button class="secondary skill-filter" data-skill-filter="draft" type="button">Drafts</button></div></div><div id="skills-list" class="record-grid"></div></div></div>
       </section>
     </main>
   </div>
@@ -2297,7 +2634,13 @@ function renderConsoleHtml() {
       modelOverride: "",
       audit: [],
       auditFilter: "all",
-      browserTabId: ""
+      browserTabId: "",
+      taskFilter: "all",
+      selectedTaskId: "",
+      selectedAgentId: "",
+      agents: [],
+      skills: [],
+      skillFilter: "all"
     };
     const planTemplates = {
       smoke: {
@@ -2322,6 +2665,33 @@ function renderConsoleHtml() {
       const data = await response.json();
       if (!response.ok || data.ok === false) throw new Error(data.error || response.statusText);
       return data;
+    }
+
+    async function streamApi(path, options, onDelta) {
+      const response = await fetch(path, options);
+      if (!response.ok || !response.body) throw new Error(response.statusText || "stream request failed");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let result;
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        let boundary;
+        while ((boundary = buffer.indexOf("\\n\\n")) >= 0) {
+          const block = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const event = /^event:\\s*(.+)$/mu.exec(block)?.[1] || "message";
+          const raw = /^data:\\s*(.+)$/mu.exec(block)?.[1] || "{}";
+          const value = JSON.parse(raw);
+          if (event === "delta") onDelta(value.delta || "");
+          if (event === "result") result = value;
+          if (event === "error") throw new Error(value.error || "stream failed");
+        }
+      }
+      if (!result) throw new Error("stream ended without a result");
+      return result;
     }
 
     function showOutput(value) {
@@ -2448,9 +2818,15 @@ function renderConsoleHtml() {
         refreshApprovals().catch((error) => showOutput(error.message));
         refreshBrowser().catch((error) => showOutput(error.message));
       }
-      if (name === "sessions" && state.selectedSessionId) {
-        api("/sessions/" + encodeURIComponent(state.selectedSessionId)).then(renderSessionTranscript).catch((error) => showOutput(error.message));
+      if (name === "sessions") {
+        if (state.status?.allowedCapabilities?.includes("session.read")) refreshSessions().catch((error) => showOutput(error.message));
+        else $("session-list").innerHTML = '<div class="empty-state"><strong>Sessions are disabled by policy</strong><span>Add session.read/session.write to this gateway policy to manage conversations.</span></div>';
       }
+      if (name === "tasks") refreshTasks().catch((error) => showOutput(error.message));
+      if (name === "usage") refreshUsage().catch((error) => showOutput(error.message));
+      if (name === "cron") refreshCron().catch((error) => showOutput(error.message));
+      if (name === "agents") refreshAgents().catch((error) => showOutput(error.message));
+      if (name === "skills") refreshSkills().catch((error) => showOutput(error.message));
     }
 
     function renderItemText(text, fallback) {
@@ -2506,11 +2882,26 @@ function renderConsoleHtml() {
     }
 
     function renderSessionRecord(session) {
-      return '<div class="item clickable session-record" data-session-id="' + escapeHtml(session.id) + '">' +
-        '<div class="session-record-body"><div class="item-line"><span class="item-title">' + renderItemText(session.title, "Untitled session") + '</span><span class="muted">' + escapeHtml(session.status || "open") + '</span></div>' +
-        '<div class="muted">messages: ' + escapeHtml(session.messageCount || 0) + '</div></div>' +
-        '<div class="row"><button class="session-action" data-session-action="rename" data-session-id="' + escapeHtml(session.id) + '" title="Rename session" aria-label="Rename session">✎</button><button class="session-action delete" data-session-action="delete" data-session-id="' + escapeHtml(session.id) + '" title="Delete session" aria-label="Delete session">×</button></div>' +
+      const updated = session.updatedAt || session.createdAt || "";
+      return '<div class="data-row clickable session-record" data-session-id="' + escapeHtml(session.id) + '">' +
+        '<span class="data-primary"><strong>' + renderItemText(session.title, "Untitled session") + '</strong><small>' + escapeHtml(session.id) + '</small></span>' +
+        '<span class="chip">' + escapeHtml(session.source || "direct") + '</span>' +
+        '<span class="chip ' + (session.status === "archived" ? "" : "ok") + '">' + escapeHtml(session.status || "open") + '</span>' +
+        '<span>' + escapeHtml(session.runtime || "odinn") + '</span>' +
+        '<span class="muted">' + escapeHtml(relativeTime(updated)) + '</span>' +
+        '<span>' + escapeHtml(session.messageCount || 0) + '</span>' +
+        '<span class="row"><button class="session-action" data-session-action="rename" data-session-id="' + escapeHtml(session.id) + '" title="Rename session" aria-label="Rename session">Rename</button><button class="session-action delete" data-session-action="delete" data-session-id="' + escapeHtml(session.id) + '" title="Delete session" aria-label="Delete session">Delete</button></span>' +
       '</div>';
+    }
+
+    function relativeTime(value) {
+      const at = Date.parse(value || "");
+      if (!Number.isFinite(at)) return "—";
+      const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
+      if (seconds < 60) return seconds + "s ago";
+      if (seconds < 3600) return Math.floor(seconds / 60) + "m ago";
+      if (seconds < 86400) return Math.floor(seconds / 3600) + "h ago";
+      return Math.floor(seconds / 86400) + "d ago";
     }
 
     async function renameChat(sessionId) {
@@ -2654,11 +3045,18 @@ function renderConsoleHtml() {
                 .map((message) => ({ role: message.role, content: message.content }))
             }
           };
-      const result = await api("/run", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(toolRequest)
-      });
+      let streamed = "";
+      if (options.tool !== "job.healthcheck") {
+        state.messages = [...state.messages, { role: "user", content }, { role: "assistant", content: "" }];
+        renderChatMessages(state.messages);
+      }
+      const result = options.tool === "job.healthcheck"
+        ? await api("/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(toolRequest) })
+        : await streamApi("/run/stream", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(toolRequest) }, (delta) => {
+            streamed += delta;
+            state.messages[state.messages.length - 1].content = streamed;
+            renderChatMessages(state.messages);
+          });
       const reply = options.tool === "job.healthcheck"
         ? "Healthcheck passed on " + result.output.platform + " " + result.output.release + ". Workspace: " + result.output.workspaceRoot
         : result.output.content;
@@ -2803,12 +3201,13 @@ function renderConsoleHtml() {
         $("cap-browser-status").textContent = status.security?.browser?.enabled === false ? "OFF" : "READY";
         $("cap-security-mode").textContent = status.security?.browser?.requireApproval === false ? "OPEN" : "SAFE";
         $("tool").innerHTML = status.tools.map((tool) => '<option value="' + escapeHtml(tool) + '">' + escapeHtml(tool) + '</option>').join("");
+        $("cron-tool").innerHTML = status.tools.map((tool) => '<option value="' + escapeHtml(tool) + '">' + escapeHtml(tool) + '</option>').join("");
         $("tool-list").innerHTML = status.toolDetails.map((tool) => renderRecord(tool, tool.name, tool.capability + " | " + tool.description)).join("");
-        await refreshRuns();
-        await refreshMemory();
-        await refreshSessions();
-        await refreshGoals();
-        await refreshImprovements();
+        const background = [refreshRuns()];
+        if (status.allowedCapabilities.includes("memory.read")) background.push(refreshMemory());
+        if (status.allowedCapabilities.includes("session.read")) background.push(refreshSessions());
+        if (status.allowedCapabilities.includes("goal.read")) background.push(refreshGoals());
+        await Promise.allSettled(background);
         await refreshApprovals();
       } catch (error) {
         $("health").textContent = "Error";
@@ -2832,6 +3231,95 @@ function renderConsoleHtml() {
       $("plan-last-status").textContent = planRuns[0]?.status || "—";
     }
 
+    async function refreshTasks() {
+      const runs = await api("/runs");
+      state.runs = runs;
+      const query = $("task-query")?.value.trim().toLowerCase() || "";
+      const filtered = runs.filter((run) => (state.taskFilter === "all" || run.status === state.taskFilter || (state.taskFilter === "failed" && ["failed", "blocked", "cancelled"].includes(run.status))) && (!query || JSON.stringify(run).toLowerCase().includes(query)));
+      $("task-total").textContent = runs.length;
+      $("task-running").textContent = runs.filter((run) => run.status === "running").length;
+      $("task-passed").textContent = runs.filter((run) => run.status === "completed").length;
+      $("task-failed").textContent = runs.filter((run) => ["failed", "blocked", "cancelled"].includes(run.status)).length;
+      $("task-table").innerHTML = filtered.map((run) => {
+        const started = run.events?.find((event) => event.type === "task.started") || {};
+        const last = run.events?.at(-1) || {};
+        const proofCount = run.events?.filter((event) => /proof|verify|audit/i.test(event.type || "")).length || 0;
+        const tone = run.status === "completed" ? "ok" : run.status === "running" ? "warn" : "danger";
+        return '<div class="data-row task-row" data-task-id="' + escapeHtml(run.id) + '"><span class="data-primary"><strong>' + escapeHtml(run.tool || run.id) + '</strong><small>' + escapeHtml(run.id) + '</small></span><span class="chip ' + tone + '">' + escapeHtml(run.status) + '</span><span>' + escapeHtml(started.actor || "gateway") + '</span><span class="muted">' + escapeHtml(relativeTime(last.at || started.at)) + '</span><span>' + escapeHtml(proofCount ? proofCount + " proof events" : (run.events?.length || 0) + " audit events") + '</span><span class="row"><button class="secondary" data-task-inspect="' + escapeHtml(run.id) + '" type="button">Inspect</button></span></div>';
+      }).join("") || '<div class="empty-state"><strong>No matching tasks</strong><span>The proof and audit ledger is quiet.</span></div>';
+    }
+
+    async function inspectTask(id) {
+      const detail = await api("/runs/" + encodeURIComponent(id));
+      state.selectedTaskId = id;
+      $("task-detail-label").textContent = id;
+      $("task-evidence").textContent = JSON.stringify(detail, null, 2);
+      $("task-verify").disabled = false;
+      const started = detail.events?.find((event) => event.type === "task.started");
+      $("task-replay").disabled = !started;
+    }
+
+    async function refreshUsage() {
+      const [audit, runs] = await Promise.all([api("/audit"), api("/runs")]);
+      const modelEvents = audit.filter((event) => /model\.chat|agent\.run|provider/i.test(JSON.stringify(event)));
+      const totalTokens = audit.reduce((sum, event) => sum + Number(event.data?.output?.usage?.totalTokens || event.data?.output?.usage?.total_tokens || 0), 0);
+      $("usage-total-tokens").textContent = totalTokens.toLocaleString();
+      $("usage-model-calls").textContent = modelEvents.filter((event) => event.type === "task.completed").length;
+      $("usage-errors").textContent = audit.filter((event) => /fail|error|denied/i.test(JSON.stringify(event))).length;
+      const days = [];
+      for (let offset = 13; offset >= 0; offset -= 1) {
+        const day = new Date(Date.now() - offset * 86400000).toISOString().slice(0, 10);
+        days.push({ day, count: audit.filter((event) => String(event.at || event.timestamp || "").startsWith(day)).length });
+      }
+      const max = Math.max(1, ...days.map((day) => day.count));
+      $("usage-chart").innerHTML = days.map((day) => '<span class="bar-column" title="' + escapeHtml(day.day + ': ' + day.count + ' events') + '"><i style="height:' + Math.max(3, Math.round(day.count / max * 165)) + 'px"></i><small>' + escapeHtml(day.day.slice(5)) + '</small></span>').join("");
+      $("runs").innerHTML = runs.slice(0, 12).map(renderRun).join("") || '<div class="empty-state"><strong>No usage yet</strong><span>Model and tool activity will appear here.</span></div>';
+    }
+
+    async function refreshCron() {
+      const data = await api("/cron");
+      state.cronJobs = data.jobs || [];
+      const query = $("cron-query")?.value.trim().toLowerCase() || "";
+      const jobs = state.cronJobs.filter((job) => !query || JSON.stringify(job).toLowerCase().includes(query));
+      $("cron-enabled").textContent = data.enabled ? "Yes" : "No";
+      $("cron-count").textContent = data.jobs.length;
+      $("cron-next").textContent = data.nextWake ? new Date(data.nextWake).toLocaleString() : "—";
+      $("cron-shown").textContent = jobs.length + " shown of " + data.jobs.length;
+      $("cron-list").innerHTML = jobs.map((job) => '<div class="cron-card"><div class="item-line"><strong>' + escapeHtml(job.name) + '</strong><span class="chip ' + (job.lastStatus === "error" ? "danger" : job.enabled ? "ok" : "") + '">' + escapeHtml(job.enabled ? (job.lastStatus || "enabled") : "disabled") + '</span></div><div class="cron-meta"><span>Cron ' + escapeHtml(job.schedule) + ' (' + escapeHtml(job.timezone) + ')</span><span>Tool: ' + escapeHtml(job.tool) + '</span><span>Last: ' + escapeHtml(relativeTime(job.lastRunAt)) + '</span></div><div class="row"><button class="secondary" data-cron-run="' + escapeHtml(job.id) + '" type="button">Run</button><button class="secondary" data-cron-toggle="' + escapeHtml(job.id) + '" data-enabled="' + escapeHtml(job.enabled) + '" type="button">' + (job.enabled ? "Disable" : "Enable") + '</button><button class="secondary" data-cron-delete="' + escapeHtml(job.id) + '" type="button">Delete</button></div></div>').join("") || '<div class="empty-state"><strong>No scheduled jobs</strong><span>Create a persisted recurring run.</span></div>';
+    }
+
+    async function refreshAgents() {
+      const data = await api("/agents");
+      state.agents = data.agents || [];
+      const query = $("agent-query")?.value.trim().toLowerCase() || "";
+      const agents = state.agents.filter((agent) => !query || JSON.stringify(agent).toLowerCase().includes(query));
+      $("agent-total").textContent = state.agents.length;
+      $("agent-enabled").textContent = state.agents.filter((agent) => agent.status === "enabled").length;
+      $("agent-quarantined").textContent = state.agents.filter((agent) => agent.status === "quarantined").length;
+      $("agent-list").innerHTML = agents.map((agent) => '<div class="item agent-package ' + (agent.id === state.selectedAgentId ? "selected" : "") + '" data-agent-id="' + escapeHtml(agent.id) + '"><div class="item-line"><strong>' + escapeHtml(agent.name) + '</strong><span class="chip ' + (agent.status === "enabled" ? "ok" : agent.status === "quarantined" ? "danger" : "") + '">' + escapeHtml(agent.status) + '</span></div><div class="muted">' + escapeHtml(agent.id + '@' + agent.version) + '</div><div class="chip-row"><span class="chip">' + escapeHtml((agent.tools || []).length + " tools") + '</span><span class="chip">' + escapeHtml((agent.plugins || []).length + " plugins") + '</span><span class="chip">' + escapeHtml((agent.tests || []).length + " tests") + '</span></div></div>').join("") || '<div class="empty-state"><strong>No agent packages installed</strong><span>Install an Agent SDK v0.3 manifest to start.</span></div>';
+      if (state.selectedAgentId) renderAgentDetail(state.agents.find((agent) => agent.id === state.selectedAgentId));
+    }
+
+    function renderAgentDetail(agent) {
+      if (!agent) return;
+      state.selectedAgentId = agent.id;
+      $("agent-detail-status").textContent = agent.status;
+      $("agent-detail-status").className = "chip " + (agent.status === "enabled" ? "ok" : agent.status === "quarantined" ? "danger" : "");
+      const sections = ["identity", "instructions", "tools", "plugins", "secrets", "sandbox", "network", "schedules", "channels", "memory", "tests", "integrity"];
+      $("agent-detail").className = "agent-inspector";
+      $("agent-detail").innerHTML = sections.map((name) => '<div class="agent-section"><strong>' + escapeHtml(name) + '</strong><pre>' + escapeHtml(JSON.stringify(agent[name], null, 2)) + '</pre></div>').join("");
+      ["agent-enable", "agent-disable", "agent-quarantine"].forEach((id) => $(id).disabled = false);
+      document.querySelectorAll("[data-agent-id]").forEach((item) => item.classList.toggle("selected", item.dataset.agentId === agent.id));
+    }
+
+    async function refreshSkills() {
+      const data = await api("/skills");
+      state.skills = data.skills || [];
+      const query = $("skill-query")?.value.trim().toLowerCase() || "";
+      const skills = state.skills.filter((skill) => (state.skillFilter === "all" || skill.status === state.skillFilter) && (!query || JSON.stringify(skill).toLowerCase().includes(query)));
+      $("skills-list").innerHTML = skills.map((skill) => '<div class="item skill-card"><div class="item-line"><strong>' + escapeHtml(skill.name) + '</strong><span class="chip ' + (skill.status === "ready" ? "ok" : "warn") + '">' + escapeHtml(skill.status) + '</span></div><p>' + escapeHtml(skill.description || "No description") + '</p><div class="muted skill-path">' + escapeHtml(skill.path || skill.entrypoint || "") + '</div><div class="chip-row"><span class="chip">' + escapeHtml(skill.bytes ? skill.bytes + " bytes" : skill.version || "package") + '</span></div></div>').join("") || '<div class="empty-state"><strong>No matching skills</strong><span>Create a draft in Skill Workshop.</span></div>';
+    }
+
     async function refreshMemory() {
       const query = $("memory-query").value.trim();
       const data = query ? await api("/memory?query=" + encodeURIComponent(query)) : await api("/memory/curated");
@@ -2848,6 +3336,7 @@ function renderConsoleHtml() {
     async function refreshSessions() {
       const data = await api("/sessions");
       const sessions = data.sessions || [];
+      state.sessions = sessions;
       const chatSessions = sessions.filter((session) => Number(session.messageCount || 0) > 0 || session.id === state.activeChatId);
       const recent = [];
       const seenGenericTitles = new Set();
@@ -2865,13 +3354,21 @@ function renderConsoleHtml() {
       $("chat-session-list").innerHTML = recent.map(renderChatSession).join("") || '<div class="muted session-empty">Your saved chats will appear here.</div>';
       $("chat-session-count").textContent = sessions.length;
       $("session-page-count").textContent = sessions.length + " sessions";
+      $("session-count-badge").textContent = sessions.length;
       if (!state.activeChatId && sessions.length) {
         const initial = sessions.find((session) => Number(session.messageCount || 0) === 0) || sessions[0];
         await loadChat(initial.id);
       } else {
         renderChatMessages(state.messages);
       }
-      $("session-list").innerHTML = sessions.slice(0, 16).map(renderSessionRecord).join("") || '<div class="muted">No sessions yet.</div>';
+      renderSessionTable();
+    }
+
+    function renderSessionTable() {
+      const query = $("session-query")?.value.trim().toLowerCase() || "";
+      const status = $("session-status-filter")?.value || "all";
+      const sessions = (state.sessions || []).filter((session) => (!query || JSON.stringify(session).toLowerCase().includes(query)) && (status === "all" || (session.status || "open") === status));
+      $("session-list").innerHTML = sessions.map(renderSessionRecord).join("") || '<div class="empty-state"><strong>No matching sessions</strong><span>Change the filters or create a new session.</span></div>';
     }
 
     async function refreshGoals() {
@@ -2882,16 +3379,6 @@ function renderConsoleHtml() {
       $("goal-list").innerHTML = (data.goals || []).slice(0, 16).map((goal) =>
         renderRecord(goal, goal.title, goal.status, 'data-goal-id="' + escapeHtml(goal.id) + '"')
       ).join("") || '<div class="empty-state"><strong>No active goals</strong><span>Create one to make long-running work visible.</span></div>';
-    }
-
-    async function refreshImprovements() {
-      const [data, runtimeStatus] = await Promise.all([api("/improvements"), api("/status")]);
-      const learning = runtimeStatus.selfImprovement || {};
-      $("improvement-mode").textContent = learning.enabled ? learning.mode + " mode" : "disabled";
-      $("improvement-mode").className = "chip " + (learning.mode === "auto" ? "ok" : learning.enabled ? "warn" : "");
-      $("improvement-list").innerHTML = (data.improvements || []).slice(0, 16).map((item) =>
-        renderRecord(item, item.title, item.status + " | " + (item.target || "runtime"), 'data-improvement-id="' + escapeHtml(item.id) + '"')
-      ).join("") || '<div class="muted">No proposals yet.</div>';
     }
 
     async function refreshAudit() {
@@ -2912,21 +3399,11 @@ function renderConsoleHtml() {
       showOutput(detail);
     }
 
-    function setPlanTemplate(name) {
-      $("plan").value = JSON.stringify(planTemplates[name] || planTemplates.smoke, null, 2);
-      document.querySelectorAll("[data-plan-template]").forEach((button) => button.classList.toggle("active", button.dataset.planTemplate === name));
-    }
-
-    setPlanTemplate("smoke");
-
     document.querySelectorAll("[data-view]").forEach((button) => {
       button.addEventListener("click", () => switchView(button.dataset.view));
     });
     document.querySelectorAll("[data-view-jump]").forEach((button) => {
       button.addEventListener("click", () => switchView(button.dataset.viewJump));
-    });
-    document.querySelectorAll("[data-plan-template]").forEach((button) => {
-      button.addEventListener("click", () => setPlanTemplate(button.dataset.planTemplate));
     });
 
     $("sidebar-toggle").addEventListener("click", () => {
@@ -2958,8 +3435,8 @@ function renderConsoleHtml() {
         item.hidden = Boolean(normalized) && !item.textContent.toLowerCase().includes(normalized);
       });
     });
-    $("sidebar-settings").addEventListener("click", () => switchView("runtime"));
-    $("sidebar-console").addEventListener("click", () => switchView("runtime"));
+    $("sidebar-settings").addEventListener("click", () => switchView("usage"));
+    $("sidebar-console").addEventListener("click", () => switchView("usage"));
     $("sidebar-theme").addEventListener("click", () => {
       document.body.classList.toggle("soft-contrast");
       showOutput(document.body.classList.contains("soft-contrast") ? "Soft contrast enabled." : "Soft contrast disabled.");
@@ -3061,12 +3538,6 @@ function renderConsoleHtml() {
       state.selectedGoalId = item.dataset.goalId;
       showOutput("Selected goal " + state.selectedGoalId);
     });
-    $("improvement-list").addEventListener("click", (event) => {
-      const item = event.target.closest("[data-improvement-id]");
-      if (!item) return;
-      state.selectedImprovementId = item.dataset.improvementId;
-      showOutput("Selected improvement " + state.selectedImprovementId);
-    });
     $("session-list").addEventListener("click", async (event) => {
       const action = event.target.closest("[data-session-action]");
       if (action) {
@@ -3090,37 +3561,6 @@ function renderConsoleHtml() {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(planTemplates.smoke)
-        }));
-        await refreshRuns();
-      } catch (error) {
-        showOutput(error.message);
-      } finally {
-        setBusy(event.currentTarget, false);
-      }
-    });
-    $("run").addEventListener("click", async (event) => {
-      try {
-        setBusy(event.currentTarget, true);
-        const body = { tool: $("tool").value, input: JSON.parse($("input").value || "{}") };
-        showOutput(await api("/run", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body)
-        }));
-        await refreshRuns();
-      } catch (error) {
-        showOutput(error.message);
-      } finally {
-        setBusy(event.currentTarget, false);
-      }
-    });
-    $("run-plan").addEventListener("click", async (event) => {
-      try {
-        setBusy(event.currentTarget, true);
-        showOutput(await api("/plan", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: $("plan").value
         }));
         await refreshRuns();
       } catch (error) {
@@ -3155,31 +3595,16 @@ function renderConsoleHtml() {
     });
     $("create-session").addEventListener("click", async (event) => {
       try {
+        const title = window.prompt("Session title", "New session");
+        if (!title?.trim()) return;
         setBusy(event.currentTarget, true);
         const session = await api("/sessions", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ title: $("session-title").value, source: "console" })
+          body: JSON.stringify({ title: title.trim(), source: "console" })
         });
         state.selectedSessionId = session.id;
         showOutput(session);
-        await refreshSessions();
-        await refreshRuns();
-      } catch (error) {
-        showOutput(error.message);
-      } finally {
-        setBusy(event.currentTarget, false);
-      }
-    });
-    $("append-session-message").addEventListener("click", async (event) => {
-      try {
-        if (!state.selectedSessionId) throw new Error("Select or create a session first.");
-        setBusy(event.currentTarget, true);
-        showOutput(await api("/sessions/" + encodeURIComponent(state.selectedSessionId) + "/messages", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ role: "user", content: $("session-message").value, source: "console" })
-        }));
         await refreshSessions();
         await refreshRuns();
       } catch (error) {
@@ -3223,63 +3648,111 @@ function renderConsoleHtml() {
         setBusy(event.currentTarget, false);
       }
     });
-    $("propose-improvement").addEventListener("click", async (event) => {
-      try {
-        setBusy(event.currentTarget, true);
-        const improvement = await api("/improvements", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            title: $("improvement-title").value,
-            rationale: $("improvement-rationale").value,
-            source: "console"
-          })
-        });
-        state.selectedImprovementId = improvement.id;
-        showOutput(improvement);
-        await refreshImprovements();
-        await refreshRuns();
-      } catch (error) {
-        showOutput(error.message);
-      } finally {
-        setBusy(event.currentTarget, false);
-      }
+    $("refresh-sessions").addEventListener("click", () => refreshSessions().catch((error) => showOutput(error.message)));
+    $("session-query").addEventListener("input", renderSessionTable);
+    $("session-status-filter").addEventListener("change", renderSessionTable);
+
+    $("refresh-tasks").addEventListener("click", () => refreshTasks().catch((error) => showOutput(error.message)));
+    $("task-query").addEventListener("input", () => refreshTasks().catch((error) => showOutput(error.message)));
+    document.querySelectorAll(".task-filter").forEach((button) => button.addEventListener("click", () => {
+      state.taskFilter = button.dataset.taskFilter || "all";
+      document.querySelectorAll(".task-filter").forEach((item) => item.classList.toggle("active", item === button));
+      refreshTasks().catch((error) => showOutput(error.message));
+    }));
+    $("task-table").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-task-inspect]");
+      if (button) inspectTask(button.dataset.taskInspect).catch((error) => showOutput(error.message));
     });
-    $("learn-improvements").addEventListener("click", async (event) => {
-      try {
-        setBusy(event.currentTarget, true);
-        showOutput(await api("/improvements/learn", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: 1000 }) }));
-        await refreshImprovements();
-        await refreshRuns();
-      } catch (error) {
-        showOutput(error.message);
-      } finally {
-        setBusy(event.currentTarget, false);
-      }
+    $("task-verify").addEventListener("click", async () => {
+      if (!state.selectedTaskId) return;
+      try { $("task-evidence").textContent = JSON.stringify(await api("/runtime/runs/" + encodeURIComponent(state.selectedTaskId) + "/verify"), null, 2); }
+      catch (error) { $("task-evidence").textContent = "Verification unavailable: " + error.message; }
     });
-    $("decide-improvement").addEventListener("click", async (event) => {
-      try {
-        if (!state.selectedImprovementId) throw new Error("Select or propose an improvement first.");
-        setBusy(event.currentTarget, true);
-        showOutput(await api("/improvements/" + encodeURIComponent(state.selectedImprovementId) + "/decisions", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ decision: $("improvement-decision").value, note: "Decided from console.", source: "console" })
-        }));
-        await refreshImprovements();
-        await refreshRuns();
-      } catch (error) {
-        showOutput(error.message);
-      } finally {
-        setBusy(event.currentTarget, false);
-      }
+    $("task-replay").addEventListener("click", async () => {
+      if (!state.selectedTaskId || !window.confirm("Replay this task only if its tool is safe and idempotent?")) return;
+      showOutput(await api("/runs/" + encodeURIComponent(state.selectedTaskId) + "/replay", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
+      await refreshTasks();
     });
-    $("rollback-improvement").addEventListener("click", async (event) => {
-      await withButton(event.currentTarget, "Rolling back...", async () => {
-        if (!state.selectedImprovementId) throw new Error("Select an applied improvement first.");
-        showOutput(await api("/improvements/" + encodeURIComponent(state.selectedImprovementId) + "/rollback", { method: "POST" }));
-        await refreshImprovements();
+
+    $("new-cron").addEventListener("click", () => $("cron-dialog").showModal());
+    $("refresh-cron").addEventListener("click", () => refreshCron().catch((error) => showOutput(error.message)));
+    $("cron-query").addEventListener("input", () => refreshCron().catch((error) => showOutput(error.message)));
+    $("cron-form").addEventListener("submit", async (event) => {
+      if (event.submitter?.value === "cancel") return;
+      event.preventDefault();
+      try {
+        await api("/cron", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: $("cron-name").value, schedule: $("cron-schedule").value, timezone: $("cron-timezone").value, tool: $("cron-tool").value, input: JSON.parse($("cron-input").value || "{}") }) });
+        $("cron-dialog").close();
+        await refreshCron();
+      } catch (error) { showOutput(error.message); }
+    });
+    $("cron-list").addEventListener("click", async (event) => {
+      const run = event.target.closest("[data-cron-run]");
+      const toggle = event.target.closest("[data-cron-toggle]");
+      const remove = event.target.closest("[data-cron-delete]");
+      try {
+        if (run) showOutput(await api("/cron/" + encodeURIComponent(run.dataset.cronRun) + "/run", { method: "POST" }));
+        if (toggle) await api("/cron/" + encodeURIComponent(toggle.dataset.cronToggle), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: toggle.dataset.enabled !== "true" }) });
+        if (remove && window.confirm("Delete this scheduled job?")) await api("/cron/" + encodeURIComponent(remove.dataset.cronDelete), { method: "DELETE" });
+        await refreshCron();
+      } catch (error) { showOutput(error.message); }
+    });
+
+    $("new-agent").addEventListener("click", () => $("agent-dialog").showModal());
+    $("refresh-agents").addEventListener("click", () => refreshAgents().catch((error) => showOutput(error.message)));
+    $("agent-query").addEventListener("input", () => refreshAgents().catch((error) => showOutput(error.message)));
+    $("agent-form").addEventListener("submit", async (event) => {
+      if (event.submitter?.value === "cancel") return;
+      event.preventDefault();
+      try {
+        const manifest = JSON.parse($("agent-manifest").value);
+        await api("/agents/validate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
+        const result = await api("/agents", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
+        state.selectedAgentId = result.agent.id;
+        $("agent-dialog").close();
+        await refreshAgents();
+        renderAgentDetail(result.agent);
+      } catch (error) { showOutput(error.message); }
+    });
+    $("agent-list").addEventListener("click", (event) => {
+      const item = event.target.closest("[data-agent-id]");
+      if (item) renderAgentDetail(state.agents.find((agent) => agent.id === item.dataset.agentId));
+    });
+    for (const [buttonId, action] of [["agent-enable", "enable"], ["agent-disable", "disable"], ["agent-quarantine", "quarantine"]]) {
+      $(buttonId).addEventListener("click", async () => {
+        if (!state.selectedAgentId) return;
+        await api("/agents/" + encodeURIComponent(state.selectedAgentId) + "/lifecycle", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action }) });
+        await refreshAgents();
       });
+    }
+
+    $("refresh-skills").addEventListener("click", () => refreshSkills().catch((error) => showOutput(error.message)));
+    $("skill-query").addEventListener("input", () => refreshSkills().catch((error) => showOutput(error.message)));
+    document.querySelectorAll(".skill-filter").forEach((button) => button.addEventListener("click", () => {
+      state.skillFilter = button.dataset.skillFilter || "all";
+      document.querySelectorAll(".skill-filter").forEach((item) => item.classList.toggle("active", item === button));
+      refreshSkills().catch((error) => showOutput(error.message));
+    }));
+
+    async function validateSkillDraft() {
+      const result = await api("/skills/workshop/validate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: $("skill-draft-name").value, description: $("skill-draft-description").value, instructions: $("skill-draft-instructions").value }) });
+      state.skillDraft = result;
+      $("workshop-status").textContent = result.valid ? "valid" : "needs work";
+      $("workshop-status").className = "chip " + (result.valid ? "ok" : "danger");
+      $("save-skill-draft").disabled = !result.valid;
+      $("skill-validation").className = result.valid ? "item" : "empty-state";
+      $("skill-validation").innerHTML = result.valid ? '<strong>Package is valid</strong><span class="muted">SHA-256 ' + escapeHtml(result.digest) + '</span>' : '<strong>Validation failed</strong><span>' + escapeHtml(result.errors.join(" · ")) + '</span>';
+      $("skill-preview").textContent = result.content;
+      return result;
+    }
+    $("validate-skill").addEventListener("click", () => validateSkillDraft().catch((error) => showOutput(error.message)));
+    $("save-skill-draft").addEventListener("click", async () => {
+      const result = state.skillDraft?.valid ? state.skillDraft : await validateSkillDraft();
+      if (!result.valid) return;
+      const saved = await api("/skills/workshop/save", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: $("skill-draft-name").value, description: $("skill-draft-description").value, instructions: $("skill-draft-instructions").value }) });
+      showOutput(saved);
+      await refreshSkills();
+      switchView("skills");
     });
     refresh();
   </script>

@@ -1,11 +1,10 @@
-import { hostname, platform, release } from "node:os";
+import { homedir, hostname, platform, release } from "node:os";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { execFile as execFileCallback } from "node:child_process";
+import { spawn } from "node:child_process";
 import { access, chmod, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { promisify } from "node:util";
 import { connect as netConnect, isIP } from "node:net";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -23,8 +22,6 @@ export { ExtensionRegistry, ExtensionExecutor } from "./extensions.ts";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.ts";
 export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.ts";
 export { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
-
-const execFile = promisify(execFileCallback);
 
 export const PROVIDER_PRESETS = {
   openai: {
@@ -676,7 +673,9 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
         memoryStore: recordStore,
         registry: context.registry,
         runTool: context.runTool,
-        runLedger: context.runLedger
+        runLedger: context.runLedger,
+        signal: context.signal,
+        onModelDelta: context.onModelDelta
       })
     }],
     ["model.chat", {
@@ -687,7 +686,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
           ? { retries: config.runtime.modelRetries }
           : {}),
         ...input
-      }, { stateDir, signal: context.signal })
+      }, { stateDir, signal: context.signal, onDelta: context.onModelDelta })
     }],
     ["memory.remember", {
       capability: "memory.write",
@@ -867,6 +866,7 @@ export function createApprovalStore({ path }: any = {}) {
 }
 
 const WEB_TIMEOUT_MS = 20_000;
+const MAX_MODEL_RESPONSE_BYTES = 8 * 1024 * 1024;
 const WEB_MAX_BYTES = 2_000_000;
 const WEB_MAX_CONCURRENT_REQUESTS = 8;
 let activeWebRequests = 0;
@@ -1249,6 +1249,30 @@ class BrowserNetworkProxy {
   }
 }
 
+async function resolveChromiumExecutable() {
+  const configured = process.env.ODINN_CHROMIUM_PATH;
+  const candidates = [
+    configured,
+    process.platform === "win32" ? join(process.env.PROGRAMFILES ?? "C:\\Program Files", "Google", "Chrome", "Application", "chrome.exe") : undefined,
+    process.platform === "win32" ? join(process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)", "Microsoft", "Edge", "Application", "msedge.exe") : undefined,
+    process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : undefined,
+    process.platform === "darwin" ? "/Applications/Chromium.app/Contents/MacOS/Chromium" : undefined,
+    process.platform === "linux" ? "/usr/bin/chromium" : undefined,
+    process.platform === "linux" ? "/usr/bin/chromium-browser" : undefined,
+    process.platform === "linux" ? "/usr/bin/google-chrome" : undefined,
+    process.platform === "linux" ? join(homedir(), ".cache", "ms-playwright", "chromium", "chrome-linux", "chrome") : undefined
+  ].filter(Boolean) as string[];
+  for (const candidate of candidates) {
+    try {
+      await access(candidate);
+      return candidate;
+    } catch {
+      // Try the next platform-native browser location.
+    }
+  }
+  throw new Error(`Chromium was not found for ${process.platform}; install Chromium or set ODINN_CHROMIUM_PATH`);
+}
+
 class BrowserManager {
   [key: string]: any;
   constructor(stateDir: any) {
@@ -1277,8 +1301,7 @@ class BrowserManager {
     }
     const userDataDir = join(this.stateDir, "browser-profile");
     await mkdir(userDataDir, { recursive: true });
-    const executablePath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
-    try { await access(executablePath); } catch { throw new Error(`Chromium not found at ${executablePath}; set ODINN_CHROMIUM_PATH`); }
+    const executablePath = await resolveChromiumExecutable();
     const headedRequested = process.env.ODINN_BROWSER_HEADLESS !== "1";
     const displayAvailable = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
     this.proxy = new BrowserNetworkProxy(security);
@@ -1522,12 +1545,12 @@ async function browserRecoveryResolve(stateDir: any, input: any = {}) {
 
 function browserActionSummary(tool: any, input: any) {
   if (tool === "browser.click") return `Click ${input.text || input.name || input.selector || "the selected control"}`;
-  if (tool === "browser.type") return `Fill ${input.selector || input.name || "the selected field"} with ${input.sensitive ? "[redacted value]" : JSON.stringify(String(input.value ?? ""))}`;
+  if (tool === "browser.type") return `Fill ${input.selector || input.name || "the selected field"} with [redacted value]`;
   return `Press ${input.key || "the requested key"}`;
 }
 
 function redactBrowserInput(input: any = {}) {
-  return input.sensitive ? { ...input, value: "[redacted]" } : { ...input };
+  return "value" in input ? { ...input, value: "[redacted]", sensitive: true } : { ...input };
 }
 
 const AGENT_TOOL_SCHEMAS = [
@@ -1545,7 +1568,7 @@ const AGENT_TOOL_SCHEMAS = [
   ,{ type: "function", function: { name: "browser.recovery.status", description: "Inspect an uncertain browser mutation after a crash or failed action.", parameters: { type: "object", properties: {} } } }
 ];
 
-async function runAgent(modelConfig: any, input: any = {}, { stateDir, memoryStore, runTool, runLedger }: any = {}) {
+async function runAgent(modelConfig: any, input: any = {}, { stateDir, memoryStore, runTool, runLedger, signal, onModelDelta }: any = {}) {
   const messages = Array.isArray(input.messages) ? input.messages.map((message: any) => ({ ...message })) : [{ role: "user", content: cleanRequired(input.prompt, "agent.run requires prompt") }];
   const memoryOptions = normalizeMemoryOptions(input.memory);
   const learned = memoryStore && memoryOptions.autoLearn
@@ -1565,7 +1588,8 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, memorySto
   if (recalled.memories.length) messages.splice(1, 0, { role: "system", content: formatMemoryContext(recalled.memories) });
   const maxTurns = Math.min(Math.max(Number(input.maxTurns) || 6, 1), 8);
   for (let turn = 0; turn < maxTurns; turn += 1) {
-    const result: any = await chatWithModel(modelConfig, { model: input.model, messages, tools: AGENT_TOOL_SCHEMAS }, { stateDir });
+    throwIfAborted(signal);
+    const result: any = await chatWithModel(modelConfig, { model: input.model, messages, tools: AGENT_TOOL_SCHEMAS, stream: true }, { stateDir, signal, onDelta: onModelDelta });
     if (!result.toolCalls?.length) return { ...result, memory: { recalled: recalled.memories.length, learned: learned.learned.length, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 } };
     messages.push({ role: "assistant", content: result.content || "", tool_calls: result.toolCalls });
     for (const call of result.toolCalls) {
@@ -1600,7 +1624,8 @@ export async function runTask({
   registry = createBuiltInRegistry(),
   now = () => new Date().toISOString(),
   signal,
-  runLedger
+  runLedger,
+  onModelDelta
 }: any) {
   const request = normalizeTaskRequest(task);
   const tool = registry.get(request.tool);
@@ -1725,6 +1750,7 @@ export async function runTask({
       registry,
       auditStore,
       signal,
+      onModelDelta,
       runLedger,
       capability: capabilityClaims,
       runTool: (nestedTask: any) => runTask({
@@ -1734,7 +1760,8 @@ export async function runTask({
         registry,
         now,
         signal,
-        runLedger: nestedTask.runLedger ?? runLedger
+        runLedger: nestedTask.runLedger ?? runLedger,
+        onModelDelta
       })
     });
     throwIfAborted(signal);
@@ -1851,7 +1878,7 @@ export function createAuditStore(path: any = ".odinn/audit.jsonl") {
   return new FileAuditStore(path);
 }
 
-async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, signal }: any = {}) {
+async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, signal, onDelta }: any = {}) {
   const modelRef = modelString(input.model, modelConfig.defaultModel);
   if (!modelRef) {
     throw new Error("no model configured; run `odinn onboard --provider openai` or `odinn onboard --provider ollama --model <installed-model>`");
@@ -1885,7 +1912,7 @@ async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, sign
   });
 
   if (provider.transport === "cli-antigravity") {
-    return chatWithAntigravity(provider, parsed, messages, input);
+    return chatWithAntigravity(provider, parsed, messages, input, signal);
   }
 
   const headers: Record<string, string> = { "content-type": "application/json" };
@@ -1942,9 +1969,9 @@ async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, sign
         signal: controller.signal
       });
       payload = isChatGptResponsesTransport
-        ? await readResponsesModelResponse(response)
+        ? await readResponsesModelResponse(response, onDelta)
         : streamRequested
-          ? await readStreamingChatResponse(response)
+          ? await readStreamingChatResponse(response, onDelta)
           : await readModelResponse(response);
       if (response.ok || !isRetryableProviderStatus(response.status) || attempt === maxRetries) break;
       await waitForRetry(response, attempt, controller.signal);
@@ -1983,23 +2010,42 @@ async function resolveProviderBaseUrl(provider: any, stateDir: any) {
   }
 }
 
-async function chatWithAntigravity(provider: any, parsed: any, messages: any, input: any) {
+async function chatWithAntigravity(provider: any, parsed: any, messages: any, input: any, signal?: AbortSignal) {
   const command = process.env[provider.auth.commandEnv || "ODINN_ANTIGRAVITY_CLI"] || "agy";
   const prompt = messages.map((message: any) => `${message.role}: ${message.content}`).join("\n\n");
-  try {
-    const { stdout } = await execFile(command, ["--print", "--model", parsed.model, prompt], {
-      maxBuffer: 4 * 1024 * 1024,
-      timeout: normalizeTimeout(input.timeoutMs)
+  const timeoutMs = normalizeTimeout(input.timeoutMs);
+  const content = await new Promise<string>((resolveOutput, rejectOutput) => {
+    const child = spawn(command, ["--print", "--model", parsed.model], {
+      env: { PATH: process.env.PATH ?? "", ...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+      windowsHide: true
     });
-    const content = modelString(stdout, "");
-    if (!content) throw new Error("Antigravity returned no assistant content");
-    return { provider: parsed.provider, model: parsed.model, content };
-  } catch (error) {
-    const failure = (error instanceof Error ? error : new Error(String(error))) as NodeError & { killed?: boolean };
-    if (failure.code === "ENOENT") throw new Error(`Antigravity CLI not found; install it or set ${provider.auth.commandEnv || "ODINN_ANTIGRAVITY_CLI"}`);
-    if (failure.killed) throw new Error("Antigravity request timed out");
-    throw new Error(`Antigravity request failed: ${failure.message}`);
-  }
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (error) rejectOutput(error);
+      else resolveOutput(Buffer.concat(chunks).toString("utf8").trim());
+    };
+    const abort = () => { child.kill("SIGKILL"); finish(new Error("Antigravity request aborted")); };
+    const timer = setTimeout(() => { child.kill("SIGKILL"); finish(new Error("Antigravity request timed out")); }, timeoutMs);
+    child.once("error", (error: NodeError) => finish(error.code === "ENOENT" ? new Error(`Antigravity CLI not found; install it or set ${provider.auth.commandEnv || "ODINN_ANTIGRAVITY_CLI"}`) : error));
+    child.stdout.on("data", (chunk: Buffer) => {
+      bytes += chunk.byteLength;
+      if (bytes > MAX_MODEL_RESPONSE_BYTES) { child.kill("SIGKILL"); finish(new Error(`Antigravity response exceeded ${MAX_MODEL_RESPONSE_BYTES} bytes`)); }
+      else chunks.push(Buffer.from(chunk));
+    });
+    child.once("close", (code) => code === 0 ? finish() : finish(new Error(`Antigravity request failed with exit code ${code ?? "unknown"}`)));
+    if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
+    child.stdin.end(prompt);
+  });
+  if (!content) throw new Error("Antigravity returned no assistant content");
+  return { provider: parsed.provider, model: parsed.model, content };
 }
 
 function responseText(payload: any) {
@@ -2050,7 +2096,7 @@ function extractToolCalls(payload: any, responsesTransport: any) {
 }
 
 async function readModelResponse(response: any) {
-  const raw = await response.text();
+  const raw = await readBoundedResponseText(response);
   try {
     return raw ? JSON.parse(raw) : {};
   } catch {
@@ -2058,16 +2104,16 @@ async function readModelResponse(response: any) {
   }
 }
 
-async function readStreamingChatResponse(response: any) {
-  const raw = await response.text();
-  if (!response.headers.get("content-type")?.includes("text/event-stream") && !/^\s*(?:event|data):/u.test(raw)) {
+async function readStreamingChatResponse(response: any, onDelta?: (delta: string) => void | Promise<void>) {
+  if (!response.headers.get("content-type")?.includes("text/event-stream")) {
+    const raw = await readBoundedResponseText(response);
     try { return raw ? JSON.parse(raw) : {}; } catch { return { error: raw.slice(0, 500) }; }
   }
   let content = "";
   const toolCalls = [];
   let usage;
   let id;
-  for (const line of raw.split(/\r?\n/)) {
+  for await (const line of boundedResponseLines(response)) {
     if (!line.startsWith("data:")) continue;
     const value = line.slice("data:".length).trim();
     if (!value || value === "[DONE]") continue;
@@ -2076,7 +2122,10 @@ async function readStreamingChatResponse(response: any) {
     id ||= event.id;
     usage ||= event.usage;
     const delta = event.choices?.[0]?.delta;
-    if (typeof delta?.content === "string") content += delta.content;
+    if (typeof delta?.content === "string") {
+      content += delta.content;
+      await onDelta?.(delta.content);
+    }
     for (const call of delta?.tool_calls ?? []) {
       const current: any = toolCalls[call.index ?? toolCalls.length] ?? { id: "", type: "function", function: { name: "", arguments: "" } };
       current.id += call.id ?? "";
@@ -2092,11 +2141,9 @@ async function readStreamingChatResponse(response: any) {
   };
 }
 
-async function readResponsesModelResponse(response: any) {
-  const raw = await response.text();
-  const looksLikeEventStream = response.headers.get("content-type")?.includes("text/event-stream")
-    || /^\s*(?:event|data):/u.test(raw);
-  if (!looksLikeEventStream) {
+async function readResponsesModelResponse(response: any, onDelta?: (delta: string) => void | Promise<void>) {
+  if (!response.headers.get("content-type")?.includes("text/event-stream")) {
+    const raw = await readBoundedResponseText(response);
     try {
       return raw ? JSON.parse(raw) : {};
     } catch {
@@ -2106,7 +2153,7 @@ async function readResponsesModelResponse(response: any) {
   let completed = {};
   let content = "";
   let error;
-  for (const line of raw.split(/\r?\n/)) {
+  for await (const line of boundedResponseLines(response)) {
     if (!line.startsWith("data:")) continue;
     const value = line.slice("data:".length).trim();
     if (!value || value === "[DONE]") continue;
@@ -2116,7 +2163,10 @@ async function readResponsesModelResponse(response: any) {
     } catch {
       continue;
     }
-    if (event.type === "response.output_text.delta" && typeof event.delta === "string") content += event.delta;
+    if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
+      content += event.delta;
+      await onDelta?.(event.delta);
+    }
     if (event.type === "response.completed" && event.response && typeof event.response === "object") completed = event.response;
     if (event.type === "error" || event.type === "response.failed") error = event.error ?? event.response?.error ?? event;
   }
@@ -2125,6 +2175,44 @@ async function readResponsesModelResponse(response: any) {
     ...(content ? { output_text: content } : {}),
     ...(error ? { error } : {})
   };
+}
+
+async function readBoundedResponseText(response: any, maxBytes = MAX_MODEL_RESPONSE_BYTES) {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  if (!response.body) return "";
+  for await (const chunk of response.body) {
+    const buffer = Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > maxBytes) {
+      await response.body.cancel?.("model response exceeded configured limit").catch?.(() => undefined);
+      throw new Error(`model provider response exceeded ${maxBytes} bytes`);
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function* boundedResponseLines(response: any, maxBytes = MAX_MODEL_RESPONSE_BYTES) {
+  if (!response.body) return;
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let bytes = 0;
+  for await (const chunk of response.body) {
+    bytes += chunk.byteLength;
+    if (bytes > maxBytes) {
+      await response.body.cancel?.("model response exceeded configured limit").catch?.(() => undefined);
+      throw new Error(`model provider response exceeded ${maxBytes} bytes`);
+    }
+    buffer += decoder.decode(chunk, { stream: true });
+    let newline;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      yield buffer.slice(0, newline).replace(/\r$/u, "");
+      buffer = buffer.slice(newline + 1);
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer) yield buffer.replace(/\r$/u, "");
 }
 
 function modelErrorMessage(payload: any) {

@@ -42,5 +42,5 @@ jobs:
       - run: pnpm release:preflight
       - run: pnpm release:package
       - run: pnpm release:checksums
-      - run: node scripts/release/verify.mjs
+      - run: node scripts/release/verify.ts
       - run: pnpm release:install-smoke

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ExtensionExecutor, ExtensionRegistry } from "../packages/kernel/src/extensions.ts";
+import { digestExtensionBundle, ExtensionExecutor, ExtensionRegistry } from "../packages/kernel/src/extensions.ts";
 import { createAuditStore, createDifferentiatedRuntime } from "../packages/kernel/src/index.ts";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 
@@ -43,6 +43,24 @@ test("extension manifests are disabled, grant-scoped, provenance-aware, and roll
   assert.equal(rolledBack.version, "1.0.0");
   assert.equal(rolledBack.enabled, false);
   assert.equal(rolledBack.trusted, false);
+});
+
+test("container extensions bind integrity to the complete immutable bundle", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-extension-bundle-"));
+  const bundle = join(root, "bundle");
+  await mkdir(bundle);
+  await writeFile(join(bundle, "main.ts"), "import './support.ts';\n");
+  await writeFile(join(bundle, "support.ts"), "export const value = 1;\n");
+  const bundleDigest = await digestExtensionBundle(bundle);
+  const registry = new ExtensionRegistry(join(root, "extensions.json"));
+  await registry.install({ id: "container-tool", version: "1.0.0", type: "tool", entrypoint: "bundle/main.ts", bundleRoot: "bundle", capabilities: ["text.echo"], sandbox: "container", bundleDigest });
+  const enabled = await registry.enable("container-tool", { grants: ["text.echo"], trust: true });
+  assert.equal(enabled.integrity, "bundle-verified");
+  await writeFile(join(bundle, "support.ts"), "export const value = 2;\n");
+  const runtime = auditedExtensionRuntime(root, "bundle");
+  try {
+    await assert.rejects(() => new ExtensionExecutor(registry, { workspaceRoot: root }).invoke("container-tool", {}, { runtime: runtime.value }), /bundle integrity check failed/);
+  } finally { runtime.differentiated.ledger.close(); }
 });
 
 test("extensions require content integrity and bound non-terminated output", async () => {

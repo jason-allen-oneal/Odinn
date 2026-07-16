@@ -66,6 +66,14 @@ async function lintRepository() {
   }
   if (errors.length) fail(errors);
   else console.log("repository lint passed");
+  const eslint = spawnSync("pnpm", ["exec", "eslint", "."], {
+    cwd: root,
+    encoding: "utf8",
+    shell: process.platform === "win32"
+  });
+  if (eslint.stdout) process.stdout.write(eslint.stdout);
+  if (eslint.stderr) process.stderr.write(eslint.stderr);
+  if (eslint.status !== 0) process.exit(eslint.status ?? 1);
 }
 
 async function workspacePackageCount() {

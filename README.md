@@ -211,7 +211,7 @@ pnpm odinn extension disable --id example-tool
 pnpm odinn extension rollback --id example-tool
 ```
 
-Only manifests declaring `unconfined-process`, a verified SHA-256 `contentDigest`, explicit trust, grants, and the unsafe-sandbox acknowledgement can execute. The name is intentional: grants authorize invocation but do not confine filesystem or network behavior. Child processes receive a minimal environment and bounded output. Tool extensions use Ódinn Forge's JSONL call contract; MCP extensions use a JSON-RPC `tools/call` JSONL contract. Container execution, automatic installation, and implicit trust are not enabled by this beta.
+Executable extensions use one of two explicit adapters. `container` is the default for third-party code and requires a SHA-256 digest over the complete immutable bundle; it runs read-only with no network, dropped capabilities, no-new-privileges, a PID limit, CPU/memory limits, and a bounded temporary filesystem. `unconfined-process` remains available only for fully trusted local code with a verified entrypoint digest and an explicit unsafe-sandbox acknowledgement. Both adapters receive bounded I/O and cross the audited Sentinel/capability boundary. Tool extensions use Ódinn Forge's JSONL call contract; MCP extensions use JSON-RPC `tools/call` over JSONL.
 
 ## Architecture
 

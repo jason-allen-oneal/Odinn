@@ -39,7 +39,7 @@ jobs:
       - run: pnpm test:integration
       - run: pnpm smoke:inference
       - run: pnpm benchmark:ci
-      - run: node scripts/ci/audit.mjs moderate
+      - run: node scripts/ci/audit.ts moderate
       - run: pnpm release:package
       - run: pnpm release:checksums
       - run: pnpm storage:drill

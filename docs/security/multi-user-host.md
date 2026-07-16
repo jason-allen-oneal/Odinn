@@ -28,7 +28,7 @@ ODINN_TLS_KEY=/etc/letsencrypt/live/odinn.example.com/privkey.pem \
 pnpm host:start
 ```
 
-A non-loopback bind refuses to start without a certificate, private key, and exact public origin. Mutating requests require that exact origin. Authentication is throttled per client address and user, sessions are signed HttpOnly/SameSite cookies, and logout revokes the active session. Sessions are intentionally held in memory, so a host restart signs every user out.
+A non-loopback bind refuses to start without a certificate, private key, and exact public origin. Mutating requests require that exact origin. Authentication is durably throttled per client address and user across restarts, sessions are signed HttpOnly/SameSite cookies, and logout revokes the active session. Public responses use generic errors while internal details remain in server logs. Sessions are intentionally held in memory, so a host restart signs every user out.
 
 ## Isolation boundary
 

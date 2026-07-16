@@ -69,18 +69,20 @@ test("Proof verifies command exit/output and file assertions without invoking a 
   const { root, ledger, runId } = await fixture("run_proof_pass");
   await writeFile(join(root, "result.txt"), "ODINN_PROOF_OK\n", "utf8");
   const injected = join(root, "injected.txt");
+  const outputCommand = [process.execPath, "-e", "process.stdout.write('COMMAND_OK'); process.stderr.write('notice')"];
+  const literalCommand = [process.execPath, "-e", "process.stdout.write(process.argv[1])", "literal; touch injected.txt"];
   try {
     const result = await verifyContract(contract(runId, [
       {
         id: "command_output",
         type: "command",
-        command: [process.execPath, "-e", "process.stdout.write('COMMAND_OK'); process.stderr.write('notice')"],
+        command: outputCommand,
         expect: { exitCode: 0, stdout: { equals: "COMMAND_OK" }, stderr: { matches: "^NOTICE$", flags: "i" } }
       },
       {
         id: "argument_literal",
         type: "command",
-        command: [process.execPath, "-e", "process.stdout.write(process.argv[1])", "literal; touch injected.txt"],
+        command: literalCommand,
         expect: { exitCode: 0, stdout: { equals: "literal; touch injected.txt" } }
       },
       {
@@ -95,7 +97,7 @@ test("Proof verifies command exit/output and file assertions without invoking a 
         path: "not-created.txt",
         expect: { exists: false }
       }
-    ], "proof_pass"), { runLedger: ledger, allowedRoot: root });
+    ], "proof_pass"), { runLedger: ledger, allowedRoot: root, allowedCommands: [outputCommand, literalCommand] });
 
     assert.equal(result.status, "passed");
     assert.equal(result.passed, true);
@@ -160,13 +162,14 @@ test("Proof verifies HTTP and git assertions through bounded real operations", a
 
 test("Proof persists every failed assertion and marks the run failed", async () => {
   const { root, ledger, runId } = await fixture("run_proof_fail");
+  const wrongExitCommand = [process.execPath, "-e", "process.stdout.write('wrong'); process.exit(3)"];
   try {
-    const verifier = new ProofVerifier({ runLedger: ledger, allowedRoot: root });
+    const verifier = new ProofVerifier({ runLedger: ledger, allowedRoot: root, allowedCommands: [wrongExitCommand] });
     const result = await verifier.verify(contract(runId, [
       {
         id: "wrong_exit",
         type: "command",
-        command: [process.execPath, "-e", "process.stdout.write('wrong'); process.exit(3)"],
+        command: wrongExitCommand,
         expect: { exitCode: 0, stdout: { contains: "right" } }
       },
       {
@@ -187,6 +190,24 @@ test("Proof persists every failed assertion and marks the run failed", async () 
     assert.deepEqual(rows.map((row: any) => row.status), ["failed", "failed"]);
     assert.equal(JSON.parse(rows[0].result_json).actual.exitCode, 3);
     assert.equal(ledger.getRun(runId).status, "failed");
+  } finally {
+    ledger.close();
+  }
+});
+
+test("Proof denies command assertions unless the operator approved the exact argument vector", async () => {
+  const { root, ledger, runId } = await fixture("run_proof_command_denied");
+  const marker = join(root, "must-not-exist.txt");
+  try {
+    const result = await new ProofVerifier({ runLedger: ledger, allowedRoot: root }).verify(contract(runId, [{
+      id: "arbitrary_node",
+      type: "command",
+      command: [process.execPath, "-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "bad")`],
+      expect: { exitCode: 0 }
+    }], "proof_command_denied"));
+    assert.equal(result.passed, false);
+    assert.match(result.assertions[0].message, /operator-controlled exact command allowlist/);
+    await assert.rejects(access(marker), /ENOENT/);
   } finally {
     ledger.close();
   }

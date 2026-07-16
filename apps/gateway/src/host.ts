@@ -2,7 +2,7 @@
 import { createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { chmod, readFile, realpath, writeFile } from "node:fs/promises";
+import { chmod, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -30,10 +30,31 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
   const usersById: Map<string, any> = new Map((records.users ?? []).filter((user: any) => !user.disabled).map((user: any) => [user.id, user]));
   const sessions: Map<string, any> = new Map();
   const tenants: Map<string, any> = new Map();
+  const attemptsPath = join(root, "login-attempts.json");
   const loginAttempts: Map<string, any> = new Map();
   const sessionKey = randomBytes(32);
   const maximumLoginAttempts = Math.max(1, Number(loginLimits.maximumAttempts ?? 5));
   const loginWindowMs = Math.max(1_000, Number(loginLimits.windowMs ?? 5 * 60 * 1000));
+  try {
+    const persisted = JSON.parse(await readFile(attemptsPath, "utf8"));
+    if (persisted?.schemaVersion !== 1 || !persisted.attempts || typeof persisted.attempts !== "object") throw new Error("invalid login attempt store");
+    for (const [key, value] of Object.entries(persisted.attempts) as any) {
+      if (Number.isInteger(value?.count) && value.count > 0 && Number(value.resetAt) > Date.now()) loginAttempts.set(key, value);
+    }
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  let attemptWriteChain: Promise<unknown> = Promise.resolve();
+  const persistLoginAttempts = () => {
+    const operation = attemptWriteChain.then(async () => {
+      const temporary = `${attemptsPath}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
+      await writeFile(temporary, `${JSON.stringify({ schemaVersion: 1, attempts: Object.fromEntries(loginAttempts) }, null, 2)}\n`, { mode: 0o600 });
+      await rename(temporary, attemptsPath);
+      await chmod(attemptsPath, 0o600);
+    });
+    attemptWriteChain = operation.catch(() => undefined);
+    return operation;
+  };
 
   async function tenant(user: any) {
     if (tenants.has(user.id)) return tenants.get(user.id);
@@ -64,14 +85,19 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
           response.setHeader("retry-after", String(Math.max(1, Math.ceil((attempt.resetAt - now) / 1000))));
           return send(response, 429, { error: "too many authentication attempts" });
         }
-        if (attempt?.resetAt <= now) loginAttempts.delete(attemptKey);
+        if (attempt?.resetAt <= now) {
+          loginAttempts.delete(attemptKey);
+          await persistLoginAttempts();
+        }
         const user = usersById.get(userId);
         if (!user || !await verifyPassword(String(body.password || ""), user)) {
           const current = loginAttempts.get(attemptKey);
           loginAttempts.set(attemptKey, { count: (current?.count ?? 0) + 1, resetAt: current?.resetAt ?? now + loginWindowMs });
+          await persistLoginAttempts();
           return send(response, 401, { error: "invalid credentials" });
         }
         loginAttempts.delete(attemptKey);
+        await persistLoginAttempts();
         const id = randomBytes(32).toString("base64url");
         const expiresAt = Date.now() + 8 * 60 * 60 * 1000;
         sessions.set(id, { userId: user.id, expiresAt });
@@ -91,7 +117,10 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
       if (!user) return send(response, 403, { error: "user disabled" });
       const backend = await tenant(user);
       proxy(request, response, backend);
-    } catch (error: any) { send(response, 500, { error: error.message }); }
+    } catch (error: any) {
+      console.error("Odinn host request failed:", error);
+      send(response, 500, { error: "internal host error" });
+    }
   };
   const server: any = tls ? createHttpsServer(tls, handler) : createHttpServer(handler);
   const close = server.close.bind(server);
@@ -124,7 +153,10 @@ function proxy(incoming: any, outgoing: any, backend: any) {
     const forwarded = { ...response.headers }; delete forwarded["set-cookie"];
     outgoing.writeHead(response.statusCode ?? 502, forwarded); response.pipe(outgoing);
   });
-  request.on("error", (error: any) => send(outgoing, 502, { error: error.message }));
+  request.on("error", (error: any) => {
+    console.error("Odinn tenant gateway proxy failed:", error);
+    send(outgoing, 502, { error: "tenant gateway unavailable" });
+  });
   incoming.pipe(request);
 }
 

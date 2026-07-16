@@ -8,10 +8,11 @@ import type { JsonObject } from "@odinn/protocol";
 
 const EXTENSION_SCHEMA_VERSION = 1;
 const EXTENSION_TYPES = new Set(["tool", "skill", "mcp"]);
-const SANDBOXES = new Set(["process", "container", "none"]);
+const SANDBOXES = new Set(["unconfined-process", "container", "none"]);
+const MAX_EXTENSION_OUTPUT_BYTES = 1_000_000;
 
 type ExtensionType = "tool" | "skill" | "mcp";
-type ExtensionSandbox = "process" | "container" | "none";
+type ExtensionSandbox = "unconfined-process" | "container" | "none";
 interface ExtensionManifest extends JsonObject {
   schemaVersion: number; installId: string; id: string; version: string; name: string;
   type: ExtensionType; entrypoint: string; capabilities: string[]; sandbox: ExtensionSandbox;
@@ -79,7 +80,8 @@ export class ExtensionRegistry {
       const extension = state.extensions[id];
       if (!extension) throw new Error(`extension not found: ${id}`);
       if (!extension.trusted && trust !== true) throw new Error(`extension is untrusted: ${id}; review provenance before enabling`);
-      if (extension.sandbox === "none" && allowUnsafeSandbox !== true) throw new Error(`extension requests unsandboxed execution: ${id}`);
+      if (!/^[a-f0-9]{64}$/.test(extension.contentDigest ?? "")) throw new Error(`extension requires a full SHA-256 contentDigest before enabling: ${id}`);
+      if (["none", "unconfined-process"].includes(extension.sandbox) && allowUnsafeSandbox !== true) throw new Error(`extension requests unconfined execution: ${id}; pass the explicit unsafe-sandbox acknowledgement after review`);
       const requested = new Set(extension.capabilities);
       const selected = [...new Set(grants)].filter((grant) => requested.has(grant));
       if (selected.length !== new Set(grants).size) throw new Error(`extension grant exceeds manifest capabilities: ${id}`);
@@ -150,7 +152,7 @@ export class ExtensionExecutor {
     const extension = await this.registry.get(id);
     if (!extension) throw new Error(`extension not found: ${id}`);
     if (!extension.enabled || !extension.trusted) throw new Error(`extension is not enabled and trusted: ${id}`);
-    if (extension.sandbox !== "process") throw new Error(`extension sandbox is not executable by this adapter: ${extension.sandbox}`);
+    if (extension.sandbox !== "unconfined-process") throw new Error(`extension sandbox is not executable by this adapter: ${extension.sandbox}`);
     const requested = String(capability || extension.capabilities[0] || "").trim();
     if (!requested || !(extension.grants ?? []).includes(requested)) throw new Error(`extension capability is not granted: ${requested || "unspecified"}`);
     if (!extension.entrypoint || extension.entrypoint.includes("\0")) throw new Error(`extension entrypoint is missing: ${id}`);
@@ -162,7 +164,7 @@ export class ExtensionExecutor {
       throw new Error("extension entrypoint must remain inside the configured workspace root");
     }
     const contentDigest = createHash("sha256").update(await readFile(entrypoint)).digest("hex");
-    if (extension.contentDigest && extension.contentDigest !== contentDigest) throw new Error(`extension entrypoint integrity check failed: ${id}`);
+    if (!/^[a-f0-9]{64}$/.test(extension.contentDigest) || extension.contentDigest !== contentDigest) throw new Error(`extension entrypoint integrity check failed: ${id}`);
     const protocol = extension.type === "mcp" ? "mcp-jsonl" : "odinn-jsonl";
     const request = protocol === "mcp-jsonl"
       ? { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: input.name || extension.id, arguments: input.arguments ?? input } }
@@ -212,18 +214,39 @@ async function invokeThroughRuntime({ id, input, requested, extension, entrypoin
   }
 }
 
+function terminateExtensionTree(child: any) {
+  if (!child?.pid) return;
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    killer.unref();
+    return;
+  }
+  try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+}
+
 function runExtensionProcess(command: string, args: string[], request: ExtensionRequest, { cwd, timeoutMs, protocol }: ProcessOptions): Promise<unknown> {
   return new Promise<unknown>((resolveResult, rejectResult) => {
-    const child = spawn(command, args, { cwd, stdio: ["pipe", "pipe", "ignore"], shell: false });
+    const child = spawn(command, args, {
+      cwd,
+      detached: process.platform !== "win32",
+      env: {
+        PATH: process.env.PATH ?? "",
+        ...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {})
+      },
+      stdio: ["pipe", "pipe", "ignore"],
+      shell: false,
+      windowsHide: true
+    });
     let settled = false;
     let buffer = "";
+    let outputBytes = 0;
     const finish = (error?: Error, result?: ProcessResponse) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       child.stdout.removeAllListeners();
       child.removeAllListeners();
-      if (!child.killed) child.kill();
+      if (!child.killed) terminateExtensionTree(child);
       if (error) rejectResult(error);
       else resolveResult(protocol === "mcp-jsonl" && result?.result?.content ? result.result : result?.result ?? result);
     };
@@ -233,6 +256,11 @@ function runExtensionProcess(command: string, args: string[], request: Extension
       if (!settled) finish(new Error(`extension process exited before returning a result: ${code ?? "unknown"}`));
     });
     child.stdout.on("data", (chunk) => {
+      outputBytes += chunk.byteLength;
+      if (outputBytes > MAX_EXTENSION_OUTPUT_BYTES) {
+        finish(new Error(`extension output exceeded ${MAX_EXTENSION_OUTPUT_BYTES} bytes`));
+        return;
+      }
       buffer += chunk.toString("utf8");
       let newline;
       while ((newline = buffer.indexOf("\n")) !== -1) {
@@ -262,7 +290,7 @@ function normalizeManifest(input: unknown, { source, provenance }: Required<Inst
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) throw new Error(`invalid extension version: ${version}`);
   if (!EXTENSION_TYPES.has(type)) throw new Error(`extension type must be one of: ${Array.from(EXTENSION_TYPES).join(", ")}`);
   const capabilities = Array.isArray(value.capabilities) ? [...new Set(value.capabilities.map(String).filter(Boolean))] : [];
-  const sandbox = String(value.sandbox ?? "process") as ExtensionSandbox;
+  const sandbox = String(value.sandbox ?? "container") as ExtensionSandbox;
   if (!SANDBOXES.has(sandbox)) throw new Error(`extension sandbox must be one of: ${Array.from(SANDBOXES).join(", ")}`);
   const normalized = {
     schemaVersion: EXTENSION_SCHEMA_VERSION,
@@ -277,7 +305,7 @@ function normalizeManifest(input: unknown, { source, provenance }: Required<Inst
     source: String(value.source ?? source).trim().slice(0, 500),
     provenance: String(value.provenance ?? provenance).trim().slice(0, 120),
     digest: String(value.digest ?? createHash("sha256").update(JSON.stringify({ id, version, type, capabilities, sandbox, entrypoint: value.entrypoint ?? "" })).digest("hex")).trim(),
-    contentDigest: String(value.contentDigest ?? "").trim(),
+    contentDigest: String(value.contentDigest ?? "").trim().toLowerCase(),
     integrity: value.contentDigest ? "content-verified" : "metadata-only",
     permissions: value.permissions && typeof value.permissions === "object" && !Array.isArray(value.permissions) ? value.permissions as JsonObject : {}
   };

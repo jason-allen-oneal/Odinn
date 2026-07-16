@@ -101,7 +101,7 @@ export async function createGatewayServer({
       if (request.method === "POST" && url.pathname === "/proof") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         if (body?.schemaVersion === 1) {
-          const contract = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: workspaceRoot });
+          const contract = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: workspaceRoot, allowedCommands: config.proof?.allowedCommands ?? [] });
           return json(response, 200, await contract.verify(body));
         }
         validateContract(body?.contract);

@@ -6,8 +6,8 @@ import { access, chmod, mkdir, readFile, realpath, rename, writeFile } from "nod
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import { isIP } from "node:net";
-import { request as httpRequest } from "node:http";
+import { connect as netConnect, isIP } from "node:net";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
@@ -621,17 +621,17 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["web.search", {
       capability: "web.read",
       description: "Search the public web and return ranked results with snippets.",
-      execute: async (input: any) => searchWeb(input)
+      execute: async (input: any) => withWebRequestSlot(() => searchWeb(input))
     }],
     ["web.fetch", {
       capability: "web.read",
       description: "Fetch and extract readable content from a public web page.",
-      execute: async (input: any, context: any) => fetchWebPage(input, context.policy?.security?.web)
+      execute: async (input: any, context: any) => withWebRequestSlot(() => fetchWebPage(input, context.policy?.security?.web))
     }],
     ["browser.tabs", {
       capability: "browser.read",
       description: "List tabs in Ódinn Forge's persistent browser profile.",
-      execute: async () => browserTabs(stateDir)
+      execute: async (_input: any, context: any) => browserTabs(stateDir, context.policy?.security?.browser)
     }],
     ["browser.open", {
       capability: "browser.read",
@@ -868,7 +868,20 @@ export function createApprovalStore({ path }: any = {}) {
 
 const WEB_TIMEOUT_MS = 20_000;
 const WEB_MAX_BYTES = 2_000_000;
+const WEB_MAX_CONCURRENT_REQUESTS = 8;
+let activeWebRequests = 0;
+const webRequestWaiters: Array<() => void> = [];
 const browserManagers = new Map();
+
+async function withWebRequestSlot<T>(operation: () => Promise<T>): Promise<T> {
+  if (activeWebRequests >= WEB_MAX_CONCURRENT_REQUESTS) await new Promise<void>((resolveSlot) => webRequestWaiters.push(resolveSlot));
+  activeWebRequests += 1;
+  try { return await operation(); }
+  finally {
+    activeWebRequests -= 1;
+    webRequestWaiters.shift()?.();
+  }
+}
 
 export async function closeBrowserManagers() {
   const managers = Array.from(browserManagers.values());
@@ -885,7 +898,7 @@ async function searchWeb(input: any = {}) {
     signal: AbortSignal.timeout(WEB_TIMEOUT_MS)
   });
   if (!response.ok) throw new Error(`web search returned ${response.status}`);
-  const html = await response.text();
+  const html = (await readBoundedFetchBody(response, WEB_MAX_BYTES, "web search")).toString("utf8");
   const results = [];
   const pattern = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
   for (const match of html.matchAll(pattern)) {
@@ -963,29 +976,65 @@ async function requestValidatedUrl(value: any, security: any = {}) {
   }
   const address = addresses[0];
   return new Promise((resolveResponse: any, rejectResponse: any) => {
+    let settled = false;
+    const finish = (error?: Error, value?: any) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      if (error) rejectResponse(error);
+      else resolveResponse(value);
+    };
     const request = transport(parsed, {
       headers: { "user-agent": "Odinn-Forge/0.1 beta web-fetch" },
-      timeout: WEB_TIMEOUT_MS,
       lookup: (_hostname: any, _options: any, callback: any) => callback(null, address, isIP(address))
     }, (response: any) => {
       const chunks: Buffer[] = [];
       let bytes = 0;
       response.on("data", (chunk: any) => {
         bytes += chunk.length;
-        if (bytes <= WEB_MAX_BYTES + 1) chunks.push(chunk);
+        if (bytes > WEB_MAX_BYTES) {
+          const error = new Error(`web page exceeds ${WEB_MAX_BYTES} bytes`);
+          response.destroy(error);
+          request.destroy(error);
+          finish(error);
+          return;
+        }
+        chunks.push(chunk);
       });
-      response.on("end", () => resolveResponse({
+      response.on("end", () => finish(undefined, {
         status: response.statusCode ?? 0,
         headers: response.headers,
         url: parsed.href,
         body: Buffer.concat(chunks)
       }));
-      response.on("error", rejectResponse);
+      response.on("error", (error: Error) => finish(error));
     });
-    request.on("timeout", () => request.destroy(new Error("web.fetch request timed out")));
-    request.on("error", rejectResponse);
+    const deadline = setTimeout(() => request.destroy(new Error("web.fetch request timed out")), WEB_TIMEOUT_MS);
+    request.on("error", (error: Error) => finish(error));
     request.end();
   });
+}
+
+async function readBoundedFetchBody(response: any, maxBytes: number, label: string) {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        await reader.cancel(`${label} response exceeded ${maxBytes} bytes`).catch(() => undefined);
+        throw new Error(`${label} response exceeds ${maxBytes} bytes`);
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks);
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function dnsLookupAll(hostnameValue: any) {
@@ -1001,15 +1050,57 @@ async function dnsLookupAll(hostnameValue: any) {
 
 function isPrivateAddress(value: any) {
   const address = String(value || "").toLowerCase().replace(/^::ffff:/, "");
-  if (address === "localhost" || address.endsWith(".local")) return true;
+  if (address === "localhost" || address.endsWith(".localhost") || address.endsWith(".local") || address === "metadata.google.internal") return true;
   if (isIP(address) === 4) {
-    const [a, b] = address.split(".").map(Number);
-    return a === 10 || a === 127 || a === 169 && b === 254 || a === 192 && b === 168 || a === 172 && b >= 16 && b <= 31 || a === 100 && b >= 64 && b <= 127;
+    const [a, b, c] = address.split(".").map(Number);
+    return a === 0
+      || a === 10
+      || a === 100 && b >= 64 && b <= 127
+      || a === 127
+      || a === 169 && b === 254
+      || a === 172 && b >= 16 && b <= 31
+      || a === 192 && b === 0 && (c === 0 || c === 2)
+      || a === 192 && b === 88 && c === 99
+      || a === 192 && b === 168
+      || a === 198 && (b === 18 || b === 19 || b === 51 && c === 100)
+      || a === 203 && b === 0 && c === 113
+      || a >= 224;
   }
   if (isIP(address) === 6) {
-    return address === "::1" || address.startsWith("fc") || address.startsWith("fd") || address.startsWith("fe8") || address.startsWith("fe9") || address.startsWith("fea") || address.startsWith("feb");
+    return address === "::"
+      || address === "::1"
+      || address.startsWith("fc")
+      || address.startsWith("fd")
+      || address.startsWith("fe8")
+      || address.startsWith("fe9")
+      || address.startsWith("fea")
+      || address.startsWith("feb")
+      || address.startsWith("ff")
+      || address.startsWith("100:")
+      || address.startsWith("2001:2:")
+      || address.startsWith("2001:db8:");
   }
   return false;
+}
+
+async function validateBrowserNetworkUrl(value: any, security: any = {}) {
+  let parsed;
+  try { parsed = new URL(String(value)); } catch { throw new Error("browser blocked an invalid network URL"); }
+  if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password) throw new Error("browser only allows credential-free http(s) URLs");
+  assertDomainAllowed(parsed.hostname, security);
+  const addresses = await dnsLookupAll(parsed.hostname);
+  if (security.allowPrivateNetwork !== true && addresses.some(isPrivateAddress)) {
+    throw new Error(`browser blocked non-public DNS answer for ${parsed.hostname}`);
+  }
+  return { parsed, address: addresses[0] };
+}
+
+function browserSecurityFingerprint(security: any = {}) {
+  return JSON.stringify({
+    allowPrivateNetwork: security.allowPrivateNetwork === true,
+    allowedDomains: [...(security.allowedDomains ?? [])].map(String).sort(),
+    blockedDomains: [...(security.blockedDomains ?? [])].map(String).sort()
+  });
 }
 
 function assertDomainAllowed(host: any, security: any = {}) {
@@ -1057,11 +1148,114 @@ async function getBrowserManager(stateDir: any) {
   return manager;
 }
 
+class BrowserNetworkProxy {
+  [key: string]: any;
+  constructor(security: any) {
+    this.security = security ?? {};
+    this.server = null;
+    this.sockets = new Set();
+  }
+
+  async start() {
+    if (this.server?.listening) return;
+    this.server = createHttpServer((request, response) => void this.forwardHttp(request, response));
+    this.server.on("connect", (request: any, socket: any, head: Buffer) => void this.forwardTunnel(request, socket, head));
+    this.server.on("connection", (socket: any) => {
+      this.sockets.add(socket);
+      socket.once("close", () => this.sockets.delete(socket));
+      socket.on("error", () => socket.destroy());
+    });
+    await new Promise((resolveReady, rejectReady) => {
+      this.server.once("error", rejectReady);
+      this.server.listen(0, "127.0.0.1", () => {
+        this.server.off("error", rejectReady);
+        resolveReady(undefined);
+      });
+    });
+  }
+
+  url() {
+    const address = this.server?.address();
+    if (!address || typeof address === "string") throw new Error("browser network proxy is not listening");
+    return `http://127.0.0.1:${address.port}`;
+  }
+
+  async forwardHttp(request: any, response: any) {
+    try {
+      const { parsed, address } = await validateBrowserNetworkUrl(request.url, this.security);
+      const transport = parsed.protocol === "https:" ? httpsRequest : httpRequest;
+      const headers = { ...request.headers, host: parsed.host };
+      delete headers["proxy-connection"];
+      const upstream = transport({
+        protocol: parsed.protocol,
+        hostname: address,
+        port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+        method: request.method,
+        path: `${parsed.pathname}${parsed.search}`,
+        headers,
+        servername: parsed.hostname,
+        lookup: (_hostname: any, _options: any, callback: any) => callback(null, address, isIP(address))
+      }, (upstreamResponse: any) => {
+        response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+        upstreamResponse.pipe(response);
+      });
+      const deadline = setTimeout(() => upstream.destroy(new Error("browser proxy request timed out")), WEB_TIMEOUT_MS);
+      upstream.once("close", () => clearTimeout(deadline));
+      upstream.once("error", (error: Error) => {
+        if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain" });
+        response.end(`browser proxy rejected request: ${error.message}`);
+      });
+      request.pipe(upstream);
+    } catch (error) {
+      response.writeHead(403, { "content-type": "text/plain", connection: "close" });
+      response.end(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async forwardTunnel(request: any, client: any, head: Buffer) {
+    let upstream: any;
+    try {
+      const authority = new URL(`http://${request.url}`);
+      const port = Number(authority.port || 443);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("browser proxy blocked invalid CONNECT port");
+      const { address } = await validateBrowserNetworkUrl(`https://${authority.hostname}:${port}/`, this.security);
+      upstream = netConnect({ host: address, port, family: isIP(address) });
+      this.sockets.add(upstream);
+      upstream.once("close", () => this.sockets.delete(upstream));
+      const deadline = setTimeout(() => upstream.destroy(new Error("browser proxy CONNECT timed out")), WEB_TIMEOUT_MS);
+      await new Promise((resolveConnected, rejectConnected) => {
+        upstream.once("connect", resolveConnected);
+        upstream.once("error", rejectConnected);
+      });
+      clearTimeout(deadline);
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length) upstream.write(head);
+      upstream.on("error", () => client.destroy());
+      client.on("error", () => upstream.destroy());
+      upstream.pipe(client);
+      client.pipe(upstream);
+    } catch (error) {
+      upstream?.destroy();
+      client.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    }
+  }
+
+  async close() {
+    for (const socket of this.sockets) socket.destroy();
+    this.sockets.clear();
+    const server = this.server;
+    this.server = null;
+    if (server?.listening) await new Promise((resolveClosed) => server.close(() => resolveClosed(undefined)));
+  }
+}
+
 class BrowserManager {
   [key: string]: any;
   constructor(stateDir: any) {
     this.stateDir = stateDir;
     this.context = null;
+    this.proxy = null;
+    this.securityFingerprint = "";
     this.ids = new WeakMap();
     this.handles = new Map();
     this.handlesPath = join(stateDir, "browser-tabs.json");
@@ -1069,8 +1263,10 @@ class BrowserManager {
     this.recoveryPath = join(stateDir, "browser-recovery.json");
   }
 
-  async start() {
-    if (this.context && !this.context.isClosed()) return this.context;
+  async start(security: any = {}) {
+    const fingerprint = browserSecurityFingerprint(security);
+    if (this.context && !this.context.isClosed() && this.securityFingerprint === fingerprint) return this.context;
+    if (this.context || this.proxy) await this.close();
     this.context = null;
     if (!this.handlesLoaded) {
       try {
@@ -1085,12 +1281,35 @@ class BrowserManager {
     try { await access(executablePath); } catch { throw new Error(`Chromium not found at ${executablePath}; set ODINN_CHROMIUM_PATH`); }
     const headedRequested = process.env.ODINN_BROWSER_HEADLESS !== "1";
     const displayAvailable = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+    this.proxy = new BrowserNetworkProxy(security);
+    await this.proxy.start();
     this.context = await chromium.launchPersistentContext(userDataDir, {
       headless: !headedRequested || !displayAvailable,
       executablePath,
       viewport: { width: 1440, height: 900 },
+      serviceWorkers: "block",
+      proxy: { server: this.proxy.url() },
       args: ["--no-first-run", "--no-default-browser-check"]
     });
+    this.securityFingerprint = fingerprint;
+    await this.context.route("**/*", async (route: any) => {
+      try {
+        await validateBrowserNetworkUrl(route.request().url(), security);
+        await route.continue();
+      } catch {
+        await route.abort("blockedbyclient");
+      }
+    });
+    if (typeof this.context.routeWebSocket === "function") {
+      await this.context.routeWebSocket("**/*", async (socket: any) => {
+        try {
+          await validateBrowserNetworkUrl(socket.url(), security);
+          socket.connectToServer();
+        } catch {
+          socket.close({ code: 1008, reason: "blocked by browser network policy" });
+        }
+      });
+    }
     return this.context;
   }
 
@@ -1098,12 +1317,16 @@ class BrowserManager {
     const context = this.context;
     this.context = null;
     if (context) await context.close().catch(() => undefined);
+    const proxy = this.proxy;
+    this.proxy = null;
+    this.securityFingerprint = "";
+    if (proxy) await proxy.close().catch(() => undefined);
   }
 
-  async page(tabId: any) {
-    let context = await this.start();
+  async page(tabId: any, security: any = {}) {
+    let context = await this.start(security);
     let pages;
-    try { pages = context.pages(); } catch { await this.close(); context = await this.start(); pages = context.pages(); }
+    try { pages = context.pages(); } catch { await this.close(); context = await this.start(security); pages = context.pages(); }
     if (!pages.length) pages = [await context.newPage()];
     if (tabId) {
       const selected = pages.find((page: any) => this.tabId(page) === tabId);
@@ -1174,21 +1397,18 @@ async function ensureBrowserHandles(path: any, handles: any) {
   await chmod(path, 0o600);
 }
 
-async function browserTabs(stateDir: any) {
+async function browserTabs(stateDir: any, security: any = {}) {
   const manager = await getBrowserManager(stateDir);
-  const context = await manager.start();
+  const context = await manager.start(security);
   return { tabs: await Promise.all(context.pages().map((page: any) => manager.describe(page))) };
 }
 
 async function browserOpen(stateDir: any, input: any = {}, security: any = {}) {
   const url = cleanRequired(input.url, "browser.open requires url");
   if (!/^https?:\/\//i.test(url)) throw new Error("browser.open requires an http(s) url");
-  const parsed = new URL(url);
-  const privateHost = parsed.hostname === "localhost" || parsed.hostname.endsWith(".local") || parsed.hostname === "127.0.0.1" || parsed.hostname === "::1" || /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\./.test(parsed.hostname);
-  if (privateHost && security.allowPrivateNetwork !== true) throw new Error("browser.open blocked private-network URL by security policy");
-  assertDomainAllowed(parsed.hostname, security);
+  await validateBrowserNetworkUrl(url, security);
   const manager = await getBrowserManager(stateDir);
-  const page = await manager.page(input.tabId);
+  const page = await manager.page(input.tabId, security);
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: WEB_TIMEOUT_MS });
   assertBrowserPageAllowed(page, security);
   return { ...(await manager.describe(page)), ...(await browserPageSnapshot(page)) };
@@ -1196,7 +1416,7 @@ async function browserOpen(stateDir: any, input: any = {}, security: any = {}) {
 
 async function browserSnapshot(stateDir: any, input: any = {}, security: any = {}) {
   const manager = await getBrowserManager(stateDir);
-  const page = await manager.page(input.tabId);
+  const page = await manager.page(input.tabId, security);
   assertBrowserPageAllowed(page, security);
   return { ...(await manager.describe(page)), ...(await browserPageSnapshot(page)) };
 }
@@ -1235,7 +1455,7 @@ async function browserAction(stateDir: any, approvalStore: any, tool: any, input
     error.code = "BROWSER_RECOVERY_REQUIRED";
     throw error;
   }
-  const page = await manager.page(input.tabId);
+  const page = await manager.page(input.tabId, security);
   assertBrowserPageAllowed(page, security);
   const before = await browserPageSnapshot(page);
   if (input.expectedUrl && input.expectedUrl !== page.url()) {

@@ -228,7 +228,7 @@ export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): T
       });
       child.on("error", (error) => finish(error));
       child.on("exit", (code, exitSignal) => {
-        if (!settled) finish(new Error(`isolated task worker exited unexpectedly: ${code ?? exitSignal}`));
+        if (!settled) finish(new Error(`forked task worker exited unexpectedly: ${code ?? exitSignal}`));
       });
       signal?.addEventListener("abort", abort, { once: true });
       child.send({ payload, stateDir, workspaceRoot: taskWorkspaceRoot, config, policy });

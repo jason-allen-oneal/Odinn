@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -181,6 +181,27 @@ test("CLI start launches the local chat console", async () => {
     child.kill("SIGTERM");
     await new Promise((resolveClose: any) => child.once("close", resolveClose));
   }
+});
+
+test("CLI state restore rejects symbolic links before copying the backup", async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "odinn-cli-restore-"));
+  const state = join(fixtureRoot, "state");
+  const backup = join(fixtureRoot, "backup");
+  const outside = join(fixtureRoot, "outside-token");
+  await mkdir(state);
+  await mkdir(backup);
+  await writeFile(join(state, "config.json"), "{}\n");
+  await writeFile(join(backup, "config.json"), "{}\n");
+  await writeFile(join(backup, "backup-manifest.json"), `${JSON.stringify({ schemaVersion: 1, source: state, createdAt: new Date().toISOString() })}\n`);
+  await writeFile(outside, "outside\n");
+  await symlink(outside, join(backup, "gateway.token"));
+  const restore = spawnSync("node", ["apps/cli/src/cli.ts", "state", "restore", "--input", backup, "--confirm", "--state", state], {
+    cwd: root,
+    encoding: "utf8"
+  });
+  assert.notEqual(restore.status, 0);
+  assert.match(restore.stderr, /symbolic link/);
+  assert.equal(await readFile(join(state, "config.json"), "utf8"), "{}\n");
 });
 
 test("CLI onboarding configures a provider without storing a secret", async () => {

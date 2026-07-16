@@ -205,13 +205,13 @@ Extension manifests are inert until reviewed and enabled with explicit grants:
 
 ```bash
 pnpm odinn extension install --manifest ./extension.json
-pnpm odinn extension enable --id example-tool --grant web.read --trust
+pnpm odinn extension enable --id example-tool --grant web.read --trust --allow-unsafe-sandbox
 pnpm odinn extension run --id example-tool --capability web.read --input-json '{"query":"hello"}'
 pnpm odinn extension disable --id example-tool
 pnpm odinn extension rollback --id example-tool
 ```
 
-Only explicitly trusted `process` extensions can execute. Tool extensions use Ódinn Forge's JSONL call contract; MCP extensions use a JSON-RPC `tools/call` JSONL contract. Container execution, unsandboxed execution, automatic installation, and implicit trust are not enabled by this beta.
+Only manifests declaring `unconfined-process`, a verified SHA-256 `contentDigest`, explicit trust, grants, and the unsafe-sandbox acknowledgement can execute. The name is intentional: grants authorize invocation but do not confine filesystem or network behavior. Child processes receive a minimal environment and bounded output. Tool extensions use Ódinn Forge's JSONL call contract; MCP extensions use a JSON-RPC `tools/call` JSONL contract. Container execution, automatic installation, and implicit trust are not enabled by this beta.
 
 ## Architecture
 

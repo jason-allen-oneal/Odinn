@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createAuditStore, createBuiltInRegistry, normalizeModelConfig, runPlan, runTask, saveOAuthToken } from "../packages/kernel/src/index.ts";
+import { closeBrowserManagers, createAuditStore, createBuiltInRegistry, normalizeModelConfig, runPlan, runTask, saveOAuthToken } from "../packages/kernel/src/index.ts";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 
 async function fixture() {
@@ -334,6 +334,39 @@ test("web.fetch rejects a public-looking hostname that resolves to loopback", as
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn") });
   try {
     await assert.rejects(runTask({ task: { id: "run-dns-rebind", tool: "web.fetch", input: { url: `http://127.0.0.1.nip.io:${server.address().port}/` }, actor: "test" }, auditStore, registry }), /private|link-local|DNS validation/);
+  } finally {
+    await new Promise((resolve: any) => server.close(resolve));
+  }
+});
+
+test("browser.open rejects a public-looking hostname that resolves to loopback before navigation", async () => {
+  const { root, auditStore } = await fixture();
+  const server = createServer((_request: any, response: any) => response.end("private browser target"));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn") });
+  try {
+    await assert.rejects(runTask({ task: { id: "run-browser-dns-rebind", tool: "browser.open", input: { url: `http://127.0.0.1.nip.io:${server.address().port}/` }, actor: "test" }, auditStore, registry }), /browser blocked non-public DNS answer/);
+  } finally {
+    await closeBrowserManagers();
+    await new Promise((resolve: any) => server.close(resolve));
+  }
+});
+
+test("web.fetch terminates an oversized response instead of draining it", async () => {
+  const { root, auditStore } = await fixture();
+  let peerClosed = false;
+  const server = createServer((_request: any, response: any) => {
+    response.on("close", () => { peerClosed = true; });
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.write(Buffer.alloc(2_000_001, 65));
+  });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn") });
+  const policy = createDefaultPolicy({ security: { web: { allowPrivateNetwork: true } } });
+  try {
+    await assert.rejects(runTask({ task: { id: "run-web-body-limit", tool: "web.fetch", input: { url: `http://127.0.0.1:${server.address().port}/` }, actor: "test" }, auditStore, registry, policy }), /exceeds 2000000 bytes/);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(peerClosed, true);
   } finally {
     await new Promise((resolve: any) => server.close(resolve));
   }

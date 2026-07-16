@@ -1367,6 +1367,7 @@ async function stateCommand(args: any) {
     if (destination === state || destination.startsWith(`${state}/`) || destination.startsWith(`${state}\\`)) {
       throw new Error("state backup destination must not be inside the active state directory");
     }
+    await validateStateBackupTree(state, { requireManifest: false });
     await cp(state, destination, { recursive: true, force: false, errorOnExist: true });
     await writeFile(join(destination, "backup-manifest.json"), `${JSON.stringify({ schemaVersion: 1, source: state, createdAt: new Date().toISOString() }, null, 2)}\n`, { flag: "wx" });
     await printJson({ ok: true, operation: "backup", source: state, destination });
@@ -1378,11 +1379,16 @@ async function stateCommand(args: any) {
     if (!input) throw new Error("state restore requires --input <directory>");
     const source = resolveInvocationPath(input);
     await access(source);
+    await validateStateBackupTree(source, { requireManifest: true });
     const parent = resolve(state, "..");
     const staging = join(parent, `.${state.split(/[\\/]/).pop()}-restore-${process.pid}-${Date.now()}`);
     await cp(source, staging, { recursive: true, force: false, errorOnExist: true });
     const configPath = join(staging, "config.json");
-    try { JSON.parse(await readFile(configPath, "utf8")); } catch (error: any) { await rm(staging, { recursive: true, force: true }); throw new Error(`state restore source is invalid: ${error.message}`); }
+    try {
+      const config = JSON.parse(await readFile(configPath, "utf8"));
+      if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("config.json must contain an object");
+      await validateStateBackupTree(staging, { requireManifest: true });
+    } catch (error: any) { await rm(staging, { recursive: true, force: true }); throw new Error(`state restore source is invalid: ${error.message}`); }
     const currentBackup = `${state}.before-restore-${Date.now()}`;
     try {
       await rename(state, currentBackup);
@@ -1397,6 +1403,29 @@ async function stateCommand(args: any) {
     return;
   }
   throw new Error("state requires subcommand: backup or restore");
+}
+
+async function validateStateBackupTree(root: string, { requireManifest }: { requireManifest: boolean }) {
+  const rootStat = await lstat(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("state backup root must be a physical directory");
+  const walk = async (directory: string) => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const metadata = await lstat(path);
+      if (metadata.isSymbolicLink()) throw new Error(`state backup contains a symbolic link: ${relative(root, path)}`);
+      if (metadata.isDirectory()) {
+        await walk(path);
+        continue;
+      }
+      if (!metadata.isFile()) throw new Error(`state backup contains an unsupported file type: ${relative(root, path)}`);
+      if (metadata.nlink !== 1) throw new Error(`state backup contains a hard-linked file: ${relative(root, path)}`);
+    }
+  };
+  await walk(root);
+  if (requireManifest) {
+    const manifest = JSON.parse(await readFile(join(root, "backup-manifest.json"), "utf8"));
+    if (!manifest || manifest.schemaVersion !== 1 || typeof manifest.createdAt !== "string") throw new Error("backup-manifest.json is invalid or unsupported");
+  }
 }
 
 async function secureStateTree(root: any) {
@@ -1553,7 +1582,8 @@ async function runRecordTool(args: any, tool: any, input: any) {
 
 function runtimeFor(args: any) {
   const state = stateDir(args);
-  return { state, runtime: createDifferentiatedRuntime({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(readConfigSync(state).experimental) }) };
+  const config = readConfigSync(state);
+  return { state, config, runtime: createDifferentiatedRuntime({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) }) };
 }
 
 function readConfigSync(state: any) {
@@ -1567,14 +1597,14 @@ async function proof(args: any) {
     const path = rest[1]; if (!path) throw new Error("proof contract validate requires a contract path");
     const contract = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path); await printJson({ valid: true, contract: contract.schemaVersion === 1 ? validateVerificationContract(contract) : validateContract(contract) }); return;
   }
-  const { runtime } = runtimeFor(rest);
+  const { runtime, config } = runtimeFor(rest);
   try {
     if (subcommand === "run") {
       const runId = rest.find((value: any) => !value.startsWith("--")); const path = option(rest, "--contract"); if (!runId || !path) throw new Error("proof run requires <run-id> and --contract");
       const contract = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path);
       if (contract.schemaVersion === 1) {
         if (contract.runId !== runId) throw new Error("proof contract runId must match the requested run");
-        await printJson(await new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: invocationRoot() }).verify(contract));
+        await printJson(await new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: invocationRoot(), allowedCommands: config.proof?.allowedCommands ?? [] }).verify(contract));
       } else {
         await printJson(await runtime.proof.run(runId, contract, { workspaceRoot: invocationRoot() }));
       }

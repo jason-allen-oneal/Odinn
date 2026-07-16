@@ -34,7 +34,10 @@ export interface VerificationContract { schemaVersion: number; id: string; runId
 interface ProcessResult extends JsonObject { startedAt: string; completedAt: string; exitCode: number | null; signal?: string; stdout: string; stderr: string; timedOut: boolean; outputLimitExceeded: boolean; error?: string }
 interface AssertionResult { id: string; type: ProofAssertion["type"]; status: "passed" | "failed"; passed: boolean; message: string; expected: unknown; actual: JsonObject; startedAt: string; completedAt: string }
 interface StoredArtifact { digest: string; path: string; mediaType: string; sizeBytes: number }
-interface ProofVerifierOptions { runLedger: RunLedger; allowedRoot?: string; maxOutputBytes?: number; maxFileBytes?: number; allowExternalHttp?: boolean }
+interface ProofVerifierOptions {
+  runLedger: RunLedger; allowedRoot?: string; maxOutputBytes?: number; maxFileBytes?: number;
+  allowExternalHttp?: boolean; allowedCommands?: string[][]; commandEnvironment?: NodeJS.ProcessEnv;
+}
 
 const asObject = (value: unknown): JsonObject => value as JsonObject;
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
@@ -256,7 +259,17 @@ function isLoopbackUrl(value: string) {
   return hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
 
-function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes }: { cwd: string; timeoutMs: number; maxOutputBytes: number }): Promise<ProcessResult> {
+function terminateProcessTree(child: any) {
+  if (!child?.pid) return;
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    killer.unref();
+    return;
+  }
+  try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+}
+
+function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes, environment }: { cwd: string; timeoutMs: number; maxOutputBytes: number; environment: NodeJS.ProcessEnv }): Promise<ProcessResult> {
   return new Promise<ProcessResult>((resolveResult) => {
     const startedAt = new Date().toISOString();
     const stdout: Buffer[] = [];
@@ -269,6 +282,8 @@ function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes }: {
     let settled = false;
     const child = spawn(command[0], command.slice(1), {
       cwd,
+      env: environment,
+      detached: process.platform !== "win32",
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true
@@ -281,7 +296,7 @@ function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes }: {
       else stderrBytes += Math.min(chunk.byteLength, available);
       if (chunk.byteLength > available) {
         outputLimitExceeded = true;
-        child.kill();
+        terminateProcessTree(child);
       }
     };
     child.stdout.on("data", (chunk) => collect(stdout, chunk, "stdout"));
@@ -289,7 +304,7 @@ function captureProcess(command: string[], { cwd, timeoutMs, maxOutputBytes }: {
     child.once("error", (error) => { spawnError = error; });
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      terminateProcessTree(child);
     }, timeoutMs);
     child.once("close", (exitCode, signal) => {
       if (settled) return;
@@ -325,8 +340,10 @@ export class ProofVerifier {
   readonly maxOutputBytes: number;
   readonly maxFileBytes: number;
   readonly allowExternalHttp: boolean;
+  readonly allowedCommands: string[][];
+  readonly commandEnvironment: NodeJS.ProcessEnv;
 
-  constructor({ runLedger, allowedRoot, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, maxFileBytes = DEFAULT_MAX_FILE_BYTES, allowExternalHttp = false }: ProofVerifierOptions) {
+  constructor({ runLedger, allowedRoot, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, maxFileBytes = DEFAULT_MAX_FILE_BYTES, allowExternalHttp = false, allowedCommands = [], commandEnvironment }: ProofVerifierOptions) {
     if (!runLedger || typeof runLedger.getRun !== "function" || typeof runLedger.appendEvent !== "function") {
       throw new TypeError("ProofVerifier requires a RunLedger");
     }
@@ -339,11 +356,19 @@ export class ProofVerifier {
     if (!Number.isInteger(maxFileBytes) || maxFileBytes < 1 || maxFileBytes > 10_000_000) {
       throw new TypeError("maxFileBytes must be an integer from 1 through 10000000");
     }
+    if (!Array.isArray(allowedCommands) || allowedCommands.some((command) => !Array.isArray(command) || command.length === 0 || command.some((part) => typeof part !== "string") || !isAbsolute(command[0]))) {
+      throw new TypeError("ProofVerifier allowedCommands must contain exact non-empty argument arrays with absolute executable paths");
+    }
     this.runLedger = runLedger;
     this.allowedRoot = resolve(allowedRoot ?? runLedger.workspaceRoot ?? process.cwd());
     this.maxOutputBytes = maxOutputBytes;
     this.maxFileBytes = maxFileBytes;
     this.allowExternalHttp = allowExternalHttp === true;
+    this.allowedCommands = allowedCommands.map((command) => [...command]);
+    this.commandEnvironment = commandEnvironment ?? {
+      PATH: process.env.PATH ?? "",
+      ...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {})
+    };
   }
 
   async verify(input: unknown) {
@@ -414,6 +439,10 @@ export class ProofVerifier {
   }
 
   async verifyCommand(assertion: CommandAssertion, root: string): Promise<AssertionResult> {
+    const approved = this.allowedCommands.some((command) => command.length === assertion.command.length && command.every((part, index) => part === assertion.command[index]));
+    if (!approved) {
+      return this.failedResult(assertion, "command assertion is not present in the operator-controlled exact command allowlist", { command: assertion.command });
+    }
     let cwdResult;
     try {
       cwdResult = await resolveAllowedPath(root, assertion.cwd ?? ".");
@@ -430,7 +459,8 @@ export class ProofVerifier {
     const actual = await captureProcess(assertion.command, {
       cwd: cwdResult.path,
       timeoutMs: assertion.timeoutMs,
-      maxOutputBytes: this.maxOutputBytes
+      maxOutputBytes: this.maxOutputBytes,
+      environment: this.commandEnvironment
     });
     const failures: string[] = [];
     if (actual.error) failures.push(`command could not start: ${actual.error}`);
@@ -506,7 +536,12 @@ export class ProofVerifier {
     try { cwdResult = await resolveAllowedPath(root, assertion.cwd ?? "."); }
     catch (error) { return this.failedResult(assertion, errorMessage(error), { cwd: assertion.cwd ?? "." }); }
     if (!cwdResult.exists) return this.failedResult(assertion, `git working directory does not exist: ${assertion.cwd ?? "."}`, { cwd: assertion.cwd ?? "." });
-    const actual = await captureProcess(["git", "status", "--porcelain"], { cwd: cwdResult.path, timeoutMs: DEFAULT_TIMEOUT_MS, maxOutputBytes: this.maxOutputBytes });
+    const actual = await captureProcess(["git", "status", "--porcelain"], {
+      cwd: cwdResult.path,
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+      maxOutputBytes: this.maxOutputBytes,
+      environment: this.commandEnvironment
+    });
     const clean = actual.exitCode === 0 && actual.stdout.trim() === "";
     const passed = clean === assertion.expect.clean && actual.exitCode === 0;
     return { id: assertion.id, type: assertion.type, status: passed ? "passed" : "failed", passed, message: passed ? "git assertion passed" : `expected clean=${assertion.expect.clean}, received clean=${clean}`, expected: assertion.expect, actual, startedAt: actual.startedAt, completedAt: actual.completedAt };

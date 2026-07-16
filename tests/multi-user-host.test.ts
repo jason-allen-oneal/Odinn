@@ -58,3 +58,30 @@ test("multi-user host rate limits repeated authentication failures", async () =>
     assert.ok(Number(blocked.headers.get("retry-after")) >= 1);
   } finally { await new Promise((resolve: any) => server.close(() => resolve())); }
 });
+
+test("multi-user host preserves authentication throttles across restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-limit-restart-"));
+  const workspace = await mkdtemp(join(tmpdir(), "odinn-limit-restart-user-"));
+  const password = await hashPassword("correct-password-long");
+  const publicOrigin = "https://odinn.test";
+  const options = {
+    stateDir: root,
+    publicOrigin,
+    loginLimits: { maximumAttempts: 1, windowMs: 60_000 },
+    users: { schemaVersion: 1, users: [{ id: "alice", workspaceRoot: workspace, salt: password.salt, passwordHash: password.hash }] }
+  };
+  const first = await createMultiUserHost(options);
+  await new Promise((resolve: any) => first.listen(0, "127.0.0.1", resolve));
+  const firstBase = `http://127.0.0.1:${first.address().port}`;
+  assert.equal((await fetch(`${firstBase}/auth/login`, { method: "POST", headers: { "content-type": "application/json", origin: publicOrigin }, body: JSON.stringify({ userId: "alice", password: "wrong-password-long" }) })).status, 401);
+  await new Promise((resolve: any) => first.close(() => resolve()));
+
+  const second = await createMultiUserHost(options);
+  await new Promise((resolve: any) => second.listen(0, "127.0.0.1", resolve));
+  const secondBase = `http://127.0.0.1:${second.address().port}`;
+  try {
+    assert.equal((await fetch(`${secondBase}/auth/login`, { method: "POST", headers: { "content-type": "application/json", origin: publicOrigin }, body: JSON.stringify({ userId: "alice", password: "correct-password-long" }) })).status, 429);
+  } finally {
+    await new Promise((resolve: any) => second.close(() => resolve()));
+  }
+});

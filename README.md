@@ -38,6 +38,15 @@ pnpm gui:start
 
 Open [http://127.0.0.1:18790/](http://127.0.0.1:18790/).
 
+After installing a release, the normal path is shorter:
+
+```bash
+odinn onboard --provider openai
+odinn start
+```
+
+`odinn start` launches the local gateway and opens the chat console. Use `--no-open` on headless machines. See [Getting started](docs/getting-started.md) for provider, local-model, and troubleshooting examples.
+
 For a deterministic smoke test:
 
 ```bash
@@ -196,13 +205,13 @@ Extension manifests are inert until reviewed and enabled with explicit grants:
 
 ```bash
 pnpm odinn extension install --manifest ./extension.json
-pnpm odinn extension enable --id example-tool --grant web.read --trust
+pnpm odinn extension enable --id example-tool --grant web.read --trust --allow-unsafe-sandbox
 pnpm odinn extension run --id example-tool --capability web.read --input-json '{"query":"hello"}'
 pnpm odinn extension disable --id example-tool
 pnpm odinn extension rollback --id example-tool
 ```
 
-Only explicitly trusted `process` extensions can execute. Tool extensions use Ódinn Forge's JSONL call contract; MCP extensions use a JSON-RPC `tools/call` JSONL contract. Container execution, unsandboxed execution, automatic installation, and implicit trust are not enabled by this beta.
+Only manifests declaring `unconfined-process`, a verified SHA-256 `contentDigest`, explicit trust, grants, and the unsafe-sandbox acknowledgement can execute. The name is intentional: grants authorize invocation but do not confine filesystem or network behavior. Child processes receive a minimal environment and bounded output. Tool extensions use Ódinn Forge's JSONL call contract; MCP extensions use a JSON-RPC `tools/call` JSONL contract. Container execution, automatic installation, and implicit trust are not enabled by this beta.
 
 ## Architecture
 
@@ -267,7 +276,7 @@ Release-package validation extracts both source archives, installs with the froz
 ```bash
 pnpm release:package
 pnpm release:checksums
-node scripts/release/verify.mjs
+node scripts/release/verify.ts
 pnpm release:install-smoke
 pnpm storage:drill
 ```
@@ -280,15 +289,15 @@ Versioned install and rollback:
 
 ```bash
 ./scripts/install.sh --prefix "$HOME/.local/share/odinn"
-node scripts/install.mjs upgrade --source . --prefix "$HOME/.local/share/odinn"
-node scripts/install.mjs rollback --prefix "$HOME/.local/share/odinn"
+node scripts/install.ts upgrade --source . --prefix "$HOME/.local/share/odinn"
+node scripts/install.ts rollback --prefix "$HOME/.local/share/odinn"
 ```
 
 Opt-in multi-user host:
 
 ```bash
 ODINN_HOST_STATE=/srv/odinn ODINN_USER_PASSWORD='use-a-password-manager' \
-  node apps/gateway/src/host.mjs user-add --id alice --workspace /srv/workspaces/alice
+  node apps/gateway/src/host.ts user-add --id alice --workspace /srv/workspaces/alice
 
 ODINN_HOST=0.0.0.0 ODINN_PORT=443 ODINN_HOST_STATE=/srv/odinn \
 ODINN_PUBLIC_ORIGIN=https://odinn.example.com \

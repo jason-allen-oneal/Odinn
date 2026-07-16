@@ -67,7 +67,7 @@ Proof is evidence-based: model text cannot set `verified`. Sentinel decisions ar
 - Public web content is untrusted data and may contain prompt injection. Ódinn Forge must not treat page instructions as operator authorization.
 - State directories are repaired to `0700` and sensitive JSON/JSONL records to `0600` when the gateway opens them. Idempotency keys are bound to a canonical request hash; reusing a key with different content returns `409`.
 - Browser read access is not action authorization. An external side effect requires the approval gate unless the operator explicitly disables it.
-- The single-user gateway remains loopback-only. Remote deployment uses `host.mjs`; non-loopback startup fails without a certificate, key, and exact public origin. Passwords are scrypt-derived, sessions are signed, cookies are HttpOnly/SameSite=Strict/Secure under TLS, and tenants never share state roots or gateway bearer tokens.
+- The single-user gateway remains loopback-only. Remote deployment uses `host.ts`; non-loopback startup fails without a certificate, key, and exact public origin. Passwords are scrypt-derived, sessions are signed, cookies are HttpOnly/SameSite=Strict/Secure under TLS, and tenants never share state roots or gateway bearer tokens.
 
 ### Known beta gaps
 

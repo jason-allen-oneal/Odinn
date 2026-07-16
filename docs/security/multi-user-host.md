@@ -9,7 +9,7 @@ Passwords are read from the environment and stored only as scrypt hashes in an o
 ```bash
 ODINN_HOST_STATE=/srv/odinn-host \
 ODINN_USER_PASSWORD='use-a-password-manager-generated-secret' \
-node apps/gateway/src/host.mjs user-add \
+node apps/gateway/src/host.ts user-add \
   --id alice \
   --workspace /srv/odinn-workspaces/alice
 ```
@@ -28,7 +28,7 @@ ODINN_TLS_KEY=/etc/letsencrypt/live/odinn.example.com/privkey.pem \
 pnpm host:start
 ```
 
-A non-loopback bind refuses to start without a certificate, private key, and exact public origin. Mutating requests require that exact origin. Authentication is throttled per client address and user, sessions are signed HttpOnly/SameSite cookies, and logout revokes the active session. Sessions are intentionally held in memory, so a host restart signs every user out.
+A non-loopback bind refuses to start without a certificate, private key, and exact public origin. Mutating requests require that exact origin. Authentication is durably throttled per client address and user across restarts, sessions are signed HttpOnly/SameSite cookies, and logout revokes the active session. Public responses use generic errors while internal details remain in server logs. Sessions are intentionally held in memory, so a host restart signs every user out.
 
 ## Isolation boundary
 

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { CapabilityBroker, Sentinel } from "./differentiated-runtime.mjs";
+import { CapabilityBroker, Sentinel } from "./differentiated-runtime.ts";
 import { redact } from "./run-ledger.ts";
 import type { JsonObject } from "@odinn/protocol";
 
@@ -197,7 +197,7 @@ async function invokeThroughRuntime({ id, input, requested, extension, entrypoin
     if (featureFlags.capabilities === true) {
       const brokerOptions = { ledger, stateDir: ledger.stateDir, featureFlags };
       const consumeOptions = { runId, toolName: "extension.invoke", resource: { extensionId: id, capability: requested } };
-      claims = new CapabilityBroker(brokerOptions).consume(runtime.capabilityToken, consumeOptions);
+      claims = new CapabilityBroker(brokerOptions).consume(runtime.capabilityToken ?? "", consumeOptions);
     }
     await append({ type: "task.started", decision: "allow", data: { input: safeInput, capabilityId: claims?.id } });
     const output = await runExtensionProcess(process.execPath, [entrypoint], request, { cwd: dirname(entrypoint), timeoutMs, protocol });

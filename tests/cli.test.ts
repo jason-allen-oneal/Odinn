@@ -21,6 +21,8 @@ test("CLI advanced help exposes documented beta safety controls", () => {
     "--workspace <directory>",
     "--approve-external",
     "--duration-ms <ms>",
+    "--constraints <json>",
+    "--show-token",
     "improve rollback --improvement <id>"
   ]) {
     assert.match(help.stdout, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));

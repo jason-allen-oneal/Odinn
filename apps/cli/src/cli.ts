@@ -181,8 +181,8 @@ function usage() {
   odinn proof contract validate <contract.json|yml>
   odinn policy validate <policy.json|yml>
   odinn policy test <policy.json|yml> --tool <tool> --input-json <json> [--state .odinn]
-  odinn capability issue --run <run-id> --step <step-id> --tool <tool> [--scope a,b] [--state .odinn]
-  odinn capability use --token <token> --run <run-id> --tool <tool> [--state .odinn]
+  odinn capability issue --run <run-id> --step <step-id> --tool <tool> [--scope a,b] [--constraints <json>] [--expires-ms <ms>] [--max-uses <count>] [--show-token] [--state .odinn]
+  odinn capability use --token <token> --run <run-id> --tool <tool> [--resource <json>] [--state .odinn]
   odinn capability list <run-id> [--state .odinn]
   odinn capability revoke <capability-id> [--state .odinn]
   odinn timeline <run-id> [--state .odinn]

@@ -17,7 +17,7 @@ import { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, nor
 import { toolSafetyDescriptor } from "./tool-safety.ts";
 import { CapabilityBroker, Sentinel } from "./differentiated-runtime.mjs";
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
-export { ExtensionRegistry, ExtensionExecutor } from "./extensions.mjs";
+export { ExtensionRegistry, ExtensionExecutor } from "./extensions.ts";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.mjs";
 export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.mjs";
 export { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };

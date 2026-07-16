@@ -3,7 +3,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ExtensionExecutor, ExtensionRegistry } from "../packages/kernel/src/extensions.mjs";
+import { ExtensionExecutor, ExtensionRegistry } from "../packages/kernel/src/extensions.ts";
 import { createAuditStore, createDifferentiatedRuntime } from "../packages/kernel/src/index.mjs";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 

@@ -2,7 +2,7 @@ import { hostname, platform, release } from "node:os";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { access, chmod, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -655,6 +655,16 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       description: "Press a browser key after explicit user approval.",
       execute: async (input, context) => browserAction(stateDir, approvalStore, "browser.press", input, context.policy?.security?.browser)
     }],
+    ["browser.recovery.status", {
+      capability: "browser.read",
+      description: "Inspect unresolved browser mutations after a crash, tab loss, or uncertain action outcome.",
+      execute: async () => browserRecoveryStatus(stateDir)
+    }],
+    ["browser.recovery.resolve", {
+      capability: "browser.act",
+      description: "Resolve an uncertain browser mutation after operator inspection.",
+      execute: async (input) => browserRecoveryResolve(stateDir, input)
+    }],
     ["agent.run", {
       capability: "agent.run",
       description: "Run a bounded model/tool loop with web and browser capabilities.",
@@ -669,7 +679,12 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["model.chat", {
       capability: "model.chat",
       description: "Send a chat completion through a configured OpenAI-compatible provider.",
-      execute: async (input, context) => chatWithModel(modelConfig, input, { stateDir, signal: context.signal })
+      execute: async (input, context) => chatWithModel(modelConfig, {
+        ...(input.retries === undefined && input.maxRetries === undefined && config.runtime?.modelRetries !== undefined
+          ? { retries: config.runtime.modelRetries }
+          : {}),
+        ...input
+      }, { stateDir, signal: context.signal })
     }],
     ["memory.remember", {
       capability: "memory.write",
@@ -763,8 +778,8 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     }],
     ["improve.learn", {
       capability: "improve.write",
-      description: "Mine repeated runtime failures into reviewable improvement proposals without applying changes.",
-      execute: async (input) => learnImprovements(recordStore, auditStore, input)
+      description: "Mine repeated runtime failures and autonomously apply allowlisted, rollback-safe runtime tuning when enabled.",
+      execute: async (input) => learnImprovements(recordStore, auditStore, input, { stateDir: resolve(stateDir), config })
     }],
     ["improve.list", {
       capability: "improve.read",
@@ -775,6 +790,11 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       capability: "improve.write",
       description: "Approve or reject a self-improvement proposal as an auditable record.",
       execute: async (input) => decideImprovement(recordStore, input)
+    }],
+    ["improve.rollback", {
+      capability: "improve.write",
+      description: "Rollback an autonomously applied improvement to its captured configuration snapshot.",
+      execute: async (input) => rollbackImprovement(recordStore, input, { stateDir: resolve(stateDir), config })
     }]
   ]);
 }
@@ -1042,6 +1062,7 @@ class BrowserManager {
     this.handles = new Map();
     this.handlesPath = join(stateDir, "browser-tabs.json");
     this.handlesLoaded = false;
+    this.recoveryPath = join(stateDir, "browser-recovery.json");
   }
 
   async start() {
@@ -1114,6 +1135,26 @@ class BrowserManager {
     }
     return description;
   }
+
+  async recovery() {
+    try {
+      const value = JSON.parse(await readFile(this.recoveryPath, "utf8"));
+      if (value?.schemaVersion !== 1) throw new Error("invalid browser recovery journal");
+      if (value.status === "executing") value.status = "unknown";
+      return value;
+    } catch (error) {
+      if (error?.code === "ENOENT") return { schemaVersion: 1, status: "clear" };
+      throw error;
+    }
+  }
+
+  async writeRecovery(value) {
+    await mkdir(dirname(this.recoveryPath), { recursive: true, mode: 0o700 });
+    const temporary = `${this.recoveryPath}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify({ schemaVersion: 1, ...value }, null, 2)}\n`, { mode: 0o600 });
+    await rename(temporary, this.recoveryPath);
+    await chmod(this.recoveryPath, 0o600);
+  }
 }
 
 function isPrivateBrowserUrl(value) {
@@ -1184,6 +1225,12 @@ async function browserAction(stateDir, approvalStore, tool, input = {}, security
     return { type: "approval.required", approvalId, tool, summary: browserActionSummary(tool, input), expiresInSeconds: 300 };
   }
   const manager = await getBrowserManager(stateDir);
+  const unresolved = await manager.recovery();
+  if (["executing", "unknown"].includes(unresolved.status)) {
+    const error = new Error(`browser mutation ${unresolved.id} has an uncertain outcome; inspect the current page and resolve recovery before another mutation`);
+    error.code = "BROWSER_RECOVERY_REQUIRED";
+    throw error;
+  }
   const page = await manager.page(input.tabId);
   assertBrowserPageAllowed(page, security);
   const before = await browserPageSnapshot(page);
@@ -1200,6 +1247,17 @@ async function browserAction(stateDir, approvalStore, tool, input = {}, security
       : input.text
         ? page.getByText(input.text, { exact: input.exact === true }).first()
         : null;
+  const transaction = {
+    id: `browser_tx_${randomUUID()}`,
+    status: "executing",
+    tool,
+    tabId: manager.tabId(page),
+    expectedUrl: page.url(),
+    beforeSnapshotId: before.snapshotId,
+    startedAt: new Date().toISOString(),
+    input: redactBrowserInput(input)
+  };
+  await manager.writeRecovery(transaction);
   try {
     if (tool === "browser.press") {
       await page.keyboard.press(cleanRequired(input.key, "browser.press requires key"));
@@ -1209,13 +1267,32 @@ async function browserAction(stateDir, approvalStore, tool, input = {}, security
       else await locator.fill(String(input.value ?? ""));
     }
   } catch (error) {
+    await manager.writeRecovery({ ...transaction, status: "unknown", failedAt: new Date().toISOString(), error: error.message });
     error.code = error.code || "BROWSER_ACTION_OUTCOME_UNKNOWN";
     error.message = `${error.message}; browser mutation outcome is unknown, refresh the page and review before retrying`;
     throw error;
   }
   await page.waitForTimeout(250);
   assertBrowserPageAllowed(page, security);
-  return { type: "browser.action.completed", tool, ...(await manager.describe(page)), ...(await browserPageSnapshot(page)) };
+  const after = await browserPageSnapshot(page);
+  await manager.writeRecovery({ ...transaction, status: "completed", completedAt: new Date().toISOString(), afterUrl: page.url(), afterSnapshotId: after.snapshotId });
+  return { type: "browser.action.completed", transactionId: transaction.id, tool, ...(await manager.describe(page)), ...after };
+}
+
+async function browserRecoveryStatus(stateDir) {
+  const manager = await getBrowserManager(stateDir);
+  return { type: "browser.recovery.status", recovery: await manager.recovery() };
+}
+
+async function browserRecoveryResolve(stateDir, input = {}) {
+  const manager = await getBrowserManager(stateDir);
+  const current = await manager.recovery();
+  if (!["executing", "unknown"].includes(current.status)) throw new Error("no uncertain browser mutation requires resolution");
+  const outcome = cleanRequired(input.outcome, "browser.recovery.resolve requires outcome");
+  if (!["completed", "not-applied", "manual-recovery"].includes(outcome)) throw new Error("browser recovery outcome must be completed, not-applied, or manual-recovery");
+  const resolved = { ...current, status: "resolved", outcome, note: cleanString(input.note, ""), resolvedAt: new Date().toISOString() };
+  await manager.writeRecovery(resolved);
+  return { type: "browser.recovery.resolved", recovery: resolved };
 }
 
 function browserActionSummary(tool, input) {
@@ -1240,6 +1317,7 @@ const AGENT_TOOL_SCHEMAS = [
   { type: "function", function: { name: "browser.click", description: "Click a control; Ódinn will ask for approval before changing external state.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } } } },
   { type: "function", function: { name: "browser.type", description: "Fill a field; Ódinn will ask for approval before submitting anything.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] } } },
   { type: "function", function: { name: "browser.press", description: "Press a key; Ódinn will ask for approval first.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] } } }
+  ,{ type: "function", function: { name: "browser.recovery.status", description: "Inspect an uncertain browser mutation after a crash or failed action.", parameters: { type: "object", properties: {} } } }
 ];
 
 async function runAgent(modelConfig, input = {}, { stateDir, memoryStore, runTool, runLedger } = {}) {
@@ -2393,11 +2471,12 @@ async function proposeImprovement(store, input = {}) {
     target: cleanString(input.target, "runtime"),
     priority: cleanString(input.priority, "normal"),
     evidence: normalizeEvidence(input.evidence),
-    source: cleanString(input.source, "local")
+    source: cleanString(input.source, "local"),
+    ...(input.action ? { action: input.action } : {})
   });
 }
 
-async function learnImprovements(store, auditStore, input = {}) {
+async function learnImprovements(store, auditStore, input = {}, { stateDir, config = {} } = {}) {
   if (!auditStore || typeof auditStore.readAll !== "function") return { generated: [], message: "audit observation source unavailable" };
   const events = await auditStore.readAll();
   const limit = normalizeLimit(input.limit, 1000);
@@ -2418,16 +2497,33 @@ async function learnImprovements(store, auditStore, input = {}) {
     const title = `Investigate repeated ${group.tool} failures`;
     const target = `runtime/${group.tool}`;
     if (existing.has(`${target}:${title}`)) continue;
-    generated.push(await proposeImprovement(store, {
+    const action = deriveAutonomousAction(group, config);
+    const proposal = await proposeImprovement(store, {
       title,
       rationale: `${group.count} audited events reported: ${group.reason}. Review the trace before changing runtime behavior.`,
       target,
       priority: group.count >= 5 ? "high" : "normal",
       evidence: group.runs.map((runId) => ({ runId, type: "audit-event", count: group.count })),
-      source: "autonomous-observation"
-    }));
+      source: "autonomous-observation",
+      action
+    });
+    generated.push(proposal);
   }
-  return { generated, observedEvents: failures.length, applied: false, requiresHumanDecision: true };
+  const settings = normalizeSelfImprovementConfig(config.selfImprovement);
+  const applied = [];
+  if (settings.enabled && settings.mode === "auto") {
+    for (const proposal of generated.slice(0, settings.maxChangesPerCycle)) {
+      if (!proposal.action) continue;
+      applied.push(await applyImprovement(store, proposal, { stateDir, config, settings }));
+    }
+  }
+  return {
+    generated,
+    observedEvents: failures.length,
+    applied,
+    mode: settings.enabled ? settings.mode : "disabled",
+    requiresHumanDecision: !settings.enabled || settings.mode !== "auto"
+  };
 }
 
 async function listImprovements(store, input = {}) {
@@ -2453,6 +2549,73 @@ async function decideImprovement(store, input = {}) {
   });
 }
 
+export function normalizeSelfImprovementConfig(value = {}) {
+  const mode = ["disabled", "propose", "auto"].includes(value?.mode) ? value.mode : "propose";
+  return {
+    enabled: value?.enabled === true && mode !== "disabled",
+    mode,
+    intervalMs: boundedInteger(value?.intervalMs, 300_000, 30_000, 86_400_000),
+    maxChangesPerCycle: boundedInteger(value?.maxChangesPerCycle, 1, 1, 3),
+    rollbackOnFailure: value?.rollbackOnFailure !== false
+  };
+}
+
+function deriveAutonomousAction(group, config) {
+  const text = `${group.tool} ${group.reason}`.toLowerCase();
+  if (!/(model\.chat|agent\.run)/.test(group.tool)) return undefined;
+  if (!/(429|rate limit|timed out|timeout|502|503|504)/.test(text)) return undefined;
+  const current = boundedInteger(config.runtime?.modelRetries, 2, 0, 4);
+  if (current >= 4) return undefined;
+  return { type: "config.set", path: "runtime.modelRetries", previousValue: current, value: current + 1 };
+}
+
+async function applyImprovement(store, proposal, { stateDir, config, settings }) {
+  if (!stateDir || proposal.action?.type !== "config.set" || proposal.action.path !== "runtime.modelRetries") {
+    throw new Error("autonomous improvement action is not allowlisted");
+  }
+  const configPath = join(stateDir, "config.json");
+  const snapshotPath = join(stateDir, "improvements", `${proposal.id}.config.json`);
+  mkdirSync(dirname(snapshotPath), { recursive: true, mode: 0o700 });
+  const original = readFileSync(configPath, "utf8");
+  writeFileSync(snapshotPath, original, { mode: 0o600 });
+  const next = { ...config, runtime: { ...(config.runtime ?? {}), modelRetries: proposal.action.value } };
+  const temporary = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+    renameSync(temporary, configPath);
+    Object.assign(config, next);
+    const event = await store.append({
+      id: prefixedId("imp_evt"), type: "improvement.applied", improvementId: proposal.id,
+      decision: "applied", note: `Applied ${proposal.action.path}: ${proposal.action.previousValue} -> ${proposal.action.value}`,
+      source: "autonomous-controller", action: proposal.action, snapshotPath
+    });
+    return { improvementId: proposal.id, action: proposal.action, eventId: event.id, snapshotPath };
+  } catch (error) {
+    if (settings.rollbackOnFailure) writeFileSync(configPath, original, { mode: 0o600 });
+    await store.append({ id: prefixedId("imp_evt"), type: "improvement.failed", improvementId: proposal.id, decision: "failed", note: error.message, source: "autonomous-controller" });
+    throw error;
+  }
+}
+
+async function rollbackImprovement(store, input = {}, { stateDir, config }) {
+  const improvementId = cleanRequired(input.improvementId, "improve.rollback requires improvementId");
+  const current = reduceImprovements(await store.readAll()).find((item) => item.id === improvementId);
+  const applied = [...(current?.decisions ?? [])].reverse().find((item) => item.decision === "applied" && item.snapshotPath);
+  if (!applied) throw new Error(`applied improvement snapshot not found: ${improvementId}`);
+  const stateRoot = resolve(stateDir);
+  const snapshot = resolve(applied.snapshotPath);
+  if (relative(stateRoot, snapshot).startsWith("..")) throw new Error("improvement snapshot escapes state directory");
+  const restored = JSON.parse(readFileSync(snapshot, "utf8"));
+  const configPath = join(stateRoot, "config.json");
+  const temporary = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(restored, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temporary, configPath);
+  for (const key of Object.keys(config)) delete config[key];
+  Object.assign(config, restored);
+  const event = await store.append({ id: prefixedId("imp_evt"), type: "improvement.rolled-back", improvementId, decision: "rolled-back", note: "Restored captured configuration snapshot.", source: cleanString(input.source, "local") });
+  return { type: "improvement.rolled-back", improvementId, eventId: event.id };
+}
+
 function reduceImprovements(records) {
   const improvements = new Map();
   for (const record of records) {
@@ -2465,6 +2628,7 @@ function reduceImprovements(records) {
         priority: record.priority,
         status: record.status ?? "proposed",
         evidence: record.evidence ?? [],
+        action: record.action,
         createdAt: record.at,
         updatedAt: record.at,
         decisions: []
@@ -2474,7 +2638,7 @@ function reduceImprovements(records) {
       if (!current) continue;
       current.status = record.decision ?? current.status;
       current.updatedAt = record.at;
-      current.decisions.push({ at: record.at, decision: record.decision, note: record.note });
+      current.decisions.push({ at: record.at, decision: record.decision, note: record.note, snapshotPath: record.snapshotPath, action: record.action });
     }
   }
   return Array.from(improvements.values()).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
@@ -2493,6 +2657,11 @@ function cleanRequired(value, message) {
 function cleanString(value, fallback) {
   const text = typeof value === "string" ? value.trim() : "";
   return text || fallback;
+}
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const number = Number.parseInt(String(value ?? fallback), 10);
+  return Number.isFinite(number) ? Math.max(minimum, Math.min(maximum, number)) : fallback;
 }
 
 function normalizeTags(tags) {

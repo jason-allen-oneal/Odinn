@@ -132,7 +132,7 @@ export class ExtensionExecutor {
     const request = protocol === "mcp-jsonl"
       ? { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: input.name || extension.id, arguments: input.arguments ?? input } }
       : { type: "odinn.call", id: `call_${randomUUID()}`, input, capability: requested };
-    if (!runtime) return runExtensionProcess(process.execPath, [entrypoint], request, { cwd: dirname(entrypoint), timeoutMs, protocol });
+    if (!runtime) throw new Error("extension execution requires the audited runtime boundary");
     return invokeThroughRuntime({ id, input, requested, extension, entrypoint, request, protocol, timeoutMs, runtime: { ...runtime, capabilityToken } });
   }
 }

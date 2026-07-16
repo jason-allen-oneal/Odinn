@@ -3,7 +3,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, oauthTokenPath, ProofVerifier, validateContract, validatePolicy } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, validateContract, validatePolicy } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
@@ -39,6 +39,11 @@ export async function createGatewayServer({
   });
   const runTask = ({ task }) => isolatedTaskExecutor({ task });
   await supervisor.start();
+  const selfImprovement = normalizeSelfImprovementConfig(config.selfImprovement);
+  const improvementTimer = selfImprovement.enabled && selfImprovement.mode === "auto"
+    ? setInterval(() => runTask({ task: { tool: "improve.learn", input: { limit: 1000 }, actor: "autonomous-controller" } }).catch(() => undefined), selfImprovement.intervalMs)
+    : undefined;
+  improvementTimer?.unref?.();
 
   const server = createServer(async (request, response) => {
     try {
@@ -76,6 +81,7 @@ export async function createGatewayServer({
           providers: await summarizeProviders(config, state),
           experimental: featureFlags,
           security: policy.security,
+          selfImprovement,
           pendingApprovals: approvalStore.list()
         });
       }
@@ -434,6 +440,15 @@ export async function createGatewayServer({
           registry
         })).output);
       }
+      if (request.method === "POST" && url.pathname.startsWith("/improvements/") && url.pathname.endsWith("/rollback")) {
+        const id = decodeURIComponent(url.pathname.slice("/improvements/".length, -"/rollback".length));
+        return json(response, 200, (await runTask({
+          task: { tool: "improve.rollback", input: { improvementId: id, source: "gateway" }, actor: "gateway" },
+          auditStore,
+          policy,
+          registry
+        })).output);
+      }
       if (request.method === "POST" && url.pathname === "/run") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         return json(response, 200, await runTask({
@@ -457,6 +472,7 @@ export async function createGatewayServer({
 
   const close = server.close.bind(server);
   server.close = (callback) => {
+    if (improvementTimer) clearInterval(improvementTimer);
     Promise.allSettled([supervisor.shutdown(), isolatedTaskExecutor.shutdown?.()])
       .then(() => close(callback))
       .catch((error) => callback?.(error));
@@ -575,7 +591,7 @@ async function readConfig(state) {
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
     await mkdir(state, { recursive: true });
-    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: false, counterfactual: false } };
+    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig() };
     await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 }).catch((writeError) => {
       if (writeError?.code !== "EEXIST") throw writeError;
     });

@@ -34,7 +34,7 @@ These are implemented as local vertical slices and remain disabled by default:
 
 These slices do not claim to reverse arbitrary remote mutations, replay nondeterministic model calls, or provide multi-user isolation. Kernel tool execution and the CLI extension adapter apply Sentinel and capability checks when the experimental flags are enabled; adapters that are not routed through those boundaries remain outside that guarantee.
 
-The self-improvement loop is deliberately review-gated. `improve.learn` mines repeated audited failures into deduplicated proposals and records the evidence. It never applies a code, policy, provider, or skill change by itself.
+The self-improvement loop defaults to review-gated proposals and can be explicitly configured for bounded autonomous application. Auto mode applies only allowlisted reliability tuning, captures a rollback snapshot, and cannot widen permissions, disable approvals, change credentials, install extensions, or weaken Sentinel.
 
 ## Required release proof
 

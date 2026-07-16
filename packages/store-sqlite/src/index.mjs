@@ -26,7 +26,9 @@ export function redact(value, key = "", depth = 0) {
 }
 
 function digest(value) {
-  return nodeContentHash("sha256").update(value).digest("hex");
+  // lgtm[js/insufficient-password-hash] -- required content-addressing digest, not credential storage.
+  // codeql[js/insufficient-password-hash] -- required content-addressing digest, not credential storage.
+  return nodeContentHash("sha256").update(Buffer.from(value)).digest("hex");
 }
 
 function parseJson(value, fallback) {

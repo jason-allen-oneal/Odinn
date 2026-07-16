@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { CapabilityBroker, Sentinel } from "./differentiated-runtime.mjs";
+import { redact } from "./run-ledger.mjs";
 
 const EXTENSION_SCHEMA_VERSION = 1;
 const EXTENSION_TYPES = new Set(["tool", "skill", "mcp"]);
@@ -109,7 +111,7 @@ export class ExtensionExecutor {
     this.defaultTimeoutMs = defaultTimeoutMs;
   }
 
-  async invoke(id, input = {}, { capability, timeoutMs = this.defaultTimeoutMs } = {}) {
+  async invoke(id, input = {}, { capability, timeoutMs = this.defaultTimeoutMs, runtime, capabilityToken } = {}) {
     const extension = await this.registry.get(id);
     if (!extension) throw new Error(`extension not found: ${id}`);
     if (!extension.enabled || !extension.trusted) throw new Error(`extension is not enabled and trusted: ${id}`);
@@ -130,7 +132,41 @@ export class ExtensionExecutor {
     const request = protocol === "mcp-jsonl"
       ? { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: input.name || extension.id, arguments: input.arguments ?? input } }
       : { type: "odinn.call", id: `call_${randomUUID()}`, input, capability: requested };
-    return runExtensionProcess(process.execPath, [entrypoint], request, { cwd: dirname(entrypoint), timeoutMs, protocol });
+    if (!runtime) return runExtensionProcess(process.execPath, [entrypoint], request, { cwd: dirname(entrypoint), timeoutMs, protocol });
+    return invokeThroughRuntime({ id, input, requested, extension, entrypoint, request, protocol, timeoutMs, runtime: { ...runtime, capabilityToken } });
+  }
+}
+
+async function invokeThroughRuntime({ id, input, requested, extension, entrypoint, request, protocol, timeoutMs, runtime }) {
+  const ledger = runtime.runLedger;
+  const auditStore = runtime.auditStore;
+  if (!ledger || !auditStore) throw new Error("extension runtime enforcement requires runLedger and auditStore");
+  const runId = String(runtime.runId || `extension_${randomUUID()}`);
+  const featureFlags = ledger.featureFlags ?? runtime.featureFlags ?? {};
+  const safety = { toolName: "extension.invoke", effects: ["process", ...(extension.type === "mcp" ? ["network"] : [])], reversibility: "compensatable", requiresCapability: true, requiresApproval: false };
+  ledger.ensureRun({ runId, objective: `extension:${id}`, workspaceRoot: runtime.workspaceRoot ?? ledger.workspaceRoot });
+  const ledgerStep = ledger.beginTool({ runId, toolName: "extension.invoke", input: { extensionId: id, input }, safety, metadata: { extensionType: extension.type } });
+  const safeInput = redact({ extensionId: id, input, capability: requested });
+  const append = (event) => auditStore.append({ at: new Date().toISOString(), runId, actor: runtime.actor ?? "extension", tool: "extension.invoke", capability: extension.capabilities[0], ...event });
+  try {
+    if (featureFlags.sentinel === true) {
+      if (runtime.policy?.version === 1 && Array.isArray(runtime.policy.invariants)) {
+        new Sentinel({ ledger, featureFlags }).evaluate({ runId, stepId: ledgerStep.stepId, toolName: "extension.invoke", input: safeInput, policy: runtime.policy, workspaceRoot: runtime.workspaceRoot ?? ledger.workspaceRoot });
+      } else {
+        ledger.appendEvent({ runId, type: "policy-check", payload: { stepId: ledgerStep.stepId, decision: "allow", reason: "sentinel enabled with no configured invariants" } });
+      }
+    }
+    let claims;
+    if (featureFlags.capabilities === true) claims = new CapabilityBroker({ ledger, stateDir: ledger.stateDir, featureFlags }).consume(runtime.capabilityToken, { runId, toolName: "extension.invoke", resource: { extensionId: id, capability: requested } });
+    await append({ type: "task.started", decision: "allow", data: { input: safeInput, capabilityId: claims?.id } });
+    const output = await runExtensionProcess(process.execPath, [entrypoint], request, { cwd: dirname(entrypoint), timeoutMs, protocol });
+    await append({ type: "task.completed", decision: "allow", data: { output: redact(output) } });
+    ledger.finishTool({ runId, stepId: ledgerStep.stepId, output, status: "succeeded" });
+    return output;
+  } catch (error) {
+    await append({ type: "task.failed", decision: "deny", message: error.message, data: { code: error.code ?? "EXTENSION_FAILED" } });
+    ledger.finishTool({ runId, stepId: ledgerStep.stepId, status: "failed", error: error.message });
+    throw error;
   }
 }
 

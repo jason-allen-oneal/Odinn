@@ -70,6 +70,9 @@ test("capsules verify their checksums and detect tampering", async () => {
     const output = join(root, "run.odinn");
     await runtime.capsules.export("run-capsule", { output });
     assert.equal((await runtime.capsules.verify(output)).valid, true);
+    const replay = await runtime.capsules.replay(output, { mode: "tool-mocked" });
+    assert.equal(replay.executed, true);
+    assert.equal(runtime.ledger.getRun(replay.replayRunId).status, "completed-unverified");
     const bytes = await readFile(output); bytes[bytes.length - 1] ^= 1; await writeFile(output, bytes);
     await assert.rejects(runtime.capsules.verify(output), (error) => error.code === "CAPSULE_TAMPERED");
   } finally { runtime.ledger.close(); }

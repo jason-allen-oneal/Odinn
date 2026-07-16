@@ -131,7 +131,7 @@ function usage() {
   odinn extension enable --id <id> --grant <capability[,capability]> [--trust] [--allow-unsafe-sandbox] [--state .odinn]
   odinn extension disable --id <id> [--reason <text>] [--state .odinn]
   odinn extension rollback --id <id> [--state .odinn]
-  odinn extension run --id <id> --input-json <json> [--capability <capability>] [--state .odinn]
+  odinn extension run --id <id> --input-json <json> [--capability <capability>] [--capability-token <token>] [--state .odinn]
   odinn config model default <provider:model> [--state .odinn]
   odinn config model list [--state .odinn]
   odinn status [--state .odinn]
@@ -1261,8 +1261,20 @@ async function extensionCommand(args) {
       const id = option(rest, "--id");
       if (!id) throw new Error("extension run requires --id <id>");
       const input = JSON.parse(option(rest, "--input-json", "{}"));
+      const state = stateDir(rest);
+      const config = await readConfig(state);
+      const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
+      const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
       const executor = new ExtensionExecutor(registry, { workspaceRoot: invocationRoot() });
-      await printJson(await executor.invoke(id, input, { capability: option(rest, "--capability", "") }));
+      try {
+        await printJson(await executor.invoke(id, input, {
+          capability: option(rest, "--capability", ""),
+          capabilityToken: option(rest, "--capability-token", ""),
+          runtime: { runLedger: runtime.ledger, auditStore, policy: createDefaultPolicy(config.policy), workspaceRoot: invocationRoot(), actor: "cli" }
+        }));
+      } finally {
+        runtime.ledger.close();
+      }
       break;
     }
     default:

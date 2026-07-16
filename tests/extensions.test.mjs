@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ExtensionExecutor, ExtensionRegistry } from "../packages/kernel/src/extensions.mjs";
+import { createAuditStore, createDifferentiatedRuntime } from "../packages/kernel/src/index.mjs";
+import { createDefaultPolicy } from "../packages/policy/src/index.mjs";
 
 test("extension manifests are disabled, grant-scoped, provenance-aware, and rollbackable", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-extensions-"));
@@ -49,4 +51,26 @@ test("trusted MCP manifests use the explicit JSONL tools/call adapter", async ()
   await registry.enable("mcp-tool", { grants: ["mcp.call"], trust: true });
   const executor = new ExtensionExecutor(registry, { workspaceRoot: root, defaultTimeoutMs: 2_000 });
   assert.deepEqual(await executor.invoke("mcp-tool", { name: "fixture", arguments: {} }, { capability: "mcp.call" }), { content: [{ type: "text", text: "ODINN_MCP_OK" }] });
+});
+
+test("extension execution crosses the audited Sentinel and capability boundary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-extension-guarded-"));
+  const entrypoint = join(root, "tool.mjs");
+  const extensionSource = 'process.stdin.setEncoding("utf8"); let raw=""; process.stdin.on("data", c => raw += c).on("end", () => { const request = JSON.parse(raw); process.stdout.write(JSON.stringify({ result: { echoed: request.input.text } }) + "\\n"); });\n';
+  await writeFile(entrypoint, extensionSource);
+  const registry = new ExtensionRegistry(join(root, "extensions.json"));
+  await registry.install({ id: "guarded-tool", version: "1.0.0", type: "tool", entrypoint: "tool.mjs", capabilities: ["text.echo"], sandbox: "process" });
+  await registry.enable("guarded-tool", { grants: ["text.echo"], trust: true });
+  const stateDir = join(root, ".odinn");
+  const runtime = createDifferentiatedRuntime({ stateDir, workspaceRoot: root, featureFlags: { sentinel: true, capabilities: true } });
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  const executor = new ExtensionExecutor(registry, { workspaceRoot: root, defaultTimeoutMs: 2_000 });
+  const runId = "extension-guarded-run";
+  await assert.rejects(() => executor.invoke("guarded-tool", { text: "blocked" }, { capability: "text.echo", runtime: { runId, runLedger: runtime.ledger, auditStore, policy: createDefaultPolicy(), workspaceRoot: root } }), /capability/);
+  const issued = runtime.capabilities.issue({ runId, stepId: "extension-step", toolName: "extension.invoke", scopes: ["extension.invoke"], resourceConstraints: { extensionId: "guarded-tool", capability: "text.echo" } });
+  const output = await executor.invoke("guarded-tool", { text: "ODINN_EXTENSION_GUARDED_OK" }, { capability: "text.echo", capabilityToken: issued.token, runtime: { runId, runLedger: runtime.ledger, auditStore, policy: createDefaultPolicy(), workspaceRoot: root } });
+  assert.deepEqual(output, { echoed: "ODINN_EXTENSION_GUARDED_OK" });
+  assert.equal(runtime.ledger.getRun(runId).events.some((event) => event.type === "tool-request"), true);
+  assert.equal((await auditStore.readRun(runId)).events.some((event) => event.type === "task.completed"), true);
+  runtime.ledger.close();
 });

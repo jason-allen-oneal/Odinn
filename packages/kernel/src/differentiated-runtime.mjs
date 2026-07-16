@@ -339,7 +339,28 @@ export class CapsuleManager {
     const staging = join(this.root, `.verify-${randomUUID()}`); mkdirSync(staging, { recursive: true }); const extracted = await runProcess("unzip", ["-q", archive, "-d", staging], { timeoutMs: 60_000 }); if (extracted.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule extraction failed");
     const manifest = parse(readFileSync(join(staging, "manifest.json"), "utf8"), null); if (!manifest || manifest.formatVersion !== 1) throw new OdinnRuntimeError("CAPSULE_INVALID", "unsupported capsule version"); const checksums = readFileSync(join(staging, "checksums.sha256"), "utf8").split(/\r?\n/).filter(Boolean); const failures = []; for (const line of checksums) { const match = line.match(/^([a-f0-9]{64})  (.+)$/); if (!match || !names.includes(match[2]) || !existsSync(join(staging, match[2])) || hash(readFileSync(join(staging, match[2]))) !== match[1]) failures.push(match?.[2] ?? line); } await rm(staging, { recursive: true, force: true }); if (failures.length) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule checksum verification failed", { failures }); return { valid: true, manifest, entries: names };
   }
-  async replay(path, { mode = "verification-only", workspace } = {}) { const verified = await this.verify(path); if (!['verification-only', 'tool-mocked', 'full'].includes(mode)) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", `unsupported replay mode: ${mode}`); if (mode === "full" && !workspace) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", "full replay requires a disposable workspace"); return { ...verified, mode, executed: false, message: mode === "verification-only" ? "capsule integrity verified; acceptance replay requires a supplied contract" : "recorded replay boundaries loaded; external tools were not executed" }; }
+  async replay(path, { mode = "verification-only", workspace } = {}) {
+    const verified = await this.verify(path);
+    if (!["verification-only", "tool-mocked", "full"].includes(mode)) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", `unsupported replay mode: ${mode}`);
+    if (mode === "full") {
+      if (!workspace) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", "full replay requires a disposable workspace");
+      return { ...verified, mode, executed: false, message: "full replay is fail-closed until every adapter declares a replay-safe contract" };
+    }
+    if (mode === "verification-only") return { ...verified, mode, executed: false, contractIncluded: verified.entries.includes("contract.json"), message: "capsule integrity verified; run the included contract against a supplied workspace" };
+
+    const runJson = await runProcess("unzip", ["-p", resolve(path), "run.json"], { timeoutMs: 30_000 });
+    const eventsJson = await runProcess("unzip", ["-p", resolve(path), "events.jsonl"], { timeoutMs: 30_000 });
+    if (runJson.code !== 0 || eventsJson.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule is missing replay metadata");
+    const sourceRun = parse(runJson.stdout, null);
+    const recordedEvents = eventsJson.stdout.split(/\r?\n/).filter(Boolean).map((line) => parse(line, null)).filter(Boolean);
+    const replayRunId = `replay_${randomUUID()}`;
+    this.ledger.ensureRun({ runId: replayRunId, objective: `tool-mocked replay of ${sourceRun?.id ?? verified.manifest.runId}`, modelId: verified.manifest.model?.modelId ?? "", providerId: verified.manifest.model?.provider ?? "", workspaceRoot: workspace ? resolve(workspace) : this.ledger.workspaceRoot });
+    this.ledger.appendEvent({ runId: replayRunId, type: "capsule-replay-started", payload: { sourceRunId: sourceRun?.id ?? verified.manifest.runId, mode, eventCount: recordedEvents.length } });
+    for (const event of recordedEvents) this.ledger.appendEvent({ runId: replayRunId, type: "capsule-replay-boundary", payload: { sourceEventId: event.id, sourceType: event.type, payload: redact(event.payload ?? event.data ?? {}) } });
+    this.ledger.appendEvent({ runId: replayRunId, type: "capsule-replay-completed", payload: { sourceRunId: sourceRun?.id ?? verified.manifest.runId, boundaryCount: recordedEvents.length } });
+    this.ledger.database.db.prepare("UPDATE runs SET status = 'completed-unverified', completed_at = ? WHERE id = ?").run(now(), replayRunId);
+    return { ...verified, mode, executed: true, replayRunId, boundaryCount: recordedEvents.length, message: "recorded model and tool boundaries replayed without executing external tools" };
+  }
 }
 
 export class CounterfactualManager {

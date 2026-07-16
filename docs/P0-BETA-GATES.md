@@ -7,7 +7,7 @@ This is the release ledger for the first local, single-user Ódinn beta. A check
 - [x] Durable queued jobs with persisted state, cancellation, timeouts, retry limits, restart recovery, idempotent submission, and graceful supervisor shutdown.
 - [x] Process-isolated workers for every gateway-submitted task. The supervisor and direct gateway control paths use a forked task worker; the local CLI remains an explicitly local operator path.
 - [x] Extension manifests with type, version, digest, provenance, sandbox declaration, capability grants, enable/disable, and rollback. Installed extensions remain disabled and untrusted by default.
-- [x] Extension/MCP execution adapters. Explicitly trusted, grant-scoped `process` manifests can run through the bounded Odinn JSONL adapter; MCP manifests use an explicit JSON-RPC `tools/call` JSONL adapter. Disabled, untrusted, ungranted, container, and unsandboxed manifests remain blocked.
+- [x] Extension/MCP execution adapters. Explicitly trusted, grant-scoped `process` manifests can run through the bounded Odinn JSONL adapter; MCP manifests use an explicit JSON-RPC `tools/call` JSONL adapter. CLI extension execution can route through the audited Sentinel/capability boundary. Disabled, untrusted, ungranted, container, and unsandboxed manifests remain blocked.
 - [x] Provider retries for transient failures, rate-limit backoff, generic chat SSE normalization, OAuth refresh path, and provider transport tests.
 - [x] Provider catalog conformance contract across every preset, generic chat/Responses/SSE/tool-call fixtures, retry behavior, and canonical token accounting. Live provider-account and provider-specific service behavior remains an external release test, not a fake local green check.
 - [x] Loopback-only gateway default, strict localhost/127.0.0.1/[::1] Host validation, per-state bearer token, browser bootstrap cookie, same-origin mutation checks, request limits, content-bound idempotency keys, graceful shutdown, and reconnectable audit SSE.
@@ -28,11 +28,11 @@ These are implemented as local vertical slices and remain disabled by default:
 - [x] Sentinel policy validation and pre-operation invariant decisions for denied commands, allowed roots, and approval-required tools.
 - [x] Capability tokens with local signing keys, expiry, run/step/tool binding, resource constraints, revocation, and one-use enforcement.
 - [x] Rewind snapshots with content-addressed file artifacts, dry-run previews, symlink rejection, and actual local restoration.
-- [x] Capsules with redaction, ZIP path validation, checksums, verification-only replay metadata, and tamper detection.
+- [x] Capsules with redaction, ZIP path validation, checksums, verification-only contract metadata, tool-mocked durable boundary replay, and tamper detection. Full external-action replay remains fail-closed.
 - [x] Counterfactual workspace copies with independent runs, bounded task execution through the audited tool boundary, optional shared Proof runs, candidate comparison, and dry-run/apply branch selection with source backup. Irreversible external actions remain approval-gated and full remote rollback is not claimed.
 - [x] Darwin observations and transparent routing scores with uncertainty penalties and human-readable selection reasons.
 
-These slices do not claim to reverse arbitrary remote mutations, replay nondeterministic model calls, or provide multi-user isolation. Kernel tool execution now applies Sentinel and capability checks when the experimental flags are enabled; unintegrated third-party adapters remain outside that guarantee.
+These slices do not claim to reverse arbitrary remote mutations, replay nondeterministic model calls, or provide multi-user isolation. Kernel tool execution and the CLI extension adapter apply Sentinel and capability checks when the experimental flags are enabled; adapters that are not routed through those boundaries remain outside that guarantee.
 
 The self-improvement loop is deliberately review-gated. `improve.learn` mines repeated audited failures into deduplicated proposals and records the evidence. It never applies a code, policy, provider, or skill change by itself.
 

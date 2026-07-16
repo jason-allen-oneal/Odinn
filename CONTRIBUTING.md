@@ -40,10 +40,18 @@ pnpm test
 pnpm test:integration
 pnpm smoke:inference
 pnpm benchmark:ci
+node scripts/ci/audit.ts high
 pnpm build
+pnpm release:package
+pnpm release:checksums
+node scripts/release/verify.ts
+pnpm release:install-smoke
+pnpm storage:drill
 ```
 
 The inference command launches the packaged gateway against a local OpenAI-compatible protocol provider and verifies persistence through the public API. Do not describe it as production-model or live cloud-provider validation.
+
+When changing `.github/workflows/`, also run the pinned actionlint container described by `.github/workflows/workflow-lint.yml`. The dependency audit must return a real advisory result; scanner unavailability is a failure, not a waiver.
 
 ## Design constraints
 

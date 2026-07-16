@@ -42,11 +42,11 @@ jobs:
           head_sha="$(jq -er '.head.sha' <<<"$details")"
           title="$(jq -er '.title' <<<"$details")"
 
-          gh workflow run ci.yml --ref "$branch"
-          gh workflow run package-integrity.yml --ref "$branch"
-          gh workflow run workflow-lint.yml --ref "$branch"
-          gh workflow run security.yml --ref "$branch" -f base_sha="$base_sha" -f head_sha="$head_sha"
-          gh workflow run pr-title.yml --ref "$branch" -f pr_title="$title"
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+          gh workflow run package-integrity.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+          gh workflow run workflow-lint.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+          gh workflow run security.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" -f base_sha="$base_sha" -f head_sha="$head_sha"
+          gh workflow run pr-title.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" -f pr_title="$title"
 
   publish_release:
     needs: release_please

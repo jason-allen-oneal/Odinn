@@ -2,6 +2,11 @@
 
 ![Ódinn Forge — local-first agent runtime](docs/odinn-header.png)
 
+[![CI](https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/ci.yml)
+[![Security](https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/security.yml)
+[![Package Integrity](https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/package-integrity.yml)
+[![Workflow Lint](https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml/badge.svg?branch=main)](https://github.com/jason-allen-oneal/Odinn/actions/workflows/workflow-lint.yml)
+
 > A local-first personal AI agent runtime with durable memory, model freedom, real-world tools, and security controls that make dangerous choices explicit.
 
 Ódinn Forge is a cross-platform agent runtime for people who want an assistant that can do more than generate text without turning the machine into an unattended blast radius. It provides the kernel, policy layer, model/provider adapters, browser and web capabilities, sessions, audit trails, and a chat-first local console in one small Node.js workspace.

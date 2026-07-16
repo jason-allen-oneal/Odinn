@@ -547,7 +547,7 @@ test("kernel records sessions, goals, and self-improvement proposals", async () 
     task: {
       id: "run_session_message",
       tool: "session.message",
-      input: { sessionId: session.output.id, role: "user", content: "Build out Odinn." },
+      input: { sessionId: session.output.id, role: "user", content: "Build out Odinn Forge." },
       actor: "test"
     },
     auditStore,
@@ -560,7 +560,7 @@ test("kernel records sessions, goals, and self-improvement proposals", async () 
     registry
   });
   assert.equal(sessionDetail.output.session.messageCount, 1);
-  assert.equal(sessionDetail.output.messages[0].content, "Build out Odinn.");
+  assert.equal(sessionDetail.output.messages[0].content, "Build out Odinn Forge.");
 
   const renamed = await runTask({
     task: { id: "run_session_rename", tool: "session.rename", input: { sessionId: session.output.id, title: "Renamed beta chat" }, actor: "test" },

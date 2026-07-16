@@ -1,4 +1,4 @@
-# Odinn Experimental Runtime Threat Model
+# Odinn Forge Experimental Runtime Threat Model
 
 ## Trust boundaries
 

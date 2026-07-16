@@ -1,4 +1,4 @@
-# Odinn Proof
+# Odinn Forge Proof
 
 Proof is an experimental, evidence-backed verification layer. A model response cannot mark a run verified; only passing assertions can do that.
 

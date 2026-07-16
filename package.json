@@ -2,7 +2,7 @@
   "name": "odinn",
   "version": "0.1.0",
   "private": true,
-  "description": "Cross-platform personal AI agent runtime",
+  "description": "Ódinn Forge cross-platform personal AI agent runtime",
   "type": "module",
   "bin": {
     "odinn": "./apps/cli/src/cli.mjs"

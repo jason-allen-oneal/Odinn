@@ -627,12 +627,12 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     }],
     ["browser.tabs", {
       capability: "browser.read",
-      description: "List tabs in Ódinn's persistent browser profile.",
+      description: "List tabs in Ódinn Forge's persistent browser profile.",
       execute: async () => browserTabs(stateDir)
     }],
     ["browser.open", {
       capability: "browser.read",
-      description: "Open a URL in Ódinn's persistent browser profile.",
+      description: "Open a URL in Ódinn Forge's persistent browser profile.",
       execute: async (input, context) => browserOpen(stateDir, input, context.policy?.security?.browser)
     }],
     ["browser.snapshot", {
@@ -878,7 +878,7 @@ async function searchWeb(input = {}) {
   const limit = Math.min(normalizeLimit(input.limit, 5), 10);
   const endpoint = process.env.ODINN_SEARCH_ENDPOINT || "https://html.duckduckgo.com/html/";
   const response = await fetch(`${endpoint}?q=${encodeURIComponent(query)}`, {
-    headers: { "user-agent": "Odinn/0.1 beta web-search" },
+    headers: { "user-agent": "Odinn-Forge/0.1 beta web-search" },
     signal: AbortSignal.timeout(WEB_TIMEOUT_MS)
   });
   if (!response.ok) throw new Error(`web search returned ${response.status}`);
@@ -961,7 +961,7 @@ async function requestValidatedUrl(value, security = {}) {
   const address = addresses[0];
   return new Promise((resolveResponse, rejectResponse) => {
     const request = transport(parsed, {
-      headers: { "user-agent": "Odinn/0.1 beta web-fetch" },
+      headers: { "user-agent": "Odinn-Forge/0.1 beta web-fetch" },
       timeout: WEB_TIMEOUT_MS,
       lookup: (_hostname, _options, callback) => callback(null, address, isIP(address))
     }, (response) => {
@@ -1314,9 +1314,9 @@ const AGENT_TOOL_SCHEMAS = [
   { type: "function", function: { name: "browser.tabs", description: "List browser tabs.", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "browser.open", description: "Open a page in the persistent browser profile.", parameters: { type: "object", properties: { url: { type: "string" }, tabId: { type: "string" } }, required: ["url"] } } },
   { type: "function", function: { name: "browser.snapshot", description: "Read the current visible browser page.", parameters: { type: "object", properties: { tabId: { type: "string" } } } } },
-  { type: "function", function: { name: "browser.click", description: "Click a control; Ódinn will ask for approval before changing external state.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } } } },
-  { type: "function", function: { name: "browser.type", description: "Fill a field; Ódinn will ask for approval before submitting anything.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] } } },
-  { type: "function", function: { name: "browser.press", description: "Press a key; Ódinn will ask for approval first.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] } } }
+  { type: "function", function: { name: "browser.click", description: "Click a control; Ódinn Forge will ask for approval before changing external state.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, role: { type: "string" }, name: { type: "string" }, text: { type: "string" } } } } },
+  { type: "function", function: { name: "browser.type", description: "Fill a field; Ódinn Forge will ask for approval before submitting anything.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, selector: { type: "string" }, name: { type: "string" }, value: { type: "string" }, sensitive: { type: "boolean" } }, required: ["value"] } } },
+  { type: "function", function: { name: "browser.press", description: "Press a key; Ódinn Forge will ask for approval first.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] } } }
   ,{ type: "function", function: { name: "browser.recovery.status", description: "Inspect an uncertain browser mutation after a crash or failed action.", parameters: { type: "object", properties: {} } } }
 ];
 
@@ -1333,7 +1333,7 @@ async function runAgent(modelConfig, input = {}, { stateDir, memoryStore, runToo
   const recalled = memoryStore && memoryOptions.autoRecall && latestUserMessage?.content
     ? await recallMemory(memoryStore, { query: latestUserMessage.content, limit: memoryOptions.maxRecall })
     : { memories: [] };
-  const systemMessage = "You are Ódinn. Use web tools for current public information. Use browser tools for private accounts only after the user has logged in. Never claim an external action completed until its tool result says so. Actions that change external state require approval. Use memory.recall when durable context is relevant. Only use memory.remember for explicit user-approved facts, preferences, or decisions.";
+  const systemMessage = "You are Ódinn Forge. Use web tools for current public information. Use browser tools for private accounts only after the user has logged in. Never claim an external action completed until its tool result says so. Actions that change external state require approval. Use memory.recall when durable context is relevant. Only use memory.remember for explicit user-approved facts, preferences, or decisions.";
   const existingSystem = messages.find((message) => message.role === "system");
   if (existingSystem) existingSystem.content = `${systemMessage}\n${existingSystem.content || ""}`.trim();
   else messages.unshift({ role: "system", content: systemMessage });
@@ -2041,7 +2041,7 @@ async function compactMemory(store, input = {}) {
 function summarizeConversation(messages) {
   const relevant = messages
     .filter((message) => ["user", "assistant"].includes(message?.role) && typeof message.content === "string")
-    .map((message) => `${message.role === "user" ? "User" : "Ódinn"}: ${message.content.replace(/\s+/g, " ").trim()}`)
+    .map((message) => `${message.role === "user" ? "User" : "Ódinn Forge"}: ${message.content.replace(/\s+/g, " ").trim()}`)
     .filter(Boolean);
   if (!relevant.length) return "";
   const tail = relevant.slice(-8).join("\n");

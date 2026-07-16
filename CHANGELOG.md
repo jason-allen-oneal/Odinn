@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Odinn will be documented in this file.
+All notable changes to Odinn Forge will be documented in this file.
 
 The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
@@ -8,4 +8,4 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ### Added
 
-- Initial Odinn repository and cross-platform CI/CD foundation.
+- Initial Odinn Forge repository and cross-platform CI/CD foundation.

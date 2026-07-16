@@ -4,7 +4,7 @@ import test from "node:test";
 
 const supported = new Set(["linux", "darwin", "win32"]);
 
-test("CI host is an Odinn-supported operating system", () => {
+test("CI host is an Odinn Forge-supported operating system", () => {
   assert.ok(supported.has(process.platform), `unsupported CI platform: ${process.platform}`);
 });
 

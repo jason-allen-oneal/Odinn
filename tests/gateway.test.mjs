@@ -64,8 +64,8 @@ test("gateway serves the local console shell", async () => {
     assert.equal(response.status, 200);
     assert.match(response.headers.get("content-type"), /text\/html/);
     const html = await response.text();
-    assert.match(html, /Odinn Console/);
-    assert.match(html, /Ódinn/);
+    assert.match(html, /Odinn Forge Console/);
+    assert.match(html, /Ódinn Forge/);
     assert.match(html, /odinn-logo\.png/);
     assert.match(html, /Run Tool/);
     assert.match(html, /Recent Runs/);

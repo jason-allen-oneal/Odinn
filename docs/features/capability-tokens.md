@@ -1,4 +1,4 @@
-# Odinn Capability Tokens
+# Odinn Forge Capability Tokens
 
 Capability tokens bind one short-lived operation to a run, step, tool, resource constraints, and a use count. The signing key is local-only with restrictive permissions. Raw credentials are never placed in token claims, ledger payloads, or normal CLI output.
 

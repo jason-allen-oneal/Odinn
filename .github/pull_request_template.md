@@ -1,6 +1,6 @@
 ## Summary
 
-Describe the behavior changed and why it belongs in Odinn.
+Describe the behavior changed and why it belongs in Odinn Forge.
 
 ## Verification
 

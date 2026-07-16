@@ -1,4 +1,4 @@
-# Ódinn runtime event ledger
+# Ódinn Forge runtime event ledger
 
 The event ledger is the durable runtime spine used by the experimental Proof, Rewind, Sentinel, Capsule, Darwin, Capability, and Counterfactual features. Each remote-host tenant receives an independent state root and ledger.
 

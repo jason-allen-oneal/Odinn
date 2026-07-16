@@ -673,8 +673,8 @@ function renderConsoleHtml() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ódinn Console</title>
-  <meta name="application-name" content="Odinn Console">
+  <title>Ódinn Forge Console</title>
+  <meta name="application-name" content="Odinn Forge Console">
   <link rel="icon" type="image/png" href="/odinn-logo.png">
   <style>
     :root {
@@ -1937,9 +1937,9 @@ function renderConsoleHtml() {
   <div class="shell" id="shell">
     <aside class="sidebar">
       <div class="brand">
-        <div class="mark"><img src="/odinn-logo.png" alt="Ódinn logo"></div>
+        <div class="mark"><img src="/odinn-logo.png" alt="Ódinn Forge logo"></div>
         <div class="brand-title">
-          <strong>Ódinn</strong>
+          <strong>Ódinn Forge</strong>
           <span>local gateway</span>
         </div>
         <div class="brand-tools">
@@ -1987,7 +1987,7 @@ function renderConsoleHtml() {
       <button class="sidebar-toggle" id="sidebar-toggle" type="button" title="Collapse navigation" aria-label="Collapse navigation"><svg class="icon-svg"><use href="#icon-menu"></use></svg></button>
       <div class="topbar-title">
         <div class="breadcrumb-line">
-          <strong>Ódinn</strong>
+          <strong>Ódinn Forge</strong>
           <span class="breadcrumb-sep">/</span>
           <strong id="view-title">Chat</strong>
           <span class="breadcrumb-sep" id="chat-context-sep">/</span>
@@ -2009,7 +2009,7 @@ function renderConsoleHtml() {
           <div class="chat-column">
             <div id="chat-thread" class="chat-thread"></div>
             <div class="composer">
-              <textarea id="chat-input" placeholder="Message Ódinn..."></textarea>
+              <textarea id="chat-input" placeholder="Message Ódinn Forge..."></textarea>
               <div class="composer-footer">
                 <div class="row composer-tools">
                   <button class="secondary" data-view-jump="run" title="Open tools" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span></button>
@@ -2048,7 +2048,7 @@ function renderConsoleHtml() {
           </div>
           <div class="panel stack">
             <div class="panel-head"><div><h2>External action approvals</h2><span class="muted">Clicks, typing, and key presses stop here until you approve them.</span></div><span class="chip warn">human in the loop</span></div>
-            <div id="approval-list" class="list"><div class="empty-state"><strong>No pending actions</strong><span>Ódinn will show approval requests here before changing an external account.</span></div></div>
+            <div id="approval-list" class="list"><div class="empty-state"><strong>No pending actions</strong><span>Ódinn Forge will show approval requests here before changing an external account.</span></div></div>
           </div>
         </div>
       </section>
@@ -2063,7 +2063,7 @@ function renderConsoleHtml() {
             <div class="panel stack">
               <div class="panel-head"><h2>Tool runner</h2><button id="run" type="button">Execute</button></div>
               <div class="field"><label for="tool">Capability</label><select id="tool"></select></div>
-              <div class="field"><label for="input">Input JSON</label><textarea id="input">{"text":"Hello, Ódinn"}</textarea></div>
+              <div class="field"><label for="input">Input JSON</label><textarea id="input">{"text":"Hello, Ódinn Forge"}</textarea></div>
               <div class="chip-row"><span class="chip">actor: gateway</span><span class="chip">audit: on</span><span class="chip">approval: policy</span></div>
             </div>
             <div class="panel stack"><div class="panel-head"><h2>Tool catalog</h2><span class="muted" id="tool-count">Loading</span></div><div id="tool-list" class="record-grid"></div></div>
@@ -2085,7 +2085,7 @@ function renderConsoleHtml() {
 
       <section id="view-memory" class="view">
         <div class="page">
-          <div class="page-head"><div><div class="section-kicker">Persistent context</div><h1>Memory</h1><p>Search, curate, and correct the facts Ódinn carries between sessions.</p></div><span class="chip ok">provenance tracked</span></div>
+          <div class="page-head"><div><div class="section-kicker">Persistent context</div><h1>Memory</h1><p>Search, curate, and correct the facts Ódinn Forge carries between sessions.</p></div><span class="chip ok">provenance tracked</span></div>
           <div class="split">
             <div class="panel stack"><div class="panel-head"><h2>Capture a memory</h2><button id="remember" type="button">Remember</button></div>
             <div class="grid-2">
@@ -2540,7 +2540,7 @@ function renderConsoleHtml() {
         const configured = state.status?.models?.length;
         $("chat-thread").innerHTML = '<div class="chat-empty">' +
           '<div class="chat-avatar"><img src="/odinn-logo.png" alt=""></div>' +
-          '<h1>Ódinn</h1>' +
+          '<h1>Ódinn Forge</h1>' +
           '<span class="pill ' + (configured ? "" : "warn") + '">' + (configured ? "Ready to chat" : "Provider required") + '</span>' +
           '<p>' + (configured
             ? 'Ask anything · current web context and browser access are available from Capabilities'
@@ -2548,7 +2548,7 @@ function renderConsoleHtml() {
           (configured
             ? '<div class="chat-prompts">' +
               '<button class="chat-prompt" data-chat-prompt="What can you do?">What can you do?</button>' +
-              '<button class="chat-prompt" data-chat-prompt="Search the web for the latest Ódinn beta release notes.">Search the web</button>' +
+              '<button class="chat-prompt" data-chat-prompt="Search the web for the latest Ódinn Forge beta release notes.">Search the web</button>' +
               '<button class="chat-prompt" data-chat-prompt="Open the browser workspace and show me the current page.">Open browser workspace</button>' +
               '<button class="chat-prompt" data-chat-prompt="Check the current runtime health.">Check runtime health</button>' +
             '</div>'
@@ -2561,7 +2561,7 @@ function renderConsoleHtml() {
           ? '<span class="chip ok">' + escapeHtml(message.provider + ":" + message.model) + '</span>'
           : "";
         return '<div class="message ' + escapeHtml(message.role) + '">' +
-          '<div class="message-role">' + (message.role === "assistant" ? '<span class="message-assistant-head"><span class="message-avatar"><img src="/odinn-logo.png" alt=""></span><span>Ódinn</span></span>' : escapeHtml(message.role)) + route + '</div>' +
+          '<div class="message-role">' + (message.role === "assistant" ? '<span class="message-assistant-head"><span class="message-avatar"><img src="/odinn-logo.png" alt=""></span><span>Ódinn Forge</span></span>' : escapeHtml(message.role)) + route + '</div>' +
           '<div class="markdown-body">' + renderMarkdown(message.content) + '</div>' +
         '</div>';
       }).join("");
@@ -2695,7 +2695,7 @@ function renderConsoleHtml() {
     async function refreshApprovals() {
       const approvals = await api("/approvals");
       $("cap-approval-count").textContent = approvals.length;
-      $("approval-list").innerHTML = approvals.map(renderApproval).join("") || '<div class="empty-state"><strong>No pending actions</strong><span>Ódinn will stop before changing an external account.</span></div>';
+      $("approval-list").innerHTML = approvals.map(renderApproval).join("") || '<div class="empty-state"><strong>No pending actions</strong><span>Ódinn Forge will stop before changing an external account.</span></div>';
     }
 
     async function refreshBrowser() {

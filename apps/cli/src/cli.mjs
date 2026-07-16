@@ -817,7 +817,7 @@ async function connectOAuth(state, name, args) {
         const code = url.searchParams.get("code");
         if (!code) throw new Error("OAuth callback did not contain an authorization code");
         response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        response.end("<h1>Odinn connected</h1><p>You can close this tab.</p>");
+        response.end("<h1>Odinn Forge connected</h1><p>You can close this tab.</p>");
         resolveCallback({ code });
       } catch (error) {
         rejectCallback(error);
@@ -882,7 +882,7 @@ async function connectOpenRouterOAuth(state, name, provider, args) {
         const code = url.searchParams.get("code");
         if (!code) throw new Error("OpenRouter OAuth callback did not contain a code");
         response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        response.end("<h1>Odinn connected</h1><p>You can close this tab.</p>");
+        response.end("<h1>Odinn Forge connected</h1><p>You can close this tab.</p>");
         resolveCallback(code);
       } catch (error) {
         rejectCallback(error);
@@ -1719,7 +1719,7 @@ function renderOnboarding({ state, workspaceRoot, configPath, tools, allowedCapa
     ? providers.map((provider) => `  - ${provider.name} [${provider.authMode}]: ${provider.models.join(", ")} (${provider.baseUrl})${provider.configured ? "" : provider.authMode === "oauth" ? " [not connected]" : provider.apiKeyEnv ? " [credential missing]" : ""}`)
     : ["  - none"];
   return [
-    "Odinn local onboarding",
+    "Odinn Forge local onboarding",
     "",
     `State: ${state}`,
     `Config: ${configPath}`,
@@ -1747,7 +1747,7 @@ function renderOnboarding({ state, workspaceRoot, configPath, tools, allowedCapa
     "  pnpm odinn onboard --provider openai --state .odinn",
     "  pnpm odinn onboard --provider openai --auth api-key --model gpt-4.1-mini --state .odinn",
     "  pnpm odinn config model default <provider:model> --state .odinn",
-    "  pnpm --filter @odinn/cli start -- run --tool text.echo --input-json '{\"text\":\"Hello, Odinn\"}'",
+    "  pnpm --filter @odinn/cli start -- run --tool text.echo --input-json '{\"text\":\"Hello, Odinn Forge\"}'",
     "  pnpm --filter @odinn/cli start -- plan --file examples/local-smoke.plan.json",
     "  pnpm odinn memory remember --kind preference --subject cli --text 'Prefer exact commands.'",
     "  pnpm --filter @odinn/cli start -- tui",
@@ -1761,7 +1761,7 @@ function renderOnboarding({ state, workspaceRoot, configPath, tools, allowedCapa
 function renderTui({ state, workspaceRoot, tools, allowedCapabilities, runs }) {
   const recent = runs.slice(0, 8);
   return [
-    "Odinn TUI",
+    "Odinn Forge TUI",
     "=========",
     `Workspace : ${workspaceRoot}`,
     `State     : ${state}`,

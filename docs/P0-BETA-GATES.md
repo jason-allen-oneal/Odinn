@@ -1,6 +1,6 @@
 # P0 beta gates
 
-This is the release ledger for the Ódinn beta. A checked item has code and regression coverage. The default remains local and single-user; remote multi-user operation is an explicit TLS-only host mode.
+This is the release ledger for the Ódinn Forge beta. A checked item has code and regression coverage. The default remains local and single-user; remote multi-user operation is an explicit TLS-only host mode.
 
 ## Current state
 

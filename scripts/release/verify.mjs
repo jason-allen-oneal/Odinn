@@ -58,4 +58,4 @@ for (const extension of ["zip", "tar.gz"]) {
   }
 }
 
-console.log(`verified ${sums.length} checksums and both Odinn ${pkg.version} source archives`);
+console.log(`verified ${sums.length} checksums and both Odinn Forge ${pkg.version} source archives`);

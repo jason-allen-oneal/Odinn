@@ -1,6 +1,6 @@
 # Repository Policy Setup
 
-Workflow files cannot create branch protection or repository environments by themselves. Odinn includes an idempotent administration script for that one-time configuration.
+Workflow files cannot create branch protection or repository environments by themselves. Odinn Forge includes an idempotent administration script for that one-time configuration.
 
 Requirements:
 

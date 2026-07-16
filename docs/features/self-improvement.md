@@ -1,6 +1,6 @@
-# Ódinn self-improvement
+# Ódinn Forge self-improvement
 
-Ódinn includes a configurable autonomous evidence loop. It observes signed audit history, groups repeated failures, creates deduplicated proposals, and can apply allowlisted runtime tuning without waiting for a human decision.
+Ódinn Forge includes a configurable autonomous evidence loop. It observes signed audit history, groups repeated failures, creates deduplicated proposals, and can apply allowlisted runtime tuning without waiting for a human decision.
 
 The default remains review-gated:
 

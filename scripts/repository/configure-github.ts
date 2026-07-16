@@ -26,10 +26,14 @@ const requiredChecks = [
   "Package smoke (ubuntu-latest)",
   "Package smoke (macos-latest)",
   "Package smoke (windows-latest)",
+  "Verify package (ubuntu-latest)",
+  "Verify package (macos-latest)",
+  "Verify package (windows-latest)",
   "CodeQL",
   "Dependency review",
   "Dependency and lockfile audit",
   "Secret scan",
+  "actionlint",
   "Conventional title"
 ];
 
@@ -41,6 +45,11 @@ gh("/actions/permissions/workflow", "PUT", {
 });
 
 gh("/vulnerability-alerts", "PUT");
+try {
+  gh("/private-vulnerability-reporting", "PUT");
+} catch (error: any) {
+  console.warn(`Private vulnerability reporting could not be enabled: ${error.message}`);
+}
 try {
   gh("/automated-security-fixes", "PUT");
 } catch (error: any) {

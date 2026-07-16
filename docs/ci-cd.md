@@ -1,6 +1,6 @@
 # Odinn Forge CI/CD
 
-Odinn Forge uses separate workflows for correctness, security, scheduled verification, version management, and release publication. A green release requires every required workflow to succeed independently.
+Odinn Forge uses separate workflows for correctness, package integrity, workflow linting, pull-request policy, merge-queue validation, security, scheduled verification, version management, and release publication. A green release requires every applicable required workflow to succeed independently.
 
 ## Workflows
 
@@ -27,13 +27,21 @@ It includes:
 
 - CodeQL for JavaScript and TypeScript
 - GitHub dependency review on pull requests
-- Frozen-lockfile installation and `pnpm audit`
+- Frozen-lockfile installation and a fail-closed advisory audit. The audit uses `pnpm audit` when available and queries npm's bulk advisory endpoint directly when the legacy endpoint returns its retirement response.
 - Full-history Gitleaks secret scanning
 - OpenSSF Scorecard reporting on trusted events
 
 ### Nightly
 
 Runs the complete repository check, integration test, protocol smoke, performance threshold, dependency audit, and source packaging every day. Nightly artifacts are retained for seven days.
+
+### Package Integrity
+
+Runs on every pull request and push to `main`. Linux, macOS, and Windows each build the source archives, verify checksums and archive contents, install from the frozen lockfile, complete onboarding, and execute the packaged CLI smoke.
+
+### Workflow and pull-request policy
+
+Workflow Lint runs actionlint on every pull request and on workflow changes pushed to `main`. Pull Request Policy validates Conventional Commit syntax for pull-request titles. Merge Queue performs the full release-candidate suite for `merge_group` events.
 
 ### Release Please
 
@@ -84,7 +92,7 @@ pnpm check
 pnpm test:integration
 pnpm smoke:inference
 pnpm benchmark:ci
-pnpm audit --audit-level high
+node scripts/ci/audit.ts high
 ```
 
 To inspect release output without publishing:
@@ -92,9 +100,13 @@ To inspect release output without publishing:
 ```bash
 pnpm release:package
 pnpm release:checksums
+node scripts/release/verify.ts
+pnpm release:install-smoke
 ```
 
 Artifacts are written to `dist/release/`.
+
+The audit command fails if neither advisory service can produce a valid result. A successful gate must never mean "the scanner was unavailable."
 
 ## Release conventions
 

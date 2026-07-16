@@ -6,8 +6,6 @@ on:
     paths:
       - ".github/workflows/**"
   pull_request:
-    paths:
-      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions:

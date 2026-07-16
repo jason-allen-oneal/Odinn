@@ -89,7 +89,7 @@ Use `pnpm odinn config experimental show` to inspect the posture. Read the featu
 - **Darwin** scores models from recorded verification, reliability, speed, cost, and policy outcomes.
 - **Self-improvement** mines repeated audited failures into reviewable proposals. It does not rewrite code, change policy, install skills, or approve its own changes.
 
-These are initial local slices, not a claim that arbitrary remote effects can be reversed or perfectly replayed. Browser sessions, external mutations, nondeterministic models, automatic counterfactual execution, and public hosting remain outside the safe beta boundary.
+These are initial local slices, not a claim that arbitrary remote effects can be reversed or perfectly replayed. Browser sessions and external mutations are supported only through the documented approval, recovery, and egress boundaries. Counterfactual execution is explicit and operator-driven. Remote hosting is supported only through the TLS-only multi-user host and remains application-level tenant separation rather than hostile-code containment. Nondeterministic models and remote services remain outside any deterministic replay guarantee.
 
 The authenticated gateway exposes the same experimental surfaces through `/runtime/runs`, `/proof`, `/policy/evaluate`, `/capabilities/*`, `/checkpoints`, `/rewind/*`, `/capsules/*`, `/counterfactual/*`, and `/routing/*`. Each surface remains disabled until its matching experimental flag is enabled in `.odinn/config.json`.
 
@@ -205,13 +205,17 @@ Extension manifests are inert until reviewed and enabled with explicit grants:
 
 ```bash
 pnpm odinn extension install --manifest ./extension.json
-pnpm odinn extension enable --id example-tool --grant web.read --trust --allow-unsafe-sandbox
+pnpm odinn extension enable --id example-tool --grant web.read --trust
 pnpm odinn extension run --id example-tool --capability web.read --input-json '{"query":"hello"}'
 pnpm odinn extension disable --id example-tool
 pnpm odinn extension rollback --id example-tool
 ```
 
 Executable extensions use one of two explicit adapters. `container` is the default for third-party code and requires a SHA-256 digest over the complete immutable bundle; it runs read-only with no network, dropped capabilities, no-new-privileges, a PID limit, CPU/memory limits, and a bounded temporary filesystem. `unconfined-process` remains available only for fully trusted local code with a verified entrypoint digest and an explicit unsafe-sandbox acknowledgement. Both adapters receive bounded I/O and cross the audited Sentinel/capability boundary. Tool extensions use Ódinn Forge's JSONL call contract; MCP extensions use JSON-RPC `tools/call` over JSONL.
+
+Use `--allow-unsafe-sandbox` only when enabling a manifest that explicitly selects `unconfined-process`. The flag is not required for the default container adapter.
+
+The local console includes Sessions, Usage, Cron Jobs, proof/audit Tasks, Agent SDK package management, Skills discovery, and Skill Workshop. See [Operator console](docs/operator-console.md) for the API, persistence, and security boundaries behind those views.
 
 ## Architecture
 
@@ -254,11 +258,16 @@ By default, runtime state lives under `.odinn/`:
 - `config.json` — provider and policy metadata;
 - `records.jsonl` — memory, session, goal, and improvement records;
 - `audit.jsonl` — policy decisions and execution events;
+- `db/odinn.sqlite` and `artifacts/` — the durable run ledger and content-addressed evidence;
+- `jobs/`, `approvals.json`, and browser recovery records — restart-safe execution state;
+- `cron-jobs.json` and `agents.json` — scheduled jobs and Agent SDK package state;
+- `skill-workshop/` — validated draft skill packages;
+- `gateway.token` and audit signing keys — owner-only local control-plane secrets;
 - `oauth/` — refreshable OAuth tokens;
 - `browser-profile/` — the isolated Chromium profile;
 - `imports/` and `skills/imported/` — reviewed framework imports.
 
-Never put API keys, bearer tokens, or private account exports into plans, commits, or audit payloads.
+This list identifies the main stores rather than every internal migration or recovery file. Never put API keys, bearer tokens, or private account exports into plans, commits, or audit payloads.
 
 ## Development
 

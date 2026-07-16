@@ -21,12 +21,12 @@ Reports will be acknowledged as soon as practical. Disclosure timing will be coo
 
 ## Security boundaries
 
-Ódinn Forge's beta has explicit capability boundaries, append-only audit events, restart-safe approval and browser-recovery claims, isolated task workers, isolated browser profiles, durable stores, and a loopback-only default control plane. Remote hosting is a separate opt-in service that requires TLS and gives every provisioned user an independent gateway and state/workspace boundary.
+Ódinn Forge's beta has explicit capability boundaries, append-only audit events, restart-safe approval and browser-recovery claims, forked crash-containment workers, isolated browser profiles, durable stores, and a loopback-only default control plane. The task workers retain the parent operating-system identity, filesystem, environment, and network authority; they are not a security sandbox. Remote hosting is a separate opt-in service that requires TLS and gives every provisioned user an independent gateway and state/workspace boundary.
 
 Before the first stable release:
 
 - Do not expose the Gateway directly to the public internet.
-- Do not run unreviewed tools, skills, MCP servers, or channel adapters. Installed extensions are disabled and untrusted by default; only explicitly trusted, grant-scoped process adapters can execute in this beta.
+- Do not run unreviewed tools, skills, MCP servers, or channel adapters. Installed extensions are disabled and untrusted by default. Container extensions require a verified whole-bundle digest and explicit grants; unconfined process execution additionally requires explicit trust and unsafe-mode acknowledgement.
 - Use dedicated credentials with minimal permissions.
 - Keep provider keys and channel tokens out of source control.
 - Treat generated skills and imported configuration as untrusted until reviewed.
@@ -63,7 +63,7 @@ Proof is evidence-based: model text cannot set `verified`. Sentinel decisions ar
 
 - The local operator controls the config, provider credentials, browser login, and approval decisions.
 - Model output and imported skills are untrusted input; they cannot bypass the kernel policy evaluator.
-- Extension and MCP manifests are metadata, not trust. They are disabled by default, require provenance review, and receive only explicit capability grants when enabled. The process adapter validates the entrypoint stays inside the configured workspace, launches without a shell, enforces a timeout, and rejects disabled, untrusted, ungranted, container, and unsandboxed execution.
+- Extension and MCP manifests are metadata, not trust. They are disabled by default, require provenance review, and receive only explicit capability grants when enabled. The default container adapter verifies the complete immutable bundle, uses read-only scoped mounts, disables network access, drops capabilities, enables no-new-privileges, and enforces CPU, memory, PID, temporary-filesystem, timeout, and output limits. The `unconfined-process` adapter is restricted to trusted local code with a verified entrypoint digest and explicit unsafe acknowledgement; it still runs with the Ódinn operating-system user's authority.
 - Public web content is untrusted data and may contain prompt injection. Ódinn Forge must not treat page instructions as operator authorization.
 - State directories are repaired to `0700` and sensitive JSON/JSONL records to `0600` when the gateway opens them. Idempotency keys are bound to a canonical request hash; reusing a key with different content returns `409`.
 - Browser read access is not action authorization. An external side effect requires the approval gate unless the operator explicitly disables it.
@@ -75,4 +75,4 @@ Browser mutations are journaled before execution; an interrupted or failed mutat
 
 ## CI security gates
 
-The repository requires CodeQL analysis, dependency review, dependency auditing, secret scanning, and OpenSSF Scorecard reporting. Release jobs additionally generate an SPDX SBOM, SHA-256 checksums, and GitHub build provenance.
+The repository requires CodeQL analysis, dependency review, a fail-closed dependency advisory audit, secret scanning, package-integrity checks, and OpenSSF Scorecard reporting. The audit uses `pnpm audit` when available and falls back to npm's bulk advisory endpoint when the legacy audit endpoint is retired or unavailable. Release jobs additionally generate an SPDX SBOM, SHA-256 checksums, and GitHub build provenance.

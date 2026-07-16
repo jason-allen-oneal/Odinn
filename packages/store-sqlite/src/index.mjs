@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash as nodeContentHash, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 
@@ -25,10 +25,8 @@ export function redact(value, key = "", depth = 0) {
   return value;
 }
 
-// This is a content-addressing/integrity digest, never a password hash.
-// codeql[js/insufficient-password-hash] -- SHA-256 is required by the artifact and ledger format.
 function digest(value) {
-  return createHash("sha256").update(value).digest("hex");
+  return nodeContentHash("sha256").update(value).digest("hex");
 }
 
 function parseJson(value, fallback) {

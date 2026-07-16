@@ -410,9 +410,13 @@ export class CapsuleManager {
 }
 
 async function copyWorkspaceTree(sourceRoot: string, destinationRoot: string) {
+  const excluded = new Set([
+    ".git", ".odinn", ".odinn-worktrees", ".cache", ".next", ".pnpm-store",
+    ".turbo", "build", "coverage", "dist", "node_modules"
+  ]);
   await mkdir(destinationRoot, { recursive: true });
   for (const entry of await readdir(sourceRoot, { withFileTypes: true })) {
-    if ([".odinn", ".odinn-worktrees"].includes(entry.name)) continue;
+    if (excluded.has(entry.name)) continue;
     await cp(join(sourceRoot, entry.name), join(destinationRoot, entry.name), { recursive: true });
   }
 }

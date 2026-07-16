@@ -10,3 +10,8 @@ odinn capability revoke <capability-id>
 ```
 
 The broker validates signature, expiration, run/tool binding, resource constraints, revocation, and replay count before recording a use.
+
+Enabling this experimental feature changes direct CLI execution immediately:
+ordinary tool runs require a matching scoped token after capability enforcement is
+active. Issue the token first, or disable the feature before returning to normal
+manual runs. Counterfactual read-only execution issues its own one-use token.

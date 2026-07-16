@@ -77,6 +77,7 @@ test("gateway serves the local console shell", async () => {
     assert.match(html, /Goals/);
     assert.match(html, /Skill Workshop/);
     assert.match(html, /modelOverride/);
+    assert.match(html, /allowedCapabilities\?\.includes\("agent\.run"\) \? "agent\.run" : "model\.chat"/);
     assert.match(html, /provider \+ ":" \+ message\.model/);
     assert.match(html, /chat-empty/);
     assert.match(html, /data-chat-prompt/);

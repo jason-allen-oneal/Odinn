@@ -39,7 +39,7 @@ Requirements: Node.js 24+ and Corepack.
 corepack enable
 pnpm install
 pnpm check
-pnpm odinn onboard
+pnpm odinn onboard --provider openai
 pnpm gui:start
 ```
 
@@ -70,9 +70,9 @@ The packaged release gate is stronger than the local echo smoke: CI launches the
 Every CLI and gateway tool boundary can now write a durable SQLite run ledger with ordered steps, redacted content-addressed artifacts, conservative tool-safety metadata, experimental feature flags, and a SHA-256 event chain. Inspect a run without reading raw JSONL:
 
 ```bash
-pnpm odinn run show <run-id> --state .odinn
-pnpm odinn run events <run-id> --state .odinn
-pnpm odinn run verify <run-id> --state .odinn
+pnpm --silent odinn run show <run-id> --state .odinn
+pnpm --silent odinn run events <run-id> --state .odinn
+pnpm --silent odinn run verify <run-id> --state .odinn
 ```
 
 This is the shared foundation for the experimental Proof, Rewind, Sentinel, Capsule, Darwin, Capability, and Counterfactual slices. They are disabled by default and must be enabled individually:
@@ -92,7 +92,7 @@ Use `pnpm odinn config experimental show` to inspect the posture. Read the featu
 - **Capability Tokens** bind short-lived, one-use authority to a run, step, tool, and resource constraint.
 - **Rewind** snapshots selected local files and defaults to a dry-run restore preview.
 - **Capsules** export redacted ZIP-compatible run bundles with checksum verification and safe extraction.
-- **Counterfactual** creates physically isolated candidate workspaces and compares their durable run records; candidate execution and branch commit are still operator-driven.
+- **Counterfactual** creates separate filesystem copies of candidate workspaces and compares their durable run records; these copies are not OS sandboxes, and candidate execution and selection remain operator-driven.
 - **Darwin** scores models from recorded verification, reliability, speed, cost, and policy outcomes.
 - **Self-improvement** mines repeated audited failures into reviewable proposals. It does not rewrite code, change policy, install skills, or approve its own changes.
 

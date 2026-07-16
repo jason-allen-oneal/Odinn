@@ -986,7 +986,7 @@ async function requestValidatedUrl(value: any, security: any = {}, resolveNetwor
     };
     const request = transport(parsed, {
       headers: { "user-agent": "Odinn-Forge/0.1 beta web-fetch" },
-      lookup: (_hostname: any, _options: any, callback: any) => callback(null, address, isIP(address))
+      lookup: pinnedAddressLookup(address)
     }, (response: any) => {
       const chunks: Buffer[] = [];
       let bytes = 0;
@@ -1194,7 +1194,7 @@ class BrowserNetworkProxy {
         path: `${parsed.pathname}${parsed.search}`,
         headers,
         servername: parsed.hostname,
-        lookup: (_hostname: any, _options: any, callback: any) => callback(null, address, isIP(address))
+        lookup: pinnedAddressLookup(address)
       }, (upstreamResponse: any) => {
         response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
         upstreamResponse.pipe(response);
@@ -1247,6 +1247,14 @@ class BrowserNetworkProxy {
     this.server = null;
     if (server?.listening) await new Promise((resolveClosed) => server.close(() => resolveClosed(undefined)));
   }
+}
+
+function pinnedAddressLookup(address: string) {
+  const family = isIP(address);
+  return (_hostname: any, options: any, callback: any) => {
+    if (options?.all === true) callback(null, [{ address, family }]);
+    else callback(null, address, family);
+  };
 }
 
 async function resolveChromiumExecutable() {
@@ -1981,6 +1989,10 @@ async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, sign
     const content = isResponsesTransport ? responseText(payload) : payload?.choices?.[0]?.message?.content;
     const toolCalls = extractToolCalls(payload, isResponsesTransport);
     if ((!content || !content.trim()) && !toolCalls.length) {
+      const reasoning = payload?.choices?.[0]?.message?.reasoning;
+      if (typeof reasoning === "string" && reasoning.trim()) {
+        throw new Error("model exhausted its output budget in reasoning before producing assistant content; increase maxTokens or use a non-reasoning model");
+      }
       throw new Error("model provider returned no assistant content");
     }
     return {
@@ -2142,7 +2154,11 @@ async function readStreamingChatResponse(response: any, onDelta?: (delta: string
 }
 
 async function readResponsesModelResponse(response: any, onDelta?: (delta: string) => void | Promise<void>) {
-  if (!response.headers.get("content-type")?.includes("text/event-stream")) {
+  const contentType = response.headers.get("content-type");
+  // ChatGPT's Codex responses endpoint currently streams SSE without a
+  // Content-Type header. Treat a missing header as a stream; explicit JSON
+  // responses still take the bounded JSON path below.
+  if (contentType && !contentType.includes("text/event-stream")) {
     const raw = await readBoundedResponseText(response);
     try {
       return raw ? JSON.parse(raw) : {};

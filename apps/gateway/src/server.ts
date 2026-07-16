@@ -3055,7 +3055,7 @@ function renderConsoleHtml() {
       const toolRequest = options.tool === "job.healthcheck"
           ? { tool: "job.healthcheck", input: {} }
         : {
-            tool: "agent.run",
+            tool: state.status?.allowedCapabilities?.includes("agent.run") ? "agent.run" : "model.chat",
             input: {
               model: state.modelOverride || state.status?.defaultModel,
               sessionId,

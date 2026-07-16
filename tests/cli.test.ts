@@ -246,6 +246,7 @@ test("CLI onboarding configures a provider without storing a secret", async () =
   assert.equal(config.providers.openai.apiKeyEnv, "OPENAI_API_KEY");
   assert.equal(config.providers.openai.apiKey, undefined);
   assert.ok(config.policy.allowedCapabilities.includes("model.chat"));
+  assert.ok(config.policy.allowedCapabilities.includes("agent.run"));
 });
 
 test("CLI exposes explicit security posture controls", async () => {

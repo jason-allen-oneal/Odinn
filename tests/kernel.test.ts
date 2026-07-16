@@ -216,7 +216,8 @@ test("kernel speaks the ChatGPT Codex SSE transport for imported OAuth", async (
     }));
     assert.equal(body.stream, true);
     assert.equal(body.store, false);
-    response.writeHead(200, { "content-type": "text/event-stream" });
+    // The live ChatGPT Codex endpoint may omit Content-Type for an SSE body.
+    response.writeHead(200);
     response.end([
       'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ODINN_"}\n\n',
       'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"CODEX_OK"}\n\n',

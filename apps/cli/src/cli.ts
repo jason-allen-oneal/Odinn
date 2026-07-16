@@ -383,7 +383,11 @@ async function configCommand(args: any) {
     config.experimental = { ...normalizeExperimentalFlags(config.experimental), [feature]: subcommand === "enable" };
     await saveConfig(state, config);
     console.error(experimentalFeatureWarning(config.experimental));
-    await printJson({ ok: true, feature, enabled: config.experimental[feature], warning: experimentalFeatureWarning(config.experimental) });
+    const behaviorWarning = feature === "capabilities" && subcommand === "enable"
+      ? "capability enforcement is now active: direct tool runs require a scoped token; use `odinn capability issue` before manual runs"
+      : undefined;
+    if (behaviorWarning) console.error(behaviorWarning);
+    await printJson({ ok: true, feature, enabled: config.experimental[feature], warning: experimentalFeatureWarning(config.experimental), ...(behaviorWarning ? { behaviorWarning } : {}) });
     return;
   }
   if (section === "provider") {
@@ -813,7 +817,11 @@ async function addProvider(state: any, args: any, name: any, existingConfig: any
   }
   config.providers[name] = provider;
   config.policy ??= createDefaultPolicy();
-  config.policy.allowedCapabilities = Array.from(new Set([...(config.policy.allowedCapabilities ?? []), "model.chat"]));
+  config.policy.allowedCapabilities = Array.from(new Set([
+    ...(config.policy.allowedCapabilities ?? []),
+    "model.chat",
+    "agent.run"
+  ]));
   if (!config.defaultModel || !listConfiguredModels(normalizeModelConfig(config)).some((entry: any) => entry.id === config.defaultModel)) {
     config.defaultModel = `${name}:${models[0]}`;
   }

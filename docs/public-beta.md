@@ -30,9 +30,13 @@ cd "odinn-$tag"
 corepack enable
 ./scripts/install.sh --prefix "$HOME/.local/share/odinn"
 export PATH="$HOME/.local/share/odinn/bin:$PATH"
-odinn onboard
+odinn onboard --provider openai
 odinn start
 ```
+
+`odinn onboard` without `--provider` creates local state for diagnostics and
+built-in tools, but it does not configure a model. The chat console needs a
+configured provider before it can return agent responses.
 
 On macOS, use `shasum -a 256 -c` instead of `sha256sum -c` when GNU coreutils is unavailable.
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -102,11 +102,14 @@ test("counterfactual candidates receive isolated workspaces", async () => {
   const { root, runtime } = await fixture();
   try {
     runtime.ledger.ensureRun({ runId: "run-source", objective: "branch" });
+    await mkdir(join(root, "node_modules"));
+    await writeFile(join(root, "node_modules", "should-not-copy.txt"), "generated\n");
     const group = await runtime.counterfactual.create({ sourceRunId: "run-source", sourceStepId: "step-1", workspaceRoot: root, plans: [{ id: "a", title: "A", summary: "first" }, { id: "b", title: "B", summary: "second" }] });
     assert.equal(group.candidates.length, 2); assert.notEqual(group.candidates[0].workspaceRoot, group.candidates[1].workspaceRoot);
     assert.equal(runtime.counterfactual.compare(group.groupId).candidates.length, 2);
     await writeFile(join(group.candidates[0].workspaceRoot, "only-a.txt"), "a\n");
     await assert.rejects(readFile(join(group.candidates[1].workspaceRoot, "only-a.txt"), "utf8"), { code: "ENOENT" });
+    await assert.rejects(readFile(join(group.candidates[0].workspaceRoot, "node_modules", "should-not-copy.txt"), "utf8"), { code: "ENOENT" });
   } finally { runtime.ledger.close(); }
 });
 

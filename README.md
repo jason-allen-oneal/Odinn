@@ -22,7 +22,7 @@ The project is a clean-room implementation. It does not copy OpenClaw, Hermes, O
 
 It is not a hosted multi-user service. Do not expose the gateway to the public internet yet. The default posture is loopback-only, private-network blocking, and approval-required browser actions.
 
-The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval claims, provider retries and usage normalization, trusted process/MCP extension adapters, DNS-pinned public web fetches, symlink-safe workspace reads, owner-only state repair, cross-platform package smoke, and nightly storage recovery drills. Native installers, application upgrade rollback, audit-journal key rotation, complete external-adapter interposition, and full counterfactual/replay execution remain open. See [the P0 beta ledger](docs/P0-BETA-GATES.md).
+The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval claims, provider retries and usage normalization, trusted process/MCP extension adapters, DNS-pinned public web fetches, symlink-safe workspace reads, owner-only state repair, cross-platform package smoke, signed audit-key rotation, persistent browser tab recovery, bounded counterfactual execution, and nightly storage recovery drills. Native installers, application upgrade rollback, immutable extension versions, complete external-adapter interposition, and full capsule replay remain open. See [the P0 beta ledger](docs/P0-BETA-GATES.md).
 
 ## Quick start
 

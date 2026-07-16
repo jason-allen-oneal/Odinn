@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 
-export const SQLITE_SCHEMA_VERSION = 2;
+export const SQLITE_SCHEMA_VERSION = 3;
 type JsonMap = { [key: string]: unknown };
 type SqlRow = { [key: string]: any };
 type FeatureFlags = Record<string, boolean>;
@@ -283,7 +283,12 @@ const MIGRATIONS = [
   CREATE INDEX IF NOT EXISTS idx_policy_evaluations_run ON policy_evaluations(run_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_capabilities_run ON capabilities(run_id, status);
   CREATE INDEX IF NOT EXISTS idx_snapshots_run ON snapshots(run_id, created_at);
-  CREATE INDEX IF NOT EXISTS idx_model_observations_model ON model_observations(provider_id, model_id, task_class);`
+  CREATE INDEX IF NOT EXISTS idx_model_observations_model ON model_observations(provider_id, model_id, task_class);`,
+  `CREATE TABLE IF NOT EXISTS run_request_bindings (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id),
+    request_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );`
 ];
 
 export class SqliteStore {
@@ -379,6 +384,20 @@ export class RunLedger {
       VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?)`)
       .run(runId, parentRunId ?? null, branchPointStepId ?? null, String(objective ?? ""), String(modelId), String(providerId), resolve(workspaceRoot), JSON.stringify(this.featureFlags), now);
     return runId;
+  }
+
+  bindRunRequest({ runId, requestDigest }: { runId: string; requestDigest: string }) {
+    if (!runId || !requestDigest) throw new Error("run request binding requires runId and requestDigest");
+    return this.database.transaction((db) => {
+      const existing = db.prepare("SELECT request_digest FROM run_request_bindings WHERE run_id = ?").get(runId) as SqlRow | undefined;
+      if (existing && existing.request_digest !== requestDigest) {
+        const error = new Error(`run id ${runId} was already used for a different request`) as Error & { code?: string };
+        error.code = "IDEMPOTENCY_CONFLICT";
+        throw error;
+      }
+      if (!existing) db.prepare("INSERT INTO run_request_bindings(run_id, request_digest, created_at) VALUES (?, ?, ?)").run(runId, requestDigest, new Date().toISOString());
+      return { runId, requestDigest, replay: Boolean(existing) };
+    });
   }
 
   appendEvent({ runId, type, payload = {}, timestamp = new Date().toISOString() }: { runId: string; type: string; payload?: JsonMap; timestamp?: string }) {

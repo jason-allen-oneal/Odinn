@@ -75,7 +75,7 @@ export async function runInferenceProtocolSmoke() {
     await waitForStatus(`${gatewayBase}/status`, cookie, child, () => `${childOutput}${childError}`);
     const response = await fetch(`${gatewayBase}/run`, {
       method: "POST",
-      headers: { "content-type": "application/json", cookie },
+      headers: { "content-type": "application/json", cookie, origin: gatewayBase, "sec-fetch-site": "same-origin" },
       body: JSON.stringify({
         id: "run_ci_packaged_gateway",
         tool: "model.chat",

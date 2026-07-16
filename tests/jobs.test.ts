@@ -30,7 +30,7 @@ test("job supervisor persists completion and replays recovered work", async () =
   await supervisor.shutdown();
 
   const recoveredStore = new FileJobStore(join(root, "jobs-recovered.json"));
-  await recoveredStore.create({ id: "job_crashed", status: "running", payload: { value: "recovered" }, attempts: 0 });
+  await recoveredStore.create({ id: "job_crashed", status: "running", payload: { value: "recovered" }, attempts: 0, retrySafe: true });
   const recovered = new JobSupervisor({ store: recoveredStore, execute: async (payload: any) => payload });
   await recovered.start();
   const recoveredJob = await waitFor(async () => (await recovered.get("job_crashed"))?.status === "completed" ? recovered.get("job_crashed") : undefined);
@@ -54,7 +54,7 @@ test("job supervisor supports cancellation and timeout recovery", async () => {
   await supervisor.cancel("job_cancel");
   assert.equal((await waitFor(async () => (await supervisor.get("job_cancel"))?.status === "cancelled" ? supervisor.get("job_cancel") : undefined)).status, "cancelled");
 
-  await supervisor.submit({ action: "timeout" }, { id: "job_timeout", timeoutMs: 10 });
+  await supervisor.submit({ action: "timeout" }, { id: "job_timeout", timeoutMs: 10, retrySafe: true });
   const failed = await waitFor(async () => (await supervisor.get("job_timeout"))?.status === "failed" ? supervisor.get("job_timeout") : undefined);
   assert.match(failed.error, /timed out|aborted/);
   await supervisor.shutdown();
@@ -80,7 +80,27 @@ test("job supervisor does not requeue or start work after shutdown begins", asyn
   await supervisor.shutdown();
   await new Promise((resolve: any) => setTimeout(resolve, 50));
   assert.equal(executions, 1);
-  assert.equal((await supervisor.get("job_shutdown")).status, "failed");
+  assert.equal((await supervisor.get("job_shutdown")).status, "needs-review");
+});
+
+test("job supervisor never retries unsafe failures and quarantines unknown outcomes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-jobs-unsafe-"));
+  const store = new FileJobStore(join(root, "jobs.json"));
+  let executions = 0;
+  const supervisor = new JobSupervisor({
+    store,
+    maxAttempts: 3,
+    execute: async (_payload: any, { signal }: any) => {
+      executions += 1;
+      await new Promise((resolve: any, reject: any) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    }
+  });
+  await supervisor.start();
+  await supervisor.submit({ action: "external-write" }, { id: "job_unsafe_timeout", timeoutMs: 10 });
+  const review = await waitFor(async () => (await supervisor.get("job_unsafe_timeout"))?.status === "needs-review" ? supervisor.get("job_unsafe_timeout") : undefined);
+  assert.equal(review.attempts, 1);
+  assert.equal(executions, 1);
+  await supervisor.shutdown();
 });
 
 test("file stores expose explicit corruption recovery without hiding the damaged source", async () => {
@@ -109,4 +129,20 @@ test("audit journals rotate keys and verify signed records across retired keys",
   const tampered = await store.verifyIntegrity({ allowUnsigned: false });
   assert.equal(tampered.valid, false);
   assert.equal(rotation.retiredKeyIds.length, 1);
+});
+
+test("independent audit store instances serialize one signed chain", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-audit-concurrent-"));
+  const path = join(root, "audit.jsonl");
+  const left = new FileAuditStore(path);
+  const right = new FileAuditStore(path);
+  await Promise.all(Array.from({ length: 40 }, (_, index) => (index % 2 ? left : right).append({
+    runId: `run-concurrent-${index}`,
+    type: "task.completed",
+    data: { index }
+  })));
+  const verification = await left.verifyIntegrity({ allowUnsigned: false });
+  assert.equal(verification.events, 40);
+  assert.equal(verification.valid, true);
+  assert.deepEqual(verification.failures, []);
 });

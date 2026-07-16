@@ -1581,6 +1581,18 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, memorySto
   throw new Error(`agent reached its ${maxTurns}-turn tool limit`);
 }
 
+function stableTaskValue(value: any): string {
+  if (Array.isArray(value)) return `[${value.map(stableTaskValue).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableTaskValue(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function taskRequestDigest(request: any): string {
+  return createHash("sha256").update(stableTaskValue({ tool: request.tool, input: request.input ?? {}, actor: request.actor ?? "unknown" })).digest("hex");
+}
+
 export async function runTask({
   task,
   auditStore,
@@ -1592,18 +1604,11 @@ export async function runTask({
 }: any) {
   const request = normalizeTaskRequest(task);
   const tool = registry.get(request.tool);
+  const requestDigest = taskRequestDigest(request);
+  let runBinding: { replay?: boolean } | undefined;
 
   if (!auditStore) throw new Error("runTask requires an auditStore");
 
-  const prior = await auditStore.readRun(request.id);
-  if (prior?.status === "completed") {
-    const completed = [...prior.events].reverse().find((event: any) => event.type === "task.completed");
-    return { id: request.id, tool: request.tool, capability: tool?.capability, ok: true, replayed: true, output: completed?.data?.output };
-  }
-
-  throwIfAborted(signal);
-  const safety = toolSafetyDescriptor(request.tool, tool);
-  let ledgerStep;
   if (runLedger) {
     const modelRef = typeof request.input?.model === "string" ? request.input.model : "";
     const separator = modelRef.indexOf(":");
@@ -1613,6 +1618,33 @@ export async function runTask({
       providerId: separator > 0 ? modelRef.slice(0, separator) : "",
       modelId: separator > 0 ? modelRef.slice(separator + 1) : modelRef
     });
+    runBinding = runLedger.bindRunRequest({ runId: request.id, requestDigest });
+  }
+
+  const prior = await auditStore.readRun(request.id);
+  if (prior?.status === "completed") {
+    const started = [...prior.events].reverse().find((event: any) => event.type === "task.started");
+    const priorDigest = started?.data?.requestDigest ?? (started?.tool && started?.data && "input" in started.data
+      ? taskRequestDigest({ tool: started.tool, input: started.data.input, actor: started.actor })
+      : undefined);
+    if (!priorDigest || priorDigest !== requestDigest) {
+      const error = new Error(`run id ${request.id} was already used for a different request`) as NodeError;
+      error.code = "IDEMPOTENCY_CONFLICT";
+      throw error;
+    }
+    const completed = [...prior.events].reverse().find((event: any) => event.type === "task.completed");
+    return { id: request.id, tool: request.tool, capability: tool?.capability, ok: true, replayed: true, output: completed?.data?.output };
+  }
+  if (runBinding?.replay) {
+    const error = new Error(`run id ${request.id} is already bound to an unfinished or failed request and will not be executed again`) as NodeError;
+    error.code = "IDEMPOTENCY_REUSE";
+    throw error;
+  }
+
+  throwIfAborted(signal);
+  const safety = toolSafetyDescriptor(request.tool, tool);
+  let ledgerStep;
+  if (runLedger) {
     ledgerStep = runLedger.beginTool({ runId: request.id, toolName: request.tool, input: request.input, safety, metadata: { actor: request.actor } });
   }
   const decision = evaluateTaskPolicy({ policy, request, tool });
@@ -1680,6 +1712,7 @@ export async function runTask({
     decision: "allow",
     data: {
       inputDigest: createHash("sha256").update(JSON.stringify(request.input)).digest("hex"),
+      requestDigest,
       input: safeAuditValue(request.input)
     }
   });

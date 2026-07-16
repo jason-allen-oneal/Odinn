@@ -20,6 +20,35 @@ test("gateway control surfaces require bootstrap authentication and reject cross
     assert.ok(cookie);
     assert.equal((await fetch(`${base}/status`, { headers: { cookie } })).status, 200);
 
+    const missingCookieOrigin = await fetch(`${base}/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({ id: "run_missing_cookie_origin", tool: "text.echo", input: { text: "blocked" } })
+    });
+    assert.equal(missingCookieOrigin.status, 403);
+
+    const crossPort = await fetch(`${base}/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: `http://127.0.0.1:${server.address().port + 1}` },
+      body: JSON.stringify({ id: "run_cross_port", tool: "text.echo", input: { text: "blocked" } })
+    });
+    assert.equal(crossPort.status, 403);
+
+    const sameOrigin = await fetch(`${base}/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: base, "sec-fetch-site": "same-origin" },
+      body: JSON.stringify({ id: "run_same_origin", tool: "text.echo", input: { text: "allowed" } })
+    });
+    assert.equal(sameOrigin.status, 200);
+
+    const token = decodeURIComponent(cookie.split("=").slice(1).join("="));
+    const bearer = await fetch(`${base}/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ id: "run_bearer_no_origin", tool: "text.echo", input: { text: "allowed" } })
+    });
+    assert.equal(bearer.status, 200);
+
     const rejected = await fetch(`${base}/run`, {
       method: "POST",
       headers: { "content-type": "application/json", cookie, origin: "https://evil.example" },

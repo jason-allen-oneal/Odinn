@@ -369,6 +369,7 @@ test("gateway exposes sessions, goals, and improvement proposals", async () => {
 test("gateway exposes the experimental runtime against persisted SQLite state", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-runtime-"));
   const workspaceRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-workspace-"));
+  const attackerRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-attacker-root-"));
   await writeFile(join(workspaceRoot, "fixture.txt"), "before\n");
   await writeFile(join(stateDir, "config.json"), JSON.stringify({
     version: 1,
@@ -413,11 +414,19 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
     assert.equal(proof.status, "passed");
     assert.equal((await getJson(`${base}/proof/gateway-runtime-run`)).assertions.length, 1);
 
+    const legacyProof = await fetch(`${base}/proof`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ runId: "gateway-runtime-run", workspaceRoot: attackerRoot, contract: { version: 1, acceptance: [{ id: "command", type: "command", command: "node", args: ["-e", "process.exit(0)"] }] } })
+    });
+    assert.equal(legacyProof.status, 400);
+
     const checkpoint = await postJson(`${base}/checkpoints`, {
       runId: "gateway-runtime-run",
       stepId: "step-gateway-checkpoint",
       paths: ["fixture.txt"],
-      label: "before-change"
+      label: "before-change",
+      workspaceRoot: attackerRoot
     });
     await writeFile(join(workspaceRoot, "fixture.txt"), "after\n");
     const preview = await postJson(`${base}/rewind/${encodeURIComponent(checkpoint.snapshotId)}`, {});
@@ -450,9 +459,11 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
     const branch = await postJson(`${base}/counterfactual`, {
       sourceRunId: "gateway-runtime-run",
       sourceStepId: timeline.steps[0].id,
+      workspaceRoot: attackerRoot,
       plans: [{ id: "a", title: "A", summary: "candidate A" }, { id: "b", title: "B", summary: "candidate B" }]
     });
     assert.equal(branch.candidates.length, 2);
+    assert.ok(branch.candidates.every((candidate: any) => candidate.workspaceRoot.startsWith(`${workspaceRoot}/.odinn-worktrees/`)));
     assert.equal((await getJson(`${base}/counterfactual/${branch.groupId}`)).candidates.length, 2);
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));

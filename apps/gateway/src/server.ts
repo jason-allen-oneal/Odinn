@@ -3,7 +3,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, validateContract, validatePolicy } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, toolSafetyDescriptor, validatePolicy } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
@@ -24,16 +24,18 @@ export async function createGatewayServer({
   requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES
 }: any = {}) {
   const state = resolve(stateDir);
+  const root = resolve(workspaceRoot);
   await ensureSecureStateDirectory(state);
   const config = await readConfig(state);
   const featureFlags = normalizeExperimentalFlags(config.experimental);
-  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot, featureFlags });
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags });
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
   const policy = createDefaultPolicy(config.policy);
   const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
-  const registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, approvalStore, auditStore });
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, config, approvalStore, auditStore });
   const gatewayToken = await loadGatewayToken(state);
-  const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy });
+  const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot: root, config, policy });
+  const proofVerifier = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: root, allowedCommands: config.proof?.allowedCommands ?? [] });
   const supervisor = new JobSupervisor({
     store: new FileJobStore(join(state, "jobs.json")),
     execute: isolatedTaskExecutor
@@ -62,14 +64,15 @@ export async function createGatewayServer({
       if (process.env.ODINN_GATEWAY_AUTH !== "off" && !authorizedRequest(request, gatewayToken)) {
         return json(response, 401, { ok: false, error: "gateway authentication required" });
       }
-      if (isMutatingMethod(request.method) && !validOrigin(request)) {
+      const authentication = process.env.ODINN_GATEWAY_AUTH === "off" ? "disabled" : authenticationMode(request, gatewayToken);
+      if (isMutatingMethod(request.method) && !validMutationOrigin(request, authentication)) {
         return json(response, 403, { ok: false, error: "origin rejected for control-plane mutation" });
       }
       if (request.method === "GET" && url.pathname === "/status") {
         return json(response, 200, {
           ok: true,
           state,
-          workspaceRoot: resolve(workspaceRoot),
+          workspaceRoot: root,
           tools: Array.from(registry.keys()),
           toolDetails: Array.from(registry.entries()).map(([name, tool]: any) => ({
             name,
@@ -100,12 +103,7 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname === "/proof") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        if (body?.schemaVersion === 1) {
-          const contract = new ProofVerifier({ runLedger: runtime.ledger, allowedRoot: workspaceRoot, allowedCommands: config.proof?.allowedCommands ?? [] });
-          return json(response, 200, await contract.verify(body));
-        }
-        validateContract(body?.contract);
-        return json(response, 200, await runtime.proof.run(body.runId, body.contract, { workspaceRoot: body.workspaceRoot ?? workspaceRoot }));
+        return json(response, 200, await proofVerifier.verify(body));
       }
       if (request.method === "GET" && url.pathname.startsWith("/proof/")) {
         const runId = decodeURIComponent(url.pathname.slice("/proof/".length));
@@ -116,7 +114,7 @@ export async function createGatewayServer({
         validatePolicy(body.policy);
         const runId = body.runId ?? `policy-${randomBytes(12).toString("hex")}`;
         runtime.ledger.ensureRun({ runId, objective: "policy evaluation" });
-        return json(response, 200, runtime.sentinel.evaluate({ runId, stepId: body.stepId, toolName: body.toolName, input: body.input ?? {}, policy: body.policy, workspaceRoot }));
+        return json(response, 200, runtime.sentinel.evaluate({ runId, stepId: body.stepId, toolName: body.toolName, input: body.input ?? {}, policy: body.policy, workspaceRoot: root }));
       }
       if (request.method === "POST" && url.pathname === "/capabilities/issue") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
@@ -138,7 +136,7 @@ export async function createGatewayServer({
       if (request.method === "POST" && url.pathname === "/checkpoints") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         runtime.ledger.ensureRun({ runId: body.runId, objective: body.objective ?? "checkpoint" });
-        return json(response, 200, runtime.snapshots.create({ ...body, workspaceRoot: body.workspaceRoot ?? workspaceRoot }));
+        return json(response, 200, runtime.snapshots.create({ ...body, workspaceRoot: root }));
       }
       if (request.method === "POST" && url.pathname.startsWith("/rewind/")) {
         const snapshotId = decodeURIComponent(url.pathname.slice("/rewind/".length));
@@ -159,7 +157,7 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname === "/counterfactual") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, await runtime.counterfactual.create({ ...body, workspaceRoot: body.workspaceRoot ?? workspaceRoot }));
+        return json(response, 200, await runtime.counterfactual.create({ ...body, workspaceRoot: root }));
       }
       if (request.method === "GET" && url.pathname.startsWith("/counterfactual/")) {
         if (url.pathname.endsWith("/execute")) return json(response, 405, { ok: false, error: "counterfactual execute requires POST" });
@@ -171,7 +169,9 @@ export async function createGatewayServer({
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         return json(response, 200, await runtime.counterfactual.execute(groupId, {
           capabilities: runtime.capabilities,
-          proof: runtime.proof,
+          proof: {
+            run: async (runId: string, contract: any) => proofVerifier.verify({ ...contract, runId })
+          },
           policy,
           executor: (task: any, context: any) => isolatedTaskExecutor({ task, workspaceRoot: context.workspaceRoot })
         }));
@@ -230,7 +230,11 @@ export async function createGatewayServer({
           }
         }
         const task = body.task && typeof body.task === "object" ? body.task : body;
-        const job = await supervisor.submit({ task: { ...task, ...(id ? { id: String(id) } : {}) } }, { id: id ? String(id) : undefined, requestHash, timeoutMs: body.timeoutMs });
+        const safety = toolSafetyDescriptor(task.tool, registry.get(task.tool));
+        const job = await supervisor.submit(
+          { task: { ...task, ...(id ? { id: String(id) } : {}) } },
+          { id: id ? String(id) : undefined, requestHash, timeoutMs: body.timeoutMs, retrySafe: safety.retrySafe === true }
+        );
         return json(response, 202, { ok: true, job });
       }
       if (request.method === "POST" && url.pathname.startsWith("/jobs/") && url.pathname.endsWith("/cancel")) {
@@ -502,25 +506,37 @@ async function loadGatewayToken(state: any) {
 }
 
 function authorizedRequest(request: any, expectedToken: any) {
+  return authenticationMode(request, expectedToken) !== undefined;
+}
+
+function authenticationMode(request: any, expectedToken: any): "bearer" | "cookie" | undefined {
   const bearer = request.headers.authorization?.startsWith("Bearer ") ? request.headers.authorization.slice(7) : "";
   const cookie = String(request.headers.cookie ?? "").split(";").map((item: any) => item.trim()).find((item: any) => item.startsWith("odinn_gateway_token="))?.slice("odinn_gateway_token=".length) ?? "";
   let decodedCookie = "";
-  try { decodedCookie = decodeURIComponent(cookie); } catch { return false; }
-  const presented = bearer || decodedCookie;
-  if (!presented || presented.length !== expectedToken.length) return false;
-  return timingSafeEqual(Buffer.from(presented), Buffer.from(expectedToken));
+  try { decodedCookie = decodeURIComponent(cookie); } catch { return undefined; }
+  for (const [mode, presented] of [["bearer", bearer], ["cookie", decodedCookie]] as const) {
+    if (!presented || presented.length !== expectedToken.length) continue;
+    if (timingSafeEqual(Buffer.from(presented), Buffer.from(expectedToken))) return mode;
+  }
+  return undefined;
 }
 
 function isMutatingMethod(method: any) {
   return ["POST", "PATCH", "PUT", "DELETE"].includes(method);
 }
 
-function validOrigin(request: any) {
+function validMutationOrigin(request: any, authentication: "bearer" | "cookie" | "disabled" | undefined) {
+  if (authentication === "disabled") return true;
+  if (!authentication) return false;
   const origin = request.headers.origin;
-  if (!origin) return true;
+  if (authentication === "bearer" && !origin) return true;
+  if (!origin) return false;
   try {
     const parsed = new URL(origin);
-    return parsed.protocol === "http:" && validLoopbackHost(parsed.host) && normalizeHost(parsed.host) === normalizeHost(request.headers.host);
+    const expected = `http://${String(request.headers.host ?? "").trim().toLowerCase()}`;
+    if (parsed.origin.toLowerCase() !== expected || !validLoopbackHost(parsed.host)) return false;
+    const fetchSite = String(request.headers["sec-fetch-site"] ?? "").toLowerCase();
+    return !fetchSite || fetchSite === "same-origin" || authentication === "bearer";
   } catch { return false; }
 }
 
@@ -534,10 +550,6 @@ function validLoopbackHost(value: any) {
   const match = host.match(/^([^:]+)(?::\d{1,5})?$/) || host.match(/^(\[[0-9a-f:]+\])(?::\d{1,5})?$/);
   if (!match) return false;
   return new Set(["localhost", "127.0.0.1", "[::1]"]).has(match[1]);
-}
-
-function normalizeHost(value: any) {
-  return String(value || "").trim().toLowerCase().replace(/:\d+$/, "");
 }
 
 function hashRequest(value: any) {

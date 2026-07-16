@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile, copyFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile, copyFile, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { normalizeAuditEvent, type AuditEvent, type JsonObject } from "@odinn/protocol";
 
@@ -8,11 +8,36 @@ export const STORE_SCHEMA_VERSION = 1;
 type Integrity = { keyId: string; previous: string | null; signature: string };
 type Keyring = { schemaVersion: number; current: string; keys: Record<string, string> };
 type StoredRecord = JsonObject & { schemaVersion: number; at?: string; type?: string };
-type Job = JsonObject & { id: string; status: string; payload: JsonObject; createdAt: string; updatedAt: string; attempts: number; timeoutMs: number };
+type Job = JsonObject & { id: string; status: string; payload: JsonObject; createdAt: string; updatedAt: string; attempts: number; timeoutMs: number; retrySafe: boolean };
 type JobState = { schemaVersion: number; jobs: Record<string, Job> };
 type MutableResult<T> = T | Promise<T>;
 type NodeError = Error & { code?: string };
 const errorCode = (error: unknown) => (error as NodeError | undefined)?.code;
+
+async function withInterprocessLock<T>(lockPath: string, operation: () => Promise<T>): Promise<T> {
+  await ensureSecureStateDirectory(dirname(lockPath));
+  const deadline = Date.now() + 30_000;
+  while (true) {
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+      break;
+    } catch (error) {
+      if (errorCode(error) !== "EEXIST") throw error;
+      try {
+        if (Date.now() - (await stat(lockPath)).mtimeMs > 120_000) {
+          await rm(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      } catch (statError) {
+        if (errorCode(statError) !== "ENOENT") throw statError;
+      }
+      if (Date.now() >= deadline) throw new Error(`timed out acquiring store lock: ${lockPath}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  try { return await operation(); }
+  finally { await rm(lockPath, { recursive: true, force: true }); }
+}
 
 export async function ensureSecureStateDirectory(path: string) {
   await mkdir(path, { recursive: true, mode: 0o700 });
@@ -42,19 +67,21 @@ export class StoreCorruptionError extends Error {
 export class FileAuditStore {
   readonly path: string;
   readonly keyringPath: string;
+  readonly lockPath: string;
   private writeChain: Promise<unknown>;
 
   constructor(path: string) {
     if (!path) throw new Error("FileAuditStore requires a path");
     this.path = path;
     this.keyringPath = `${path}.keys.json`;
+    this.lockPath = `${path}.lock`;
     this.writeChain = Promise.resolve();
   }
 
   async append(event: unknown): Promise<AuditEvent> {
-    const operation = this.writeChain.then(async () => {
+    const operation = this.writeChain.then(() => withInterprocessLock(this.lockPath, async () => {
       const normalized = normalizeAuditEvent(event);
-      const keyring = await this.readKeyring();
+      const keyring = await this.readKeyringUnlocked();
       const previous = await this.lastIntegrity();
       const unsigned = { ...normalized, data: { ...(normalized.data ?? {}) } };
       delete unsigned.data.__odinnIntegrity;
@@ -64,7 +91,7 @@ export class FileAuditStore {
       await writeFile(this.path, `${JSON.stringify(signed)}\n`, { flag: "a" });
       await secureStoreFile(this.path);
       return signed;
-    });
+    }));
     this.writeChain = operation.catch(() => undefined);
     return operation;
   }
@@ -92,8 +119,8 @@ export class FileAuditStore {
   }
 
   async rotateKey() {
-    const operation = this.writeChain.then(async () => {
-      const keyring = await this.readKeyring();
+    const operation = this.writeChain.then(() => withInterprocessLock(this.lockPath, async () => {
+      const keyring = await this.readKeyringUnlocked();
       const keyId = `key_${randomUUID()}`;
       keyring.keys[keyId] = Buffer.from(randomUUID().replaceAll("-", ""), "hex").toString("base64");
       keyring.current = keyId;
@@ -101,7 +128,7 @@ export class FileAuditStore {
       await writeFile(this.keyringPath, `${JSON.stringify(keyring, null, 2)}\n`, { mode: 0o600 });
       await chmod(this.keyringPath, 0o600);
       return { keyId, retiredKeyIds: Object.keys(keyring.keys).filter((id) => id !== keyId) };
-    });
+    }));
     this.writeChain = operation.catch(() => undefined);
     return operation;
   }
@@ -126,6 +153,10 @@ export class FileAuditStore {
   }
 
   async readKeyring(): Promise<Keyring> {
+    return withInterprocessLock(this.lockPath, () => this.readKeyringUnlocked());
+  }
+
+  private async readKeyringUnlocked(): Promise<Keyring> {
     try {
       const parsed = JSON.parse(await readFile(this.keyringPath, "utf8"));
       if (!parsed.current || !parsed.keys?.[parsed.current]) throw new Error("invalid audit keyring");
@@ -310,11 +341,12 @@ export class FileJobStore {
       for (const job of Object.values(state.jobs)) {
         if (job.status !== "running") continue;
         const attempts = Number(job.attempts ?? 0) + 1;
+        const canRetry = job.retrySafe === true && attempts < maxAttempts;
         state.jobs[job.id] = normalizeJob({
           ...job,
           attempts,
-          status: attempts >= maxAttempts ? "failed" : "queued",
-          error: attempts >= maxAttempts ? "worker crashed or gateway stopped during execution" : undefined,
+          status: canRetry ? "queued" : job.retrySafe === true ? "failed" : "needs-review",
+          error: canRetry ? undefined : "worker crashed or gateway stopped during execution; outcome requires operator review",
           recoveredAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
         });
@@ -394,6 +426,7 @@ function normalizeJob(job: JsonObject): Job {
     status: String(job.status ?? "queued"),
     payload: job.payload && typeof job.payload === "object" && !Array.isArray(job.payload) ? job.payload as JsonObject : {},
     requestHash: job.requestHash,
+    retrySafe: job.retrySafe === true,
     createdAt: typeof job.createdAt === "string" ? job.createdAt : new Date().toISOString(),
     updatedAt: typeof job.updatedAt === "string" ? job.updatedAt : new Date().toISOString(),
     startedAt: job.startedAt,

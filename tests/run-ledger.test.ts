@@ -42,12 +42,16 @@ test("Phase 0 blocks unknown tools with the most restrictive descriptor", async 
   const stateDir = join(root, ".odinn");
   const ledger = createRunLedger({ stateDir, workspaceRoot: root, featureFlags: normalizeExperimentalFlags({ counterfactual: true }) });
   try {
+    const blockedTask = { id: "run_phase0_unknown", tool: "untrusted.inject", input: { token: "secret" }, actor: "test" };
+    const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+    const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir });
     await assert.rejects(() => runTask({
-      task: { id: "run_phase0_unknown", tool: "untrusted.inject", input: { token: "secret" }, actor: "test" },
-      auditStore: createAuditStore(join(stateDir, "audit.jsonl")),
-      registry: createBuiltInRegistry({ workspaceRoot: root, stateDir }),
+      task: blockedTask,
+      auditStore,
+      registry,
       runLedger: ledger
     }), /unknown tool|capability is not allowed/);
+    await assert.rejects(() => runTask({ task: blockedTask, auditStore, registry, runLedger: ledger }), (error: any) => error.code === "IDEMPOTENCY_REUSE");
     const run = ledger.getRun("run_phase0_unknown");
     assert.equal(run.steps[0].status, "blocked");
     assert.equal(run.events.at(-1).type, "tool-result");

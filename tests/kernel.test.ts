@@ -38,6 +38,23 @@ test("kernel executes an allowed deterministic tool and audits the run", async (
   assert.equal(runs[0].eventCount, 3);
 });
 
+test("kernel binds completed run ids to the original tool, input, and actor", async () => {
+  const { auditStore, registry } = await fixture();
+  const task = { id: "run_idempotency_bound", tool: "text.echo", input: { text: "original" }, actor: "test" };
+  const first = await runTask({ task, auditStore, registry });
+  assert.equal(first.output.text, "original");
+  const replay = await runTask({ task, auditStore, registry });
+  assert.equal(replay.replayed, true);
+  await assert.rejects(
+    runTask({ task: { ...task, input: { text: "different" } }, auditStore, registry }),
+    (error: any) => error.code === "IDEMPOTENCY_CONFLICT"
+  );
+  await assert.rejects(
+    runTask({ task: { ...task, actor: "different-actor" }, auditStore, registry }),
+    (error: any) => error.code === "IDEMPOTENCY_CONFLICT"
+  );
+});
+
 test("security policy is safe by default and supports explicit posture changes", () => {
   const defaults = createDefaultPolicy();
   assert.equal(defaults.security.web.enabled, true);

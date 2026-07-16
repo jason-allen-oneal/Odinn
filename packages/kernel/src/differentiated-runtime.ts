@@ -177,13 +177,7 @@ export class ProofEngine {
   }
   async evaluate(assertion: AnyRecord, workspaceRoot: string): Promise<AnyRecord> {
     if (assertion.type === "command") {
-      const result = await runProcess(assertion.command, assertion.args ?? [], { cwd: workspaceRoot, timeoutMs: assertion.timeoutMs ?? 120_000 });
-      const expect = assertion.expect ?? {};
-      const output = `${result.stdout}${result.stderr}`;
-      const passed = result.code === (expect.exitCode ?? 0)
-        && (expect.contains ? output.includes(expect.contains) : true)
-        && (expect.excludes ? !output.includes(expect.excludes) : true);
-      return { status: passed ? "passed" : "failed", message: passed ? "command assertion passed" : `exit=${result.code}`, code: result.code, stdout: result.stdout, stderr: result.stderr };
+      throw new OdinnRuntimeError("POLICY_VIOLATION", "legacy Proof command assertions are disabled; use ProofVerifier with an operator-controlled exact command allowlist");
     }
     if (assertion.type === "file") {
       const path = safeExistingPath(workspaceRoot, assertion.path); const exists = existsSync(path); const expectExists = assertion.expect?.exists !== false;
@@ -415,12 +409,20 @@ export class CapsuleManager {
   }
 }
 
+async function copyWorkspaceTree(sourceRoot: string, destinationRoot: string) {
+  await mkdir(destinationRoot, { recursive: true });
+  for (const entry of await readdir(sourceRoot, { withFileTypes: true })) {
+    if ([".odinn", ".odinn-worktrees"].includes(entry.name)) continue;
+    await cp(join(sourceRoot, entry.name), join(destinationRoot, entry.name), { recursive: true });
+  }
+}
+
 export class CounterfactualManager {
   [key: string]: any;
   constructor({ ledger, stateDir, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.stateDir = resolve(stateDir ?? ".odinn"); this.featureFlags = featureFlags; }
   async create({ sourceRunId, sourceStepId, plans = [], workspaceRoot = process.cwd() }: AnyRecord = {}) {
     requireExperimental(this.featureFlags, "counterfactual"); if (!plans.length || plans.length > 4) throw new OdinnRuntimeError("BUDGET_EXCEEDED", "counterfactual plans must contain 1-4 candidates"); const groupId = `cf_${randomUUID()}`; this.ledger.database.db.prepare("INSERT INTO counterfactual_groups(id, source_run_id, status, created_at) VALUES (?, ?, 'created', ?)").run(groupId, sourceRunId, now()); const candidates = [];
-    for (const plan of plans) { if (!plan?.id || !plan.title || !plan.summary) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual plans require id, title, and summary"); const runId = `run_${randomUUID()}`; const branchRoot = join(dirname(resolve(workspaceRoot)), `.odinn-worktrees`, groupId, plan.id); mkdirSync(dirname(branchRoot), { recursive: true }); await cp(workspaceRoot, branchRoot, { recursive: true, filter: (source) => !source.includes(`${sep}.odinn${sep}`) }); this.ledger.ensureRun({ runId, parentRunId: sourceRunId, branchPointStepId: sourceStepId, objective: plan.summary, workspaceRoot: branchRoot }); this.ledger.database.db.prepare("INSERT INTO run_branches(id, source_run_id, source_step_id, child_run_id, label, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`branch_${randomUUID()}`, sourceRunId, sourceStepId, runId, plan.title, now()); this.ledger.database.db.prepare("INSERT INTO counterfactual_candidates(id, group_id, run_id, plan_json, status) VALUES (?, ?, ?, ?, 'created')").run(`candidate_${randomUUID()}`, groupId, runId, json(redact(plan))); candidates.push({ runId, plan, workspaceRoot: branchRoot }); }
+    for (const plan of plans) { if (!plan?.id || !plan.title || !plan.summary) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual plans require id, title, and summary"); const runId = `run_${randomUUID()}`; const sourceRoot = resolve(workspaceRoot); const branchRoot = join(sourceRoot, `.odinn-worktrees`, groupId, plan.id); await copyWorkspaceTree(sourceRoot, branchRoot); this.ledger.ensureRun({ runId, parentRunId: sourceRunId, branchPointStepId: sourceStepId, objective: plan.summary, workspaceRoot: branchRoot }); this.ledger.database.db.prepare("INSERT INTO run_branches(id, source_run_id, source_step_id, child_run_id, label, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`branch_${randomUUID()}`, sourceRunId, sourceStepId, runId, plan.title, now()); this.ledger.database.db.prepare("INSERT INTO counterfactual_candidates(id, group_id, run_id, plan_json, status) VALUES (?, ?, ?, ?, 'created')").run(`candidate_${randomUUID()}`, groupId, runId, json(redact(plan))); candidates.push({ runId, plan, workspaceRoot: branchRoot }); }
     this.ledger.appendEvent({ runId: sourceRunId, type: "branch-created", payload: { groupId, candidates: candidates.map((candidate) => ({ runId: candidate.runId, title: candidate.plan.title })) } }); return { groupId, candidates };
   }
   async execute(groupId: string, { executor, proof, capabilities, policy, workspaceRoot = this.ledger.workspaceRoot }: AnyRecord = {}) {
@@ -487,7 +489,9 @@ export class CounterfactualManager {
     if (!candidate) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual candidate not found");
     if (candidate.status !== "completed" && candidate.status !== "verified" && candidate.status !== "completed-unverified") throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "only a completed candidate can be selected", { status: candidate.status });
     const sourceRoot = resolve(candidate.source_root); const candidateRoot = resolve(candidate.candidate_root);
-    if (sourceRoot === candidateRoot || candidateRoot.startsWith(`${sourceRoot}${sep}`)) throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "candidate workspace must be isolated from source workspace");
+    const internalBranchRoot = join(sourceRoot, ".odinn-worktrees");
+    const authorizedInternalBranch = candidateRoot.startsWith(`${internalBranchRoot}${sep}`);
+    if (sourceRoot === candidateRoot || (candidateRoot.startsWith(`${sourceRoot}${sep}`) && !authorizedInternalBranch)) throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "candidate workspace is not an authorized isolated branch");
     const actions = [{ action: "replace-workspace", source: candidateRoot, destination: sourceRoot }];
     if (!apply) return { groupId, runId, applied: false, actions, warning: "dry-run; pass --apply to replace the source workspace" };
     const backup = join(this.stateDir, "worktrees", `${groupId}-${randomUUID()}`);

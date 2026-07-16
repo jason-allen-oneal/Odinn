@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { resolve, sep } from "node:path";
 import type { JsonObject } from "@odinn/protocol";
 
 export interface JobRecord {
@@ -10,6 +11,7 @@ export interface JobRecord {
   attempts: number;
   timeoutMs: number;
   requestHash?: string;
+  retrySafe?: boolean;
   result?: unknown;
   error?: string;
   createdAt?: string;
@@ -84,9 +86,9 @@ export class JobSupervisor {
 
   async submit(
     payload: JsonObject,
-    { id = `job_${randomUUID()}`, timeoutMs = this.defaultTimeoutMs, requestHash }: { id?: string; timeoutMs?: number; requestHash?: string } = {}
+    { id = `job_${randomUUID()}`, timeoutMs = this.defaultTimeoutMs, requestHash, retrySafe = false }: { id?: string; timeoutMs?: number; requestHash?: string; retrySafe?: boolean } = {}
   ): Promise<JobRecord> {
-    const job = await this.store.create({ id, payload, requestHash, status: "queued", timeoutMs });
+    const job = await this.store.create({ id, payload, requestHash, retrySafe, status: "queued", timeoutMs });
     await this.drain();
     return job;
   }
@@ -94,7 +96,7 @@ export class JobSupervisor {
   async cancel(id: string): Promise<JobRecord> {
     const job = await this.store.get(id);
     if (!job) throw new Error(`job not found: ${id}`);
-    if (["completed", "failed", "cancelled"].includes(job.status)) return job;
+    if (["completed", "failed", "cancelled", "needs-review"].includes(job.status)) return job;
     const running = this.active.get(id);
     if (running) {
       running.controller.abort(new Error("job cancelled by user"));
@@ -143,12 +145,13 @@ export class JobSupervisor {
         const reason = controller.signal.reason;
         const cancelled = controller.signal.aborted && reason instanceof Error && reason.message.includes("cancel");
         const message = errorMessage(error);
+        const unknownOutcome = !job.retrySafe && (controller.signal.aborted || /worker exited unexpectedly|gateway stopped during execution/i.test(message));
         await this.store.update(job.id, {
-          status: cancelled ? "cancelled" : "failed",
+          status: cancelled ? "cancelled" : unknownOutcome ? "needs-review" : "failed",
           completedAt: new Date().toISOString(),
           error: message
         });
-        if (!this.stopping && !cancelled && current && current.attempts < this.maxAttempts) {
+        if (!this.stopping && !cancelled && job.retrySafe === true && current && current.attempts < this.maxAttempts) {
           await this.store.update(job.id, { status: "queued", completedAt: undefined, error: message });
         }
       } finally {
@@ -194,12 +197,16 @@ function isWorkerResponse(message: unknown): message is WorkerResponse {
 
 export function createIsolatedTaskExecutor(options: WorkerConfiguration = {}): TaskExecutor {
   const { stateDir, workspaceRoot, config, policy } = options;
+  const authoritativeRoot = resolve(workspaceRoot ?? process.cwd());
   const workerPath = fileURLToPath(new URL("./task-worker.ts", import.meta.url));
   const browserWorkerPath = fileURLToPath(new URL("./browser-worker.ts", import.meta.url));
-  const browserExecutor = createPersistentWorkerExecutor({ workerPath: browserWorkerPath, stateDir, workspaceRoot, config, policy });
+  const browserExecutor = createPersistentWorkerExecutor({ workerPath: browserWorkerPath, stateDir, workspaceRoot: authoritativeRoot, config, policy });
   const children = new Set<ChildProcess>();
   const execute = ((payload: WorkerPayload, { signal }: ExecutorOptions = {}) => {
-    const taskWorkspaceRoot = payload.workspaceRoot || workspaceRoot;
+    const taskWorkspaceRoot = resolve(payload.workspaceRoot || authoritativeRoot);
+    if (taskWorkspaceRoot !== authoritativeRoot && !taskWorkspaceRoot.startsWith(`${authoritativeRoot}${sep}`)) {
+      return Promise.reject(new Error("task workspaceRoot must remain inside the gateway workspace"));
+    }
     if (String(payload.task?.tool || "").startsWith("browser.")) {
       return browserExecutor({ ...payload, workspaceRoot: taskWorkspaceRoot }, { signal });
     }

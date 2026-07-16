@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -94,6 +94,36 @@ test("counterfactual candidates receive isolated workspaces", async () => {
     assert.equal(runtime.counterfactual.compare(group.groupId).candidates.length, 2);
     await writeFile(join(group.candidates[0].workspaceRoot, "only-a.txt"), "a\n");
     await assert.rejects(readFile(join(group.candidates[1].workspaceRoot, "only-a.txt"), "utf8"), { code: "ENOENT" });
+  } finally { runtime.ledger.close(); }
+});
+
+test("counterfactual execution runs real audited tasks and supports selection preview", async () => {
+  const { root, state, runtime } = await fixture();
+  const auditStore = createAuditStore(join(state, "audit.jsonl"));
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state, auditStore });
+  try {
+    runtime.ledger.ensureRun({ runId: "run-source-execute", objective: "branch execution" });
+    await writeFile(join(root, "candidate-only.txt"), "before\n");
+    const plans = ["a", "b"].map((id) => ({
+      id,
+      title: id.toUpperCase(),
+      summary: `execute ${id}`,
+      tasks: [{ tool: "workspace.readText", readOnly: true, input: { path: "candidate-only.txt" } }]
+    }));
+    const group = await runtime.counterfactual.create({ sourceRunId: "run-source-execute", sourceStepId: "step-1", workspaceRoot: root, plans });
+    await rm(join(root, "candidate-only.txt"), { force: true });
+    const execution = await runtime.counterfactual.execute(group.groupId, {
+      policy: createDefaultPolicy(),
+      proof: runtime.proof,
+      capabilities: runtime.capabilities,
+      executor: (task, context) => runTask({ task, auditStore, policy: context.policy, registry: createBuiltInRegistry({ workspaceRoot: context.workspaceRoot, stateDir: state, auditStore }), runLedger: runtime.ledger })
+    });
+    assert.deepEqual(execution.results.map((result) => result.status), ["completed-unverified", "completed-unverified"]);
+    assert.deepEqual(execution.results.flatMap((result) => result.tasks.map((task) => task.output?.content)), ["before\n", "before\n"]);
+    const preview = await runtime.counterfactual.select(group.groupId, group.candidates[0].runId);
+    assert.equal(preview.applied, false);
+    assert.match(preview.warning, /--apply/);
+    assert.equal(runtime.counterfactual.compare(group.groupId).candidates.filter((candidate) => candidate.status === "completed").length, 2);
   } finally { runtime.ledger.close(); }
 });
 

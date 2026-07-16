@@ -114,7 +114,8 @@ export function createIsolatedTaskExecutor({ stateDir, workspaceRoot, config, po
   });
   const children = new Set();
   const execute = (payload, { signal } = {}) => {
-    if (String(payload?.task?.tool || "").startsWith("browser.")) return browserExecutor(payload, { signal });
+    const taskWorkspaceRoot = payload?.workspaceRoot || workspaceRoot;
+    if (String(payload?.task?.tool || "").startsWith("browser.")) return browserExecutor({ ...payload, workspaceRoot: taskWorkspaceRoot }, { signal });
     return new Promise((resolve, reject) => {
     const child = fork(workerPath, [], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
     children.add(child);
@@ -142,7 +143,7 @@ export function createIsolatedTaskExecutor({ stateDir, workspaceRoot, config, po
       if (!settled) finish(new Error(`isolated task worker exited unexpectedly: ${code ?? exitSignal}`));
     });
     signal?.addEventListener("abort", abort, { once: true });
-    child.send({ payload, stateDir, workspaceRoot, config, policy });
+    child.send({ payload, stateDir, workspaceRoot: taskWorkspaceRoot, config, policy });
     });
   };
   execute.shutdown = async () => {

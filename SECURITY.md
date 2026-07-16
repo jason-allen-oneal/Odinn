@@ -71,7 +71,7 @@ Proof is evidence-based: model text cannot set `verified`. Sentinel decisions ar
 
 ### Known beta gaps
 
-The release ledger intentionally leaves these items open: failed-action/tab-loss browser recovery, audit-journal key rotation, native installers and application upgrade rollback, immutable content-addressed extension versions, automatic counterfactual candidate execution, full capsule replay, complete integration of experimental policy/capability checks into every external tool adapter, and remote or multi-user hosting. The source archives have cross-platform extraction/install smoke, but that is not proof of a native installer or rollback-safe upgrade. Keep Ódinn loopback-only and single-user until those boundaries are designed and tested.
+The release ledger intentionally leaves these items open: failed-action/tab-loss browser recovery, native installers and application upgrade rollback, immutable content-addressed extension versions, full capsule replay, complete integration of experimental policy/capability checks into every external tool adapter, and remote or multi-user hosting. Audit journals now support rotating HMAC keys while retaining retired keys for verification. The source archives have cross-platform extraction/install smoke, but that is not proof of a native installer or rollback-safe upgrade. Keep Ódinn loopback-only and single-user until those boundaries are designed and tested.
 
 ## CI security gates
 

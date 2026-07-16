@@ -353,13 +353,13 @@ export class RunLedger {
     this.featureFlags = { ...featureFlags };
   }
 
-  ensureRun({ runId, objective, modelId = "", providerId = "", parentRunId, branchPointStepId } = {}) {
+  ensureRun({ runId, objective, modelId = "", providerId = "", parentRunId, branchPointStepId, workspaceRoot = this.workspaceRoot } = {}) {
     if (!runId) throw new Error("RunLedger requires runId");
     const now = new Date().toISOString();
     this.database.db.prepare(`INSERT OR IGNORE INTO runs
       (id, parent_run_id, branch_point_step_id, status, objective, model_id, provider_id, workspace_root, feature_flags_json, created_at)
       VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?)`)
-      .run(runId, parentRunId ?? null, branchPointStepId ?? null, String(objective ?? ""), String(modelId), String(providerId), this.workspaceRoot, JSON.stringify(this.featureFlags), now);
+      .run(runId, parentRunId ?? null, branchPointStepId ?? null, String(objective ?? ""), String(modelId), String(providerId), resolve(workspaceRoot), JSON.stringify(this.featureFlags), now);
     return runId;
   }
 

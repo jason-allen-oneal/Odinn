@@ -349,8 +349,100 @@ export class CounterfactualManager {
     for (const plan of plans) { if (!plan?.id || !plan.title || !plan.summary) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual plans require id, title, and summary"); const runId = `run_${randomUUID()}`; const branchRoot = join(dirname(resolve(workspaceRoot)), `.odinn-worktrees`, groupId, plan.id); mkdirSync(dirname(branchRoot), { recursive: true }); await cp(workspaceRoot, branchRoot, { recursive: true, filter: (source) => !source.includes(`${sep}.odinn${sep}`) }); this.ledger.ensureRun({ runId, parentRunId: sourceRunId, branchPointStepId: sourceStepId, objective: plan.summary, workspaceRoot: branchRoot }); this.ledger.database.db.prepare("INSERT INTO run_branches(id, source_run_id, source_step_id, child_run_id, label, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`branch_${randomUUID()}`, sourceRunId, sourceStepId, runId, plan.title, now()); this.ledger.database.db.prepare("INSERT INTO counterfactual_candidates(id, group_id, run_id, plan_json, status) VALUES (?, ?, ?, ?, 'created')").run(`candidate_${randomUUID()}`, groupId, runId, json(redact(plan))); candidates.push({ runId, plan, workspaceRoot: branchRoot }); }
     this.ledger.appendEvent({ runId: sourceRunId, type: "branch-created", payload: { groupId, candidates: candidates.map((candidate) => ({ runId: candidate.runId, title: candidate.plan.title })) } }); return { groupId, candidates };
   }
-  compare(groupId) { requireExperimental(this.featureFlags, "counterfactual"); const rows = this.ledger.database.db.prepare("SELECT c.*, r.status, r.workspace_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id WHERE c.group_id = ? ORDER BY c.id").all(groupId); return { groupId, candidates: rows.map((row) => ({ ...row, plan: parse(row.plan_json), proof: this.ledger.database.db.prepare("SELECT status, COUNT(*) count FROM assertion_results WHERE run_id = ? GROUP BY status").all(row.run_id) })) }; }
-  select(groupId, runId) { requireExperimental(this.featureFlags, "counterfactual"); const candidate = this.ledger.database.db.prepare("SELECT * FROM counterfactual_candidates WHERE group_id = ? AND run_id = ?").get(groupId, runId); if (!candidate) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual candidate not found"); this.ledger.database.db.prepare("UPDATE counterfactual_candidates SET status = CASE WHEN run_id = ? THEN 'selected' ELSE 'discarded' END, selected_at = CASE WHEN run_id = ? THEN ? ELSE selected_at END WHERE group_id = ?").run(runId, runId, now(), groupId); this.ledger.database.db.prepare("UPDATE counterfactual_groups SET status = 'selected' WHERE id = ?").run(groupId); return { groupId, runId, selected: true }; }
+  async execute(groupId, { executor, proof, capabilities, policy, workspaceRoot = this.ledger.workspaceRoot } = {}) {
+    requireExperimental(this.featureFlags, "counterfactual");
+    if (typeof executor !== "function") throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual execution requires an executor");
+    const rows = this.ledger.database.db.prepare("SELECT c.*, r.workspace_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id WHERE c.group_id = ? ORDER BY c.id").all(groupId);
+    if (!rows.length) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual group not found");
+    const results = [];
+    for (const row of rows) {
+      const plan = parse(row.plan_json, {});
+      const startedAt = now();
+      this.ledger.database.db.prepare("UPDATE counterfactual_candidates SET status = 'executing' WHERE run_id = ?").run(row.run_id);
+      this.ledger.database.db.prepare("UPDATE runs SET status = 'executing', started_at = ? WHERE id = ?").run(startedAt, row.run_id);
+      this.ledger.appendEvent({ runId: row.run_id, type: "counterfactual-started", payload: { groupId, planId: plan.id } });
+      const taskResults = [];
+      try {
+        if (!Array.isArray(plan.tasks) || plan.tasks.length === 0 || plan.tasks.length > 32) {
+          throw new OdinnRuntimeError("CAPSULE_INVALID", `counterfactual plan ${plan.id} must contain 1-32 executable tasks`);
+        }
+        for (let index = 0; index < plan.tasks.length; index += 1) {
+          const task = plan.tasks[index];
+          const taskId = `${row.run_id}:task:${index + 1}`;
+          if (!task || typeof task.tool !== "string" || !task.tool) throw new OdinnRuntimeError("CAPSULE_INVALID", `counterfactual plan ${plan.id} task ${index} requires a tool`);
+          this.ledger.ensureRun({ runId: taskId, parentRunId: row.run_id, objective: task.reason ?? `counterfactual task ${index + 1}`, workspaceRoot: row.workspace_root });
+          const executableTask = { ...task, input: { ...(task.input ?? {}) } };
+          if (task.readOnly === true && capabilities && this.featureFlags.capabilities === true && !executableTask.input.capabilityToken) {
+            const issued = capabilities.issue({ runId: taskId, stepId: taskId, toolName: task.tool, scopes: ["read"], expiresInMs: 300_000, maxUses: 1 });
+            executableTask.input.capabilityToken = issued.token;
+          }
+          const result = await executor({
+            ...executableTask,
+            id: taskId,
+            actor: "counterfactual",
+            reason: `counterfactual:${groupId}:${plan.id}`
+          }, { workspaceRoot: row.workspace_root, policy });
+          taskResults.push(redact(result));
+        }
+        let proofResult;
+        if (plan.contract) {
+          if (!proof) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual plan includes a contract but no proof engine was supplied");
+          const contract = { ...plan.contract, runId: row.run_id };
+          proofResult = await proof.run(row.run_id, contract, { workspaceRoot: row.workspace_root });
+          if (proofResult.status === "failed") throw new OdinnRuntimeError("VERIFICATION_FAILED", `counterfactual plan ${plan.id} failed Proof verification`, { proof: proofResult });
+        }
+        this.ledger.database.db.prepare("UPDATE counterfactual_candidates SET status = 'completed' WHERE run_id = ?").run(row.run_id);
+        this.ledger.database.db.prepare("UPDATE runs SET status = ?, completed_at = ? WHERE id = ?").run(proofResult?.status ?? "completed-unverified", now(), row.run_id);
+        this.ledger.appendEvent({ runId: row.run_id, type: "counterfactual-completed", payload: { groupId, planId: plan.id, proof: proofResult?.status, taskCount: taskResults.length } });
+        results.push({ runId: row.run_id, planId: plan.id, status: proofResult?.status ?? "completed-unverified", tasks: taskResults, proof: proofResult });
+      } catch (error) {
+        this.ledger.database.db.prepare("UPDATE counterfactual_candidates SET status = 'failed' WHERE run_id = ?").run(row.run_id);
+        this.ledger.database.db.prepare("UPDATE runs SET status = 'failed', completed_at = ? WHERE id = ?").run(now(), row.run_id);
+        this.ledger.appendEvent({ runId: row.run_id, type: "counterfactual-failed", payload: { groupId, planId: plan.id, code: error.code ?? "RUNTIME_ERROR", message: error.message } });
+        results.push({ runId: row.run_id, planId: plan.id, status: "failed", error: { code: error.code ?? "RUNTIME_ERROR", message: error.message } });
+      }
+    }
+    this.ledger.database.db.prepare("UPDATE counterfactual_groups SET status = 'executed' WHERE id = ?").run(groupId);
+    return { groupId, results };
+  }
+  compare(groupId) { requireExperimental(this.featureFlags, "counterfactual"); const rows = this.ledger.database.db.prepare("SELECT c.*, c.status AS candidate_status, r.status AS run_status, r.workspace_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id WHERE c.group_id = ? ORDER BY c.id").all(groupId); return { groupId, candidates: rows.map((row) => ({ ...row, status: row.candidate_status, runStatus: row.run_status, plan: parse(row.plan_json), proof: this.ledger.database.db.prepare("SELECT status, COUNT(*) count FROM assertion_results WHERE run_id = ? GROUP BY status").all(row.run_id) })) }; }
+  async commit(groupId, runId, { apply = false } = {}) {
+    requireExperimental(this.featureFlags, "counterfactual");
+    const candidate = this.ledger.database.db.prepare("SELECT c.*, r.workspace_root AS candidate_root, parent.workspace_root AS source_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id JOIN runs parent ON parent.id = (SELECT source_run_id FROM counterfactual_groups WHERE id = c.group_id) WHERE c.group_id = ? AND c.run_id = ?").get(groupId, runId);
+    if (!candidate) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual candidate not found");
+    if (candidate.status !== "completed" && candidate.status !== "verified" && candidate.status !== "completed-unverified") throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "only a completed candidate can be selected", { status: candidate.status });
+    const sourceRoot = resolve(candidate.source_root); const candidateRoot = resolve(candidate.candidate_root);
+    if (sourceRoot === candidateRoot || candidateRoot.startsWith(`${sourceRoot}${sep}`)) throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "candidate workspace must be isolated from source workspace");
+    const actions = [{ action: "replace-workspace", source: candidateRoot, destination: sourceRoot }];
+    if (!apply) return { groupId, runId, applied: false, actions, warning: "dry-run; pass --apply to replace the source workspace" };
+    const backup = join(this.stateDir, "worktrees", `${groupId}-${randomUUID()}`);
+    await cp(sourceRoot, backup, { recursive: true, filter: (source) => !source.includes(`${sep}.odinn${sep}`) && !source.endsWith(`${sep}.odinn`) });
+    try {
+      await syncWorkspace(candidateRoot, sourceRoot);
+      this.ledger.database.db.prepare("UPDATE counterfactual_candidates SET status = CASE WHEN run_id = ? THEN 'selected' ELSE 'discarded' END, selected_at = CASE WHEN run_id = ? THEN ? ELSE selected_at END WHERE group_id = ?").run(runId, runId, now(), groupId);
+      this.ledger.database.db.prepare("UPDATE counterfactual_groups SET status = 'selected' WHERE id = ?").run(groupId);
+      const sourceRunId = this.ledger.database.db.prepare("SELECT source_run_id FROM counterfactual_groups WHERE id = ?").get(groupId)?.source_run_id;
+      if (sourceRunId) this.ledger.appendEvent({ runId: sourceRunId, type: "branch-selected", payload: { groupId, runId, sourceRoot } });
+      return { groupId, runId, applied: true, actions };
+    } catch (error) {
+      await syncWorkspace(backup, sourceRoot).catch(() => undefined);
+      throw new OdinnRuntimeError("WORKSPACE_CONFLICT", `selected branch could not be applied: ${error.message}`, { groupId, runId });
+    } finally { await rm(backup, { recursive: true, force: true }); }
+  }
+  async select(groupId, runId, options = {}) { const result = await this.commit(groupId, runId, options); if (!result.applied) return result; return { ...result, selected: true }; }
+}
+
+async function syncWorkspace(source, destination) {
+  const excluded = new Set([".odinn", ".git", ".odinn-worktrees"]);
+  const sourceEntries = new Set((await readdir(source, { withFileTypes: true })).filter((entry) => !excluded.has(entry.name)).map((entry) => entry.name));
+  for (const entry of await readdir(destination, { withFileTypes: true })) {
+    if (excluded.has(entry.name) || sourceEntries.has(entry.name)) continue;
+    await rm(join(destination, entry.name), { recursive: true, force: true });
+  }
+  for (const name of sourceEntries) {
+    await rm(join(destination, name), { recursive: true, force: true });
+    await cp(join(source, name), join(destination, name), { recursive: true, preserveTimestamps: true });
+  }
 }
 
 export function createDifferentiatedRuntime({ stateDir = ".odinn", workspaceRoot = process.cwd(), featureFlags = {} } = {}) {

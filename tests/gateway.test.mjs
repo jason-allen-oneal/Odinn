@@ -158,9 +158,11 @@ test("gateway closes and reopens the persistent browser profile cleanly", async 
   const first = await createGatewayServer({ stateDir, workspaceRoot: root });
   await new Promise((resolve) => first.listen(0, "127.0.0.1", resolve));
   const firstBase = `http://127.0.0.1:${first.address().port}`;
+  let stableTabId;
   try {
-    const tabs = await postJson(`${firstBase}/run`, { tool: "browser.tabs", input: {} });
-    assert.equal(tabs.ok, true);
+    const opened = await postJson(`${firstBase}/run`, { tool: "browser.open", input: { url: "https://example.com" } });
+    assert.equal(opened.ok, true);
+    stableTabId = opened.output.id;
   } finally {
     await new Promise((resolve, reject) => first.close((error) => error ? reject(error) : resolve()));
   }
@@ -173,7 +175,7 @@ test("gateway closes and reopens the persistent browser profile cleanly", async 
     assert.equal(tabs.ok, true);
     const snapshot = await postJson(`${secondBase}/run`, {
       tool: "browser.snapshot",
-      input: { tabId: tabs.output.tabs[0].id }
+      input: { tabId: stableTabId }
     });
     assert.equal(snapshot.ok, true);
   } finally {

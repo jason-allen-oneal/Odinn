@@ -155,13 +155,24 @@ export async function createGatewayServer({
         return json(response, 200, await runtime.counterfactual.create({ ...body, workspaceRoot: body.workspaceRoot ?? workspaceRoot }));
       }
       if (request.method === "GET" && url.pathname.startsWith("/counterfactual/")) {
+        if (url.pathname.endsWith("/execute")) return json(response, 405, { ok: false, error: "counterfactual execute requires POST" });
         const groupId = decodeURIComponent(url.pathname.slice("/counterfactual/".length));
         return json(response, 200, runtime.counterfactual.compare(groupId));
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/counterfactual/") && url.pathname.endsWith("/execute")) {
+        const groupId = decodeURIComponent(url.pathname.slice("/counterfactual/".length, -"/execute".length));
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, await runtime.counterfactual.execute(groupId, {
+          capabilities: runtime.capabilities,
+          proof: runtime.proof,
+          policy,
+          executor: (task, context) => isolatedTaskExecutor({ task, workspaceRoot: context.workspaceRoot })
+        }));
       }
       if (request.method === "POST" && url.pathname.startsWith("/counterfactual/") && url.pathname.endsWith("/select")) {
         const groupId = decodeURIComponent(url.pathname.slice("/counterfactual/".length, -"/select".length));
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        return json(response, 200, runtime.counterfactual.select(groupId, body.runId));
+        return json(response, 200, await runtime.counterfactual.select(groupId, body.runId, { apply: body.apply === true }));
       }
       if (request.method === "POST" && url.pathname === "/routing/observe") {
         return json(response, 200, runtime.darwin.observe(await readJson(request, { maxBytes: requestMaxBytes })));

@@ -135,6 +135,9 @@ function usage() {
   odinn config model default <provider:model> [--state .odinn]
   odinn config model list [--state .odinn]
   odinn status [--state .odinn]
+  odinn audit [--state .odinn]
+  odinn audit verify [--allow-unsigned] [--state .odinn]
+  odinn audit rotate-key [--state .odinn]
   odinn tui [--state .odinn] [--watch]
   odinn run --tool <tool> [--input-json <json>] [--input-file <json-file>] [--state .odinn]
   odinn run show <run-id> [--state .odinn]
@@ -156,9 +159,9 @@ function usage() {
   odinn compare <group-id> [--state .odinn]
   odinn capsule export <run-id> --output <run.odinn> [--state .odinn]
   odinn capsule inspect|verify|replay <run.odinn> [--mode verification-only|tool-mocked|full] [--state .odinn]
-  odinn counterfactual run --source-run <run-id> --from <step-id> --plan-file <plan.json> [--plan-file <plan.json>] [--state .odinn]
+  odinn counterfactual run --source-run <run-id> --from <step-id> --plan-file <plan.json> [--plan-file <plan.json>] [--execute] [--state .odinn]
   odinn counterfactual compare <group-id> [--state .odinn]
-  odinn counterfactual select <group-id> --run <run-id> [--state .odinn]
+  odinn counterfactual select <group-id> --run <run-id> [--apply] [--state .odinn]
   odinn routing observe --run <run-id> --provider <id> --model <id> --task-class <class> --verified true|false [--state .odinn]
   odinn routing stats [--task-class <class>] [--state .odinn]
   odinn routing choose --task-class <class> [--state .odinn]
@@ -1544,9 +1547,25 @@ async function capsuleCommand(args) {
 
 async function counterfactualCommand(args) {
   const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); try {
-    if (subcommand === "run") { const files = []; for (let i = 0; i < rest.length; i += 1) if (rest[i] === "--plan-file") files.push(rest[i + 1]); await printJson(await runtime.counterfactual.create({ sourceRunId: option(rest, "--source-run"), sourceStepId: option(rest, "--from"), plans: await Promise.all(files.map(async (file) => parseStructuredDocument(await readFile(resolveInvocationPath(file), "utf8"), file))), workspaceRoot: invocationRoot() })); return; }
+    if (subcommand === "run") {
+      const files = []; for (let i = 0; i < rest.length; i += 1) if (rest[i] === "--plan-file") files.push(rest[i + 1]);
+      const created = await runtime.counterfactual.create({ sourceRunId: option(rest, "--source-run"), sourceStepId: option(rest, "--from"), plans: await Promise.all(files.map(async (file) => parseStructuredDocument(await readFile(resolveInvocationPath(file), "utf8"), file))), workspaceRoot: invocationRoot() });
+      if (!hasFlag(rest, "--execute")) { await printJson(created); return; }
+      const config = await readConfig(stateDir(rest));
+      const auditStore = createAuditStore(join(stateDir(rest), config.auditLog ?? "audit.jsonl"));
+      const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: stateDir(rest), config, auditStore });
+      const result = await runtime.counterfactual.execute(created.groupId, {
+        proof: runtime.proof,
+        capabilities: runtime.capabilities,
+        policy: createDefaultPolicy(config.policy),
+        workspaceRoot: invocationRoot(),
+        executor: async (task, context) => runTask({ task, auditStore, policy: context.policy, registry: createBuiltInRegistry({ workspaceRoot: context.workspaceRoot, stateDir: stateDir(rest), config, auditStore }), runLedger: runtime.ledger })
+      });
+      await printJson({ ...created, execution: result });
+      return;
+    }
     if (subcommand === "compare") { await printJson(runtime.counterfactual.compare(rest[0])); return; }
-    if (subcommand === "select") { await printJson(runtime.counterfactual.select(rest[0], option(rest, "--run"))); return; }
+    if (subcommand === "select") { await printJson(await runtime.counterfactual.select(rest[0], option(rest, "--run"), { apply: hasFlag(rest, "--apply") })); return; }
     throw new Error("counterfactual requires run, compare, or select");
   } finally { runtime.ledger.close(); }
 }
@@ -1564,6 +1583,15 @@ async function audit(args) {
   const state = stateDir(args);
   const config = await readConfig(state);
   const store = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+  const subcommand = args.find((value) => !value.startsWith("--"));
+  if (subcommand === "verify") {
+    await printJson(await store.verifyIntegrity({ allowUnsigned: hasFlag(args, "--allow-unsigned") }));
+    return;
+  }
+  if (subcommand === "rotate-key") {
+    await printJson(await store.rotateKey());
+    return;
+  }
   await printJson(await store.readAll());
 }
 

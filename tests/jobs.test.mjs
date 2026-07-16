@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { JobSupervisor } from "../packages/kernel/src/jobs.mjs";
-import { FileJobStore } from "../packages/store-file/src/index.mjs";
+import { FileAuditStore, FileJobStore } from "../packages/store-file/src/index.mjs";
 
 async function waitFor(check) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -92,4 +92,21 @@ test("file stores expose explicit corruption recovery without hiding the damaged
   const recovered = await store.recoverCorruption();
   assert.equal(recovered.recovered, true);
   assert.deepEqual(await store.list(), []);
+});
+
+test("audit journals rotate keys and verify signed records across retired keys", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-audit-keys-"));
+  const path = join(root, "audit.jsonl");
+  const store = new FileAuditStore(path);
+  await store.append({ runId: "run-a", type: "task.started", data: { message: "before rotation" } });
+  const rotation = await store.rotateKey();
+  await store.append({ runId: "run-b", type: "task.completed", data: { message: "after rotation" } });
+  const verified = await store.verifyIntegrity({ allowUnsigned: false });
+  assert.equal(verified.valid, true);
+  assert.equal(verified.retiredKeyIds.length, 1);
+  const content = await readFile(path, "utf8");
+  await writeFile(path, content.replace("after rotation", "tampered"));
+  const tampered = await store.verifyIntegrity({ allowUnsigned: false });
+  assert.equal(tampered.valid, false);
+  assert.equal(rotation.retiredKeyIds.length, 1);
 });

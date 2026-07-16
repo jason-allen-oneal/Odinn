@@ -1,3 +1,4 @@
+import { createHmac, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile, copyFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { normalizeAuditEvent } from "@odinn/protocol";
@@ -29,14 +30,26 @@ export class FileAuditStore {
   constructor(path) {
     if (!path) throw new Error("FileAuditStore requires a path");
     this.path = path;
+    this.keyringPath = `${path}.keys.json`;
+    this.writeChain = Promise.resolve();
   }
 
   async append(event) {
-    const normalized = normalizeAuditEvent(event);
-    await ensureSecureStateDirectory(dirname(this.path));
-    await writeFile(this.path, `${JSON.stringify(normalized)}\n`, { flag: "a" });
-    await secureStoreFile(this.path);
-    return normalized;
+    const operation = this.writeChain.then(async () => {
+      const normalized = normalizeAuditEvent(event);
+      const keyring = await this.readKeyring();
+      const previous = await this.lastIntegrity();
+      const unsigned = { ...normalized, data: { ...(normalized.data ?? {}) } };
+      delete unsigned.data.__odinnIntegrity;
+      const signature = createHmac("sha256", Buffer.from(keyring.keys[keyring.current], "base64")).update(JSON.stringify({ event: unsigned, previous })).digest("base64url");
+      const signed = { ...normalized, data: { ...(normalized.data ?? {}), __odinnIntegrity: { keyId: keyring.current, previous, signature } } };
+      await ensureSecureStateDirectory(dirname(this.path));
+      await writeFile(this.path, `${JSON.stringify(signed)}\n`, { flag: "a" });
+      await secureStoreFile(this.path);
+      return signed;
+    });
+    this.writeChain = operation.catch(() => undefined);
+    return operation;
   }
 
   async readAll() {
@@ -59,6 +72,61 @@ export class FileAuditStore {
 
   async recover() {
     return recoverJsonLines(this.path, (record) => normalizeAuditEvent(record));
+  }
+
+  async rotateKey() {
+    const operation = this.writeChain.then(async () => {
+      const keyring = await this.readKeyring();
+      const keyId = `key_${randomUUID()}`;
+      keyring.keys[keyId] = Buffer.from(randomUUID().replaceAll("-", ""), "hex").toString("base64");
+      keyring.current = keyId;
+      await ensureSecureStateDirectory(dirname(this.keyringPath));
+      await writeFile(this.keyringPath, `${JSON.stringify(keyring, null, 2)}\n`, { mode: 0o600 });
+      await chmod(this.keyringPath, 0o600);
+      return { keyId, retiredKeyIds: Object.keys(keyring.keys).filter((id) => id !== keyId) };
+    });
+    this.writeChain = operation.catch(() => undefined);
+    return operation;
+  }
+
+  async verifyIntegrity({ allowUnsigned = true } = {}) {
+    const events = await this.readAll();
+    const keyring = await this.readKeyring();
+    let previous = null;
+    const failures = [];
+    let unsigned = 0;
+    for (const event of events) {
+      const integrity = event.data?.__odinnIntegrity;
+      if (!integrity) { unsigned += 1; if (!allowUnsigned) failures.push({ runId: event.runId, reason: "unsigned event" }); previous = null; continue; }
+      const secret = keyring.keys[integrity.keyId];
+      const unsignedEvent = { ...event, data: { ...(event.data ?? {}) } };
+      delete unsignedEvent.data.__odinnIntegrity;
+      const expected = secret && createHmac("sha256", Buffer.from(secret, "base64")).update(JSON.stringify({ event: unsignedEvent, previous: integrity.previous })).digest("base64url");
+      if (!secret || integrity.previous !== previous || expected !== integrity.signature) failures.push({ runId: event.runId, reason: "audit integrity mismatch" });
+      previous = integrity.signature;
+    }
+    return { valid: failures.length === 0, events: events.length, unsigned, failures, currentKeyId: keyring.current, retiredKeyIds: Object.keys(keyring.keys).filter((id) => id !== keyring.current) };
+  }
+
+  async readKeyring() {
+    try {
+      const parsed = JSON.parse(await readFile(this.keyringPath, "utf8"));
+      if (!parsed.current || !parsed.keys?.[parsed.current]) throw new Error("invalid audit keyring");
+      return parsed;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      const keyId = `key_${randomUUID()}`;
+      const keyring = { schemaVersion: 1, current: keyId, keys: { [keyId]: Buffer.from(randomUUID().replaceAll("-", ""), "hex").toString("base64") } };
+      await ensureSecureStateDirectory(dirname(this.keyringPath));
+      await writeFile(this.keyringPath, `${JSON.stringify(keyring, null, 2)}\n`, { mode: 0o600 });
+      await chmod(this.keyringPath, 0o600);
+      return keyring;
+    }
+  }
+
+  async lastIntegrity() {
+    const events = await this.readAll();
+    return events.reverse().find((event) => event.data?.__odinnIntegrity)?.data.__odinnIntegrity.signature ?? null;
   }
 
   async readRuns() {

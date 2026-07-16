@@ -15,7 +15,7 @@ This is the release ledger for the first local, single-user Ódinn beta. A check
 - [x] Browser approval gate, domain/private-network policy, input redaction, and stale snapshot checks when an action is based on a snapshot.
 - [x] Durable approval transactions survive restart and duplicate approval claims idempotently; the persistent browser worker reopens its profile after gateway restart and cleans up without orphan workers. Full failed-action/tab-loss recovery remains open.
 - [x] Store schema versions, atomic job writes, explicit corruption recovery, owner-only state permissions, atomic replacement restore, and persisted task output for replay.
-- [ ] Audit-journal key rotation. The nightly `storage:drill` now exercises backup, restore, and corruption recovery; key rotation remains open.
+- [x] Audit-journal key rotation. Signed journal records retain retired verification keys; `odinn audit rotate-key` rotates the active key and `odinn audit verify` validates the signed chain. Legacy unsigned records are reported and can be rejected without silently rewriting history.
 - [x] Packaged gateway/provider smoke, onboarding smoke, checksums, SBOM/provenance workflow hooks, and cross-platform package tests.
 - [ ] Native installers and upgrade rollback testing on clean machines. Source archive extraction, dependency installation, onboarding, and CLI execution are now covered by `release:install-smoke`; native installers and upgrade rollback remain open.
 - [x] Structured audit events, run timelines, persisted output, replay endpoint, provider failure tests, and failure categorization for task lifecycle.
@@ -29,7 +29,7 @@ These are implemented as local vertical slices and remain disabled by default:
 - [x] Capability tokens with local signing keys, expiry, run/step/tool binding, resource constraints, revocation, and one-use enforcement.
 - [x] Rewind snapshots with content-addressed file artifacts, dry-run previews, symlink rejection, and actual local restoration.
 - [x] Capsules with redaction, ZIP path validation, checksums, verification-only replay metadata, and tamper detection.
-- [ ] Counterfactual workspace copies with independent runs, branch relationships, candidate comparison, and selection records. Automatic candidate execution, shared Proof runs, and selected-branch commit remain open.
+- [x] Counterfactual workspace copies with independent runs, bounded task execution through the audited tool boundary, optional shared Proof runs, candidate comparison, and dry-run/apply branch selection with source backup. Irreversible external actions remain approval-gated and full remote rollback is not claimed.
 - [x] Darwin observations and transparent routing scores with uncertainty penalties and human-readable selection reasons.
 
 These slices do not claim to reverse arbitrary remote mutations, replay nondeterministic model calls, or provide multi-user isolation. Kernel tool execution now applies Sentinel and capability checks when the experimental flags are enabled; unintegrated third-party adapters remain outside that guarantee.

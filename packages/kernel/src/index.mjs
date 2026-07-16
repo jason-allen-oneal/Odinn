@@ -1039,10 +1039,21 @@ class BrowserManager {
     this.stateDir = stateDir;
     this.context = null;
     this.ids = new WeakMap();
+    this.handles = new Map();
+    this.handlesPath = join(stateDir, "browser-tabs.json");
+    this.handlesLoaded = false;
   }
 
   async start() {
-    if (this.context) return this.context;
+    if (this.context && !this.context.isClosed()) return this.context;
+    this.context = null;
+    if (!this.handlesLoaded) {
+      try {
+        const saved = JSON.parse(await readFile(this.handlesPath, "utf8"));
+        if (saved?.schemaVersion === 1 && saved.handles && typeof saved.handles === "object") this.handles = new Map(Object.entries(saved.handles));
+      } catch (error) { if (error?.code !== "ENOENT") this.handles.clear(); }
+      this.handlesLoaded = true;
+    }
     const userDataDir = join(this.stateDir, "browser-profile");
     await mkdir(userDataDir, { recursive: true });
     const executablePath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
@@ -1065,12 +1076,21 @@ class BrowserManager {
   }
 
   async page(tabId) {
-    const context = await this.start();
-    let pages = context.pages();
+    let context = await this.start();
+    let pages;
+    try { pages = context.pages(); } catch { await this.close(); context = await this.start(); pages = context.pages(); }
     if (!pages.length) pages = [await context.newPage()];
     if (tabId) {
       const selected = pages.find((page) => this.tabId(page) === tabId);
-      if (!selected) throw new Error(`browser tab not found: ${tabId}`);
+      if (!selected) {
+        const handle = this.handles.get(tabId);
+        if (!handle?.url || isPrivateBrowserUrl(handle.url)) throw new Error(`browser tab not found or cannot be safely rehydrated: ${tabId}`);
+        const recovered = await context.newPage();
+        try { await recovered.goto(handle.url, { waitUntil: "domcontentloaded", timeout: WEB_TIMEOUT_MS }); }
+        catch (error) { await recovered.close().catch(() => undefined); throw new Error(`browser tab recovery failed: ${error.message}`); }
+        this.ids.set(recovered, tabId);
+        return recovered;
+      }
       return selected;
     }
     return pages[0];
@@ -1082,12 +1102,31 @@ class BrowserManager {
   }
 
   async describe(page) {
-    return {
-      id: this.tabId(page),
+    const id = this.tabId(page);
+    const description = {
+      id,
       url: page.url(),
       title: await page.title().catch(() => "")
     };
+    if (description.url && description.url !== "about:blank") {
+      this.handles.set(id, { url: description.url, title: description.title, updatedAt: new Date().toISOString() });
+      await ensureBrowserHandles(this.handlesPath, this.handles);
+    }
+    return description;
   }
+}
+
+function isPrivateBrowserUrl(value) {
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return host === "localhost" || host.endsWith(".local") || host === "::1" || host === "127.0.0.1" || /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\.|^169\.254\./.test(host);
+  } catch { return true; }
+}
+
+async function ensureBrowserHandles(path, handles) {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify({ schemaVersion: 1, handles: Object.fromEntries(handles) }, null, 2)}\n`, { mode: 0o600 });
+  await chmod(path, 0o600);
 }
 
 async function browserTabs(stateDir) {
@@ -1161,12 +1200,18 @@ async function browserAction(stateDir, approvalStore, tool, input = {}, security
       : input.text
         ? page.getByText(input.text, { exact: input.exact === true }).first()
         : null;
-  if (tool === "browser.press") {
-    await page.keyboard.press(cleanRequired(input.key, "browser.press requires key"));
-  } else {
-    if (!locator) throw new Error(`${tool} requires selector, role/name, or text`);
-    if (tool === "browser.click") await locator.click();
-    else await locator.fill(String(input.value ?? ""));
+  try {
+    if (tool === "browser.press") {
+      await page.keyboard.press(cleanRequired(input.key, "browser.press requires key"));
+    } else {
+      if (!locator) throw new Error(`${tool} requires selector, role/name, or text`);
+      if (tool === "browser.click") await locator.click();
+      else await locator.fill(String(input.value ?? ""));
+    }
+  } catch (error) {
+    error.code = error.code || "BROWSER_ACTION_OUTCOME_UNKNOWN";
+    error.message = `${error.message}; browser mutation outcome is unknown, refresh the page and review before retrying`;
+    throw error;
   }
   await page.waitForTimeout(250);
   assertBrowserPageAllowed(page, security);

@@ -3,7 +3,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { createRunLedger, redact } from "./run-ledger.mjs";
+import { createRunLedger, redact } from "./run-ledger.ts";
 
 export const ODINN_ERROR_CODES = Object.freeze([
   "POLICY_VIOLATION", "CAPABILITY_DENIED", "CAPABILITY_EXPIRED", "CAPABILITY_SCOPE_MISMATCH",

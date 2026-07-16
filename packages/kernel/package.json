@@ -6,6 +6,9 @@
   "exports": {
     ".": "./src/index.mjs"
   },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
   "dependencies": {
     "@odinn/policy": "workspace:*",
     "@odinn/protocol": "workspace:*",

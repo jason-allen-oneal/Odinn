@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { CapabilityBroker, Sentinel } from "./differentiated-runtime.mjs";
-import { redact } from "./run-ledger.mjs";
+import { redact } from "./run-ledger.ts";
 
 const EXTENSION_SCHEMA_VERSION = 1;
 const EXTENSION_TYPES = new Set(["tool", "skill", "mcp"]);

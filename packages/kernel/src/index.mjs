@@ -13,10 +13,10 @@ import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/p
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
 import { chromium } from "playwright-core";
-import { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.mjs";
-import { toolSafetyDescriptor } from "./tool-safety.mjs";
+import { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
+import { toolSafetyDescriptor } from "./tool-safety.ts";
 import { CapabilityBroker, Sentinel } from "./differentiated-runtime.mjs";
-export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.mjs";
+export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
 export { ExtensionRegistry, ExtensionExecutor } from "./extensions.mjs";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.mjs";
 export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.mjs";

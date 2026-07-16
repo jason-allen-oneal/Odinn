@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { createRunLedger } from "../packages/kernel/src/run-ledger.mjs";
+import { createRunLedger } from "../packages/kernel/src/run-ledger.ts";
 import {
   PROOF_CONTRACT_SCHEMA_VERSION,
   ProofVerifier,

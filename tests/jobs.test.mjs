@@ -3,7 +3,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { JobSupervisor } from "../packages/kernel/src/jobs.mjs";
+import { JobSupervisor } from "../packages/kernel/src/jobs.ts";
 import { FileAuditStore, FileJobStore } from "../packages/store-file/src/index.ts";
 
 async function waitFor(check) {

@@ -11,6 +11,7 @@ import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
 import { chromium } from "playwright-core";
 import { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.mjs";
 import { toolSafetyDescriptor } from "./tool-safety.mjs";
+import { CapabilityBroker, Sentinel } from "./differentiated-runtime.mjs";
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.mjs";
 export { ExtensionRegistry, ExtensionExecutor } from "./extensions.mjs";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.mjs";
@@ -1222,6 +1223,37 @@ export async function runTask({
     throw error;
   }
 
+  let capabilityClaims;
+  try {
+    if (runLedger?.featureFlags?.sentinel === true) {
+      if (Array.isArray(policy?.invariants)) {
+        new Sentinel({ ledger: runLedger, featureFlags: runLedger.featureFlags }).evaluate({
+          runId: request.id,
+          stepId: ledgerStep?.stepId,
+          toolName: request.tool,
+          input: request.input,
+          policy,
+          workspaceRoot: runLedger.workspaceRoot
+        });
+      } else {
+        runLedger.appendEvent({ runId: request.id, type: "policy-check", payload: { stepId: ledgerStep?.stepId, decision: "allow", reason: "sentinel enabled with no configured invariants" } });
+      }
+    }
+    if (runLedger?.featureFlags?.capabilities === true && safety.requiresCapability) {
+      const token = request.input?.capabilityToken;
+      if (typeof token !== "string" || !token) {
+        const error = new Error(`capability token required for ${request.tool}`);
+        error.code = "CAPABILITY_DENIED";
+        throw error;
+      }
+      capabilityClaims = new CapabilityBroker({ ledger: runLedger, stateDir: runLedger.stateDir, featureFlags: runLedger.featureFlags }).consume(token, { runId: request.id, toolName: request.tool, resource: request.input?.resource ?? {} });
+    }
+  } catch (error) {
+    await auditStore.append({ at: now(), runId: request.id, type: "task.blocked", actor: request.actor, tool: request.tool, capability: tool?.capability, decision: "deny", message: error.message, data: { code: error.code ?? "POLICY_VIOLATION" } });
+    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: "blocked", error: error.message });
+    throw error;
+  }
+
   await auditStore.append({
     at: now(),
     runId: request.id,
@@ -1245,6 +1277,7 @@ export async function runTask({
       auditStore,
       signal,
       runLedger,
+      capability: capabilityClaims,
       runTool: (nestedTask) => runTask({
         task: { ...nestedTask, actor: nestedTask.actor ?? request.actor },
         auditStore,
@@ -2356,7 +2389,7 @@ function safeAuditValue(value, depth = 0) {
   if (typeof value !== "object") return undefined;
   const output = {};
   for (const [key, entry] of Object.entries(value).slice(0, 100)) {
-    if (/api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|authorization|cookie|credential/i.test(key)) {
+    if (/api[-_]?key|access[-_]?token|refresh[-_]?token|capability(?:[-_]?token)?|secret|password|authorization|cookie|credential/i.test(key)) {
       output[key] = "[redacted]";
     } else {
       output[key] = safeAuditValue(entry, depth + 1);

@@ -3,7 +3,8 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createDifferentiatedRuntime, OdinnRuntimeError, ProofVerifier } from "../packages/kernel/src/index.mjs";
+import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, OdinnRuntimeError, ProofVerifier, runTask } from "../packages/kernel/src/index.mjs";
+import { createDefaultPolicy } from "../packages/policy/src/index.mjs";
 
 const flags = { proof: true, rewind: true, sentinel: true, capsules: true, darwin: true, capabilities: true, counterfactual: true };
 
@@ -91,5 +92,22 @@ test("counterfactual candidates receive isolated workspaces", async () => {
     assert.equal(runtime.counterfactual.compare(group.groupId).candidates.length, 2);
     await writeFile(join(group.candidates[0].workspaceRoot, "only-a.txt"), "a\n");
     await assert.rejects(readFile(join(group.candidates[1].workspaceRoot, "only-a.txt"), "utf8"), { code: "ENOENT" });
+  } finally { runtime.ledger.close(); }
+});
+
+test("kernel execution enforces Sentinel and capability tokens at the real tool boundary", async () => {
+  const { root, state, runtime } = await fixture();
+  const auditStore = createAuditStore(join(state, "audit.jsonl"));
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state });
+  try {
+    const policy = createDefaultPolicy({ invariants: [{ id: "deny-prod", type: "command.deny-pattern", values: ["terraform apply"], enforcement: "block" }] });
+    await assert.rejects(runTask({ task: { id: "run-kernel-block", tool: "text.echo", input: { text: "terraform apply" }, actor: "test" }, auditStore, policy, registry, runLedger: runtime.ledger }), (error) => error.code === "POLICY_VIOLATION");
+    assert.equal(runtime.ledger.getRun("run-kernel-block").status, "blocked");
+
+    runtime.ledger.ensureRun({ runId: "run-kernel-cap", objective: "capability execution" });
+    const issued = runtime.capabilities.issue({ runId: "run-kernel-cap", stepId: "step-cap", toolName: "text.echo" });
+    const result = await runTask({ task: { id: "run-kernel-cap", tool: "text.echo", input: { text: "capability passed", capabilityToken: issued.token }, actor: "test" }, auditStore, policy: createDefaultPolicy(), registry, runLedger: runtime.ledger });
+    assert.equal(result.output.text, "capability passed");
+    assert.doesNotMatch(JSON.stringify(runtime.ledger.getRun("run-kernel-cap")), new RegExp(issued.token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   } finally { runtime.ledger.close(); }
 });

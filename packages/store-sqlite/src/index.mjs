@@ -5,7 +5,7 @@ import { join, dirname, resolve } from "node:path";
 
 export const SQLITE_SCHEMA_VERSION = 2;
 
-const SECRET_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|credential|password|secret|private[_-]?key)/i;
+const SECRET_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|capability(?:[_-]?token)?|authorization|cookie|credential|password|secret|private[_-]?key)/i;
 const SECRET_VALUE = /Bearer\s+[A-Za-z0-9._~+\/-]+|(?:sk|rk)-[A-Za-z0-9_-]{12,}/g;
 
 function stable(value) {
@@ -300,11 +300,12 @@ export class ArtifactStore {
 }
 
 export class RunLedger {
-  constructor({ database, artifacts, workspaceRoot, featureFlags = {} } = {}) {
+  constructor({ database, artifacts, workspaceRoot, stateDir, featureFlags = {} } = {}) {
     if (!database || !artifacts) throw new Error("RunLedger requires database and artifacts");
     this.database = database;
     this.artifacts = artifacts;
     this.workspaceRoot = resolve(workspaceRoot ?? process.cwd());
+    this.stateDir = resolve(stateDir ?? dirname(database.path));
     this.featureFlags = { ...featureFlags };
   }
 
@@ -423,5 +424,5 @@ export function createRunLedger({ stateDir = ".odinn", workspaceRoot = process.c
   const state = resolve(stateDir);
   const database = new SqliteStore(join(state, "db", "odinn.sqlite"));
   const artifacts = new ArtifactStore(join(state, "artifacts"));
-  return new RunLedger({ database, artifacts, workspaceRoot, featureFlags });
+  return new RunLedger({ database, artifacts, workspaceRoot, stateDir: state, featureFlags });
 }

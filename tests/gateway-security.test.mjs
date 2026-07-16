@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createGatewayServer } from "../apps/gateway/src/server.mjs";
-import { createApprovalStore } from "../packages/kernel/src/index.mjs";
+import { createApprovalStore } from "../packages/kernel/src/index.ts";
 
 test("gateway control surfaces require bootstrap authentication and reject cross-origin mutations", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-security-"));

@@ -4,7 +4,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createAuditStore, createBuiltInRegistry, createRunLedger, normalizeExperimentalFlags, runTask } from "../packages/kernel/src/index.mjs";
+import { createAuditStore, createBuiltInRegistry, createRunLedger, normalizeExperimentalFlags, runTask } from "../packages/kernel/src/index.ts";
 
 test("Phase 0 records a real tool call as a durable redacted hash chain", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-phase0-ledger-"));

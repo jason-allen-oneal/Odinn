@@ -1,4 +1,4 @@
-import { createAuditStore, createApprovalStore, createBuiltInRegistry, createRunLedger, closeBrowserManagers, normalizeExperimentalFlags, runTask } from "./index.mjs";
+import { createAuditStore, createApprovalStore, createBuiltInRegistry, createRunLedger, closeBrowserManagers, normalizeExperimentalFlags, runTask } from "./index.ts";
 import { join } from "node:path";
 import type { RuntimePolicy } from "@odinn/policy";
 

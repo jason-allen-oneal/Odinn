@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createAuditStore, createBuiltInRegistry, normalizeModelConfig, runPlan, runTask, saveOAuthToken } from "../packages/kernel/src/index.mjs";
+import { createAuditStore, createBuiltInRegistry, normalizeModelConfig, runPlan, runTask, saveOAuthToken } from "../packages/kernel/src/index.ts";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 
 async function fixture() {

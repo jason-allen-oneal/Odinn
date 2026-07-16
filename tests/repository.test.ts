@@ -61,6 +61,10 @@ test("public beta support and reporting surfaces ship in the release tree", asyn
   ]) {
     assert.ok((await read(path)).trim().length > 0, `${path} must not be empty`);
   }
+  const betaGuide = await read("docs/public-beta.md");
+  assert.doesNotMatch(betaGuide, /v\d+\.\d+\.\d+-beta\.\d+/);
+  assert.match(betaGuide, /registration and discovery do not execute or activate/u);
+  assert.doesNotMatch(betaGuide, /attachments sent to their configured API/u);
 });
 
 test("release packaging removes stale assets before creating a version", async () => {

@@ -6,7 +6,7 @@
 
 - Linux, macOS, or Windows with Node.js 24 or newer and Corepack.
 - One local operator using the loopback gateway at `127.0.0.1`.
-- Public web reading, an isolated browser profile, durable memory, audited tools, sessions, goals, cron jobs, Agents, and reviewed skills.
+- Public web reading, an isolated browser profile, durable memory, audited tools, sessions, goals, and cron jobs. The console can register and inspect declarative Agent SDK packages, discover reviewed `SKILL.md` files, and stage draft skills; registration and discovery do not execute or activate those packages.
 - Explicit approval for browser mutations and other external side effects.
 - Experimental Proof, Rewind, Sentinel, Capsules, Darwin, Capability, Counterfactual, and self-improvement features remain disabled until individually enabled.
 
@@ -18,7 +18,7 @@ Download the newest prerelease from the repository's Releases page. Release asse
 
 ### Linux and macOS
 
-Replace `<tag>` with the published tag, such as `v0.2.1-beta.0`:
+Replace `<tag>` with the exact prerelease tag shown on the Releases page:
 
 ```bash
 tag=<tag>
@@ -68,7 +68,7 @@ node scripts/install.ts rollback --prefix "$HOME/.local/share/odinn"
 
 Ódinn Forge has no built-in product telemetry. Runtime state, browser profiles, audit records, memory, and credentials stay in the configured local state directory unless you deliberately use a remote host or external provider.
 
-Model providers receive the prompts, recalled context, tool results, and attachments sent to their configured API. Websites receive normal browser or fetch traffic. Imported skills, MCP servers, extensions, and browser pages are untrusted input. Review them before enabling them and never post `.odinn`, OAuth files, gateway tokens, browser profiles, or raw diagnostic bundles publicly.
+Model providers receive the prompts, recalled context, and tool results sent to their configured API. Websites receive normal browser or fetch traffic. Imported skills, MCP servers, extensions, and browser pages are untrusted input. Review them before enabling them and never post `.odinn`, OAuth files, gateway tokens, browser profiles, or raw diagnostic bundles publicly.
 
 ## Before reporting a bug
 
@@ -87,4 +87,3 @@ Use the repository's bug-report form for ordinary defects. Suspected vulnerabili
 ## Beta feedback
 
 Useful reports describe an actual workflow: what you tried, whether onboarding succeeded, where the interface became confusing, which provider or tool was involved, and whether restart or rollback recovered cleanly. Feature requests should explain the outcome needed rather than prescribing a large architecture from the void.
-

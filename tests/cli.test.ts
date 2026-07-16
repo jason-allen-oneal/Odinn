@@ -8,6 +8,25 @@ import test from "node:test";
 
 const root = new URL("..", import.meta.url).pathname;
 
+test("CLI advanced help exposes documented beta safety controls", () => {
+  const help = spawnSync("node", ["apps/cli/src/cli.ts", "help", "--all"], {
+    cwd: root,
+    encoding: "utf8"
+  });
+  assert.equal(help.status, 0, help.stderr || help.stdout);
+  for (const expected of [
+    "config self-improvement set",
+    "--interval-ms <ms>",
+    "--max-changes <count>",
+    "--workspace <directory>",
+    "--approve-external",
+    "--duration-ms <ms>",
+    "improve rollback --improvement <id>"
+  ]) {
+    assert.match(help.stdout, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+});
+
 test("CLI runs a deterministic tool through the audited kernel path", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-"));
   const init = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], {

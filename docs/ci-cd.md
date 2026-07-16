@@ -80,7 +80,7 @@ Configure the following manually in GitHub because they are repository policy, n
 - Require branches to be current before merge.
 - Block force pushes and deletion of `main`.
 - Enable private vulnerability reporting.
-- Create a `release` environment and require approval for stable releases.
+- Create a `release` environment and require approval for every prerelease and stable release publication.
 - Limit workflow permissions to read-only by default.
 
 ## Local equivalence

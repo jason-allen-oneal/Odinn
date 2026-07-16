@@ -7,6 +7,15 @@ on:
   schedule:
     - cron: "23 4 * * 2"
   workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Base commit for an explicitly dispatched dependency review
+        required: false
+        type: string
+      head_sha:
+        description: Head commit for an explicitly dispatched dependency review
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -36,7 +45,7 @@ jobs:
 
   dependency-review:
     name: Dependency review
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (inputs.base_sha != '' && inputs.head_sha != '')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -52,8 +61,8 @@ jobs:
         id: dependency-graph
         env:
           GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
         run: |
           status="$(curl --silent --show-error --output dependency-review-response.json --write-out '%{http_code}' \
             --header 'Accept: application/vnd.github+json' \

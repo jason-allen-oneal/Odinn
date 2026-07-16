@@ -49,6 +49,8 @@ Pushes to `main` are analyzed for Conventional Commit messages. During public be
 
 GitHub deliberately does not emit a second workflow event for a tag created with the workflow `GITHUB_TOKEN`. The Release Please workflow therefore calls `release.yml` directly when `release_created` is true and passes the exact generated tag into the protected reusable release workflow. The tag-push and manual-dispatch triggers remain available for operator-created recovery runs.
 
+The same recursion guard suppresses ordinary `pull_request` workflow events for Release Please's generated PR. When `prs_created` is true, the workflow explicitly dispatches CI, Security, Package Integrity, Workflow Lint, and Pull Request Policy against the generated head commit. Security receives the exact base and head SHAs so dependency review still compares the intended release change.
+
 ### Release
 
 A `v*` tag starts the release workflow. The workflow:

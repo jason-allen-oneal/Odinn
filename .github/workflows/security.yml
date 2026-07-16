@@ -15,10 +15,6 @@ concurrency:
   group: security-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  NODE_VERSION: "24"
-  PNPM_VERSION: "10.14.0"
-
 jobs:
   codeql:
     name: CodeQL
@@ -46,6 +42,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    env:
+      NODE_VERSION: "24"
+      PNPM_VERSION: "10.14.0"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -102,6 +101,9 @@ jobs:
     name: Dependency and lockfile audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      NODE_VERSION: "24"
+      PNPM_VERSION: "10.14.0"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6

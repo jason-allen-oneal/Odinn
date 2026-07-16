@@ -3,6 +3,12 @@ name: Pull Request Policy
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_title:
+        description: Pull request title to validate for an explicitly dispatched check
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,7 +20,7 @@ jobs:
     steps:
       - name: Validate pull request title
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_TITLE: ${{ github.event.pull_request.title || inputs.pr_title }}
         shell: bash
         run: |
           pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+'

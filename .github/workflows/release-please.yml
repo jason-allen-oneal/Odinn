@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: read
+  actions: write
   attestations: write
   contents: write
   id-token: write
@@ -28,6 +28,25 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      - name: Dispatch required checks for the generated release pull request
+        if: steps.release.outputs.prs_created == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: |
+          number="$(jq -er '.number' <<<"$RELEASE_PR")"
+          details="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")"
+          branch="$(jq -er '.head.ref' <<<"$details")"
+          base_sha="$(jq -er '.base.sha' <<<"$details")"
+          head_sha="$(jq -er '.head.sha' <<<"$details")"
+          title="$(jq -er '.title' <<<"$details")"
+
+          gh workflow run ci.yml --ref "$branch"
+          gh workflow run package-integrity.yml --ref "$branch"
+          gh workflow run workflow-lint.yml --ref "$branch"
+          gh workflow run security.yml --ref "$branch" -f base_sha="$base_sha" -f head_sha="$head_sha"
+          gh workflow run pr-title.yml --ref "$branch" -f pr_title="$title"
 
   publish_release:
     needs: release_please

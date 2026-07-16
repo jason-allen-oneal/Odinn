@@ -29,11 +29,23 @@ test("Release Please hands token-created tags to the protected release workflow"
   assert.match(releasePlease, /release_created:\s*\$\{\{ steps\.release\.outputs\.release_created \}\}/);
   assert.match(releasePlease, /uses:\s*\.\/\.github\/workflows\/release\.yml/);
   assert.match(releasePlease, /tag:\s*\$\{\{ needs\.release_please\.outputs\.tag_name \}\}/);
+  assert.match(releasePlease, /if:\s*steps\.release\.outputs\.prs_created == 'true'/);
+  for (const workflow of ["ci.yml", "package-integrity.yml", "workflow-lint.yml", "security.yml", "pr-title.yml"]) {
+    assert.match(releasePlease, new RegExp(`gh workflow run ${workflow.replace(".", "\\.")}`));
+  }
   assert.match(release, /^\s{2}workflow_call:/m);
   assert.match(release, /\*-\*\) prerelease=\(--prerelease\)/);
   assert.equal(config.packages["."].versioning, "prerelease");
   assert.equal(config.packages["."]["prerelease-type"], "beta");
   assert.equal(config.packages["."].prerelease, true);
+});
+
+test("dispatched release pull requests receive dependency and title checks", async () => {
+  const security = await read(".github/workflows/security.yml");
+  const title = await read(".github/workflows/pr-title.yml");
+  assert.match(security, /inputs\.base_sha != '' && inputs\.head_sha != ''/);
+  assert.match(security, /github\.event\.pull_request\.base\.sha \|\| inputs\.base_sha/);
+  assert.match(title, /github\.event\.pull_request\.title \|\| inputs\.pr_title/);
 });
 
 test("public beta support and reporting surfaces ship in the release tree", async () => {

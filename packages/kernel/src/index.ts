@@ -1932,11 +1932,16 @@ async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, sign
   }
   if (accessToken) headers.authorization = `Bearer ${accessToken}`;
   const isChatGptResponsesTransport = provider.transport === "openai-chatgpt-responses";
+  const chatGptAccountId = isChatGptResponsesTransport && accessToken
+    ? resolveOpenAICodexAccountId(accessToken)
+    : "";
   if (isChatGptResponsesTransport) Object.assign(headers, {
     accept: "text/event-stream",
+    "openai-beta": "responses=experimental",
     originator: process.env.ODINN_OPENAI_ORIGINATOR || "openclaw",
     version: process.env.ODINN_OPENAI_CLIENT_VERSION || "2026.6.11",
-    "user-agent": `openclaw/${process.env.ODINN_OPENAI_CLIENT_VERSION || "2026.6.11"}`
+    "user-agent": `openclaw/${process.env.ODINN_OPENAI_CLIENT_VERSION || "2026.6.11"}`,
+    ...(chatGptAccountId ? { "chatgpt-account-id": chatGptAccountId } : {})
   });
   if (provider.auth.flow === "github-copilot-device") Object.assign(headers, {
     accept: "application/json",
@@ -2009,6 +2014,18 @@ async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, sign
   } finally {
     clearTimeout(timeout);
     signal?.removeEventListener("abort", abortFromParent);
+  }
+}
+
+function resolveOpenAICodexAccountId(token: string) {
+  const parts = token.split(".");
+  if (parts.length !== 3) return "";
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString("utf8"));
+    const accountId = payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
+    return typeof accountId === "string" ? accountId.trim() : "";
+  } catch {
+    return "";
   }
 }
 

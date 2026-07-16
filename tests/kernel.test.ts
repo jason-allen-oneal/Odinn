@@ -205,9 +205,16 @@ test("kernel refreshes OAuth credentials before model execution", async () => {
 });
 
 test("kernel speaks the ChatGPT Codex SSE transport for imported OAuth", async () => {
+  const codexAccess = [
+    Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url"),
+    Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "account-test" } })).toString("base64url"),
+    "signature"
+  ].join(".");
   const providerServer = createHttpServer(async (request: any, response: any) => {
     assert.equal(request.url, "/responses");
-    assert.equal(request.headers.authorization, "Bearer codex-access");
+    assert.equal(request.headers.authorization, `Bearer ${codexAccess}`);
+    assert.equal(request.headers["chatgpt-account-id"], "account-test");
+    assert.equal(request.headers["openai-beta"], "responses=experimental");
     assert.equal(request.headers.originator, "openclaw");
     const body = JSON.parse(await new Promise((resolve: any) => {
       let raw = "";
@@ -242,7 +249,7 @@ test("kernel speaks the ChatGPT Codex SSE transport for imported OAuth", async (
   };
   const normalizedProvider = normalizeModelConfig(config).providers.openai;
   await saveOAuthToken(normalizedProvider, stateDir, {
-    access_token: "codex-access",
+    access_token: codexAccess,
     refresh_token: "codex-refresh",
     expires_at: Date.now() + 3_600_000
   });

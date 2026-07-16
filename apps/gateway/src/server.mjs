@@ -2184,10 +2184,10 @@ function renderConsoleHtml() {
 
       <section id="view-improvements" class="view">
         <div class="page">
-          <div class="page-head"><div><div class="section-kicker">Self-improvement queue</div><h1>Improvements</h1><p>Capture product friction, review proposals, and record the decision trail.</p></div><span class="chip">human decision required</span></div>
+          <div class="page-head"><div><div class="section-kicker">Autonomous learning</div><h1>Skill Workshop</h1><p>Observe repeated failures, apply bounded reliability tuning, and roll back from captured configuration snapshots.</p></div><span class="chip" id="improvement-mode">review mode</span></div>
           <div class="split">
             <div class="panel stack"><div class="panel-head"><div><h2>Evidence loop</h2><span class="muted">Mine repeated failures into reviewable proposals.</span></div><button id="learn-improvements" type="button">Analyze activity</button></div>
-            <div class="chip-row"><span class="chip ok">automatic observation</span><span class="chip warn">human approval required</span></div>
+            <div class="chip-row"><span class="chip ok">automatic observation</span><span class="chip">allowlisted changes only</span><span class="chip warn">never widens authority</span></div>
             <div class="panel-head"><h2>Propose an improvement</h2><button id="propose-improvement" type="button">Propose</button></div>
             <div class="field">
               <label for="improvement-title">Title</label>
@@ -2204,6 +2204,7 @@ function renderConsoleHtml() {
                 <option>applied</option>
               </select>
               <button class="secondary" id="decide-improvement" type="button">Decide Selected</button>
+              <button class="secondary" id="rollback-improvement" type="button">Rollback Selected</button>
             </div>
           </div>
             <div class="panel stack"><div class="panel-head"><h2>Decision queue</h2><span class="muted">select a proposal to decide</span></div><div id="improvement-list" class="list"></div></div>
@@ -2871,7 +2872,10 @@ function renderConsoleHtml() {
     }
 
     async function refreshImprovements() {
-      const data = await api("/improvements");
+      const [data, runtimeStatus] = await Promise.all([api("/improvements"), api("/status")]);
+      const learning = runtimeStatus.selfImprovement || {};
+      $("improvement-mode").textContent = learning.enabled ? learning.mode + " mode" : "disabled";
+      $("improvement-mode").className = "chip " + (learning.mode === "auto" ? "ok" : learning.enabled ? "warn" : "");
       $("improvement-list").innerHTML = (data.improvements || []).slice(0, 16).map((item) =>
         renderRecord(item, item.title, item.status + " | " + (item.target || "runtime"), 'data-improvement-id="' + escapeHtml(item.id) + '"')
       ).join("") || '<div class="muted">No proposals yet.</div>';
@@ -3256,6 +3260,13 @@ function renderConsoleHtml() {
       } finally {
         setBusy(event.currentTarget, false);
       }
+    });
+    $("rollback-improvement").addEventListener("click", async (event) => {
+      await withButton(event.currentTarget, "Rolling back...", async () => {
+        if (!state.selectedImprovementId) throw new Error("Select an applied improvement first.");
+        showOutput(await api("/improvements/" + encodeURIComponent(state.selectedImprovementId) + "/rollback", { method: "POST" }));
+        await refreshImprovements();
+      });
     });
     refresh();
   </script>

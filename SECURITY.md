@@ -21,7 +21,7 @@ Reports will be acknowledged as soon as practical. Disclosure timing will be coo
 
 ## Security boundaries
 
-Ódinn's initial beta has explicit capability boundaries, append-only audit events, restart-safe approval claims, isolated task workers, an isolated browser profile, durable local stores, and a local-only control plane. It does not provide multi-user authorization or a remotely hardened deployment model.
+Ódinn's beta has explicit capability boundaries, append-only audit events, restart-safe approval and browser-recovery claims, isolated task workers, isolated browser profiles, durable stores, and a loopback-only default control plane. Remote hosting is a separate opt-in service that requires TLS and gives every provisioned user an independent gateway and state/workspace boundary.
 
 Before the first stable release:
 
@@ -67,11 +67,11 @@ Proof is evidence-based: model text cannot set `verified`. Sentinel decisions ar
 - Public web content is untrusted data and may contain prompt injection. Ódinn must not treat page instructions as operator authorization.
 - State directories are repaired to `0700` and sensitive JSON/JSONL records to `0600` when the gateway opens them. Idempotency keys are bound to a canonical request hash; reusing a key with different content returns `409`.
 - Browser read access is not action authorization. An external side effect requires the approval gate unless the operator explicitly disables it.
-- Loopback binding is the supported deployment. `ODINN_ALLOW_REMOTE=1` is an escape hatch for controlled experiments, not a security boundary.
+- The single-user gateway remains loopback-only. Remote deployment uses `host.mjs`; non-loopback startup fails without a certificate, key, and exact public origin. Passwords are scrypt-derived, sessions are signed, cookies are HttpOnly/SameSite=Strict/Secure under TLS, and tenants never share state roots or gateway bearer tokens.
 
 ### Known beta gaps
 
-The release ledger intentionally leaves these items open: failed-action/tab-loss browser recovery, native installers and application upgrade rollback, immutable content-addressed extension versions, full external-action capsule replay, complete integration of experimental policy/capability checks into every external adapter, and remote or multi-user hosting. Tool-mocked capsule replay and the CLI extension boundary are implemented, but they do not make arbitrary remote actions reversible or safe to replay. Audit journals now support rotating HMAC keys while retaining retired keys for verification. The source archives have cross-platform extraction/install smoke, but that is not proof of a native installer or rollback-safe upgrade. Keep Ódinn loopback-only and single-user until those boundaries are designed and tested.
+Browser mutations are journaled before execution; an interrupted or failed mutation blocks further actions until the operator inspects and resolves the uncertain outcome. Native installs use immutable version directories and an atomic current/previous pointer. Full capsule replay requires a disposable workspace, complete non-redacted inputs, an audited executor, and explicit approval for network, credential, or external-state effects. Arbitrary remote services remain nondeterministic and an approved replay is not a guarantee that a remote mutation is reversible. The multi-user host provides application-level tenant isolation, not hostile-code containment between Unix users; use OS/container isolation for mutually untrusted tenants.
 
 ## CI security gates
 

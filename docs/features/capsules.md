@@ -8,8 +8,9 @@ odinn capsule export <run-id> --output run.odinn
 odinn capsule verify run.odinn
 odinn capsule replay run.odinn --mode verification-only
 odinn capsule replay run.odinn --mode tool-mocked
+odinn capsule replay run.odinn --mode full --workspace ./disposable --approve-external
 ```
 
-Extraction rejects absolute paths and parent traversal. Verification checks the internal content hashes when moved elsewhere. Verification-only replay validates the capsule and reports whether an acceptance contract is included. Tool-mocked replay creates a new durable replay run and records every captured model/tool boundary without executing external tools. Full replay remains fail-closed until every adapter declares a replay-safe contract; browser, remote mutation, and nondeterministic model execution are not silently replayed.
+Extraction rejects absolute paths and parent traversal. Verification checks internal content hashes. Verification-only replay validates the capsule. Tool-mocked replay records captured boundaries without executing tools. Full replay re-executes recorded requests only through an audited executor in a disposable workspace. Redacted inputs fail closed. Network, credential, irreversible, and external-state effects require `--approve-external`; approval does not make a remote action deterministic or reversible.
 
 The gateway restricts capsule paths to its `.odinn/capsules` store. Direct runtime and CLI exports must remain inside the configured workspace or `.odinn/capsules`.

@@ -24,6 +24,7 @@
     "onboard": "pnpm --filter @odinn/cli start -- onboard",
     "tui": "pnpm --filter @odinn/cli start -- tui",
     "gui:start": "pnpm --filter @odinn/gateway start",
+    "host:start": "node apps/gateway/src/host.mjs",
     "smoke:inference": "node scripts/ci/inference-smoke.mjs",
     "smoke:onboarding": "node scripts/ci/onboarding-smoke.mjs",
     "storage:drill": "node scripts/ci/storage-drill.mjs",

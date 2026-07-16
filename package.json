@@ -1,6 +1,6 @@
 {
   "name": "odinn",
-  "version": "0.2.1-beta",
+  "version": "0.2.1-beta.1",
   "private": true,
   "description": "Ódinn Forge cross-platform personal AI agent runtime",
   "type": "module",

@@ -4,6 +4,14 @@ All notable changes to Odinn Forge will be documented in this file.
 
 The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
+## [0.2.1-beta.1](https://github.com/jason-allen-oneal/Odinn/compare/v0.2.1-beta...v0.2.1-beta.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* **cli:** expose advanced beta safety controls ([#38](https://github.com/jason-allen-oneal/Odinn/issues/38)) ([4f8038c](https://github.com/jason-allen-oneal/Odinn/commit/4f8038c00b1eaa0be8e63df4b969262eee756ea9))
+* **test:** make browser SSRF proof deterministic ([#40](https://github.com/jason-allen-oneal/Odinn/issues/40)) ([bd02875](https://github.com/jason-allen-oneal/Odinn/commit/bd02875fd51915f2992f7725e317464fffe6dd96))
+
 ## [0.2.1-beta](https://github.com/jason-allen-oneal/Odinn/compare/v0.2.0...v0.2.1-beta) (2026-07-16)
 
 

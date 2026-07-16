@@ -677,6 +677,14 @@ function renderConsoleHtml() {
       --warn: #e8c96a;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
+    body.soft-contrast {
+      --bg: #0b0f15;
+      --surface: #151c26;
+      --surface-2: #202a37;
+      --line: #425066;
+      --line-soft: #354256;
+      --muted: #b0bbca;
+    }
     * { box-sizing: border-box; }
     html, body { height: 100%; }
     body {
@@ -794,6 +802,27 @@ function renderConsoleHtml() {
     }
     .brand-title {
       min-width: 0;
+    }
+    .brand-tools {
+      display: flex;
+      align-items: center;
+      margin-left: auto;
+    }
+    .sidebar-icon-button {
+      display: inline-grid;
+      place-items: center;
+      width: 30px;
+      min-height: 30px;
+      padding: 0;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      color: #8794a8;
+    }
+    .sidebar-icon-button:hover {
+      border-color: var(--line);
+      background: var(--surface-2);
+      color: var(--text);
     }
     .brand-title strong,
     .brand-title span {
@@ -1534,6 +1563,7 @@ function renderConsoleHtml() {
     .shell.sidebar-collapsed { grid-template-columns: 68px minmax(0, 1fr); }
     .shell.sidebar-collapsed .brand { justify-content: center; padding: 0; }
     .shell.sidebar-collapsed .brand-title,
+    .shell.sidebar-collapsed .brand-tools,
     .shell.sidebar-collapsed .nav-label,
     .shell.sidebar-collapsed .nav-group-label,
     .shell.sidebar-collapsed .menu-chats,
@@ -1726,6 +1756,36 @@ function renderConsoleHtml() {
       text-transform: uppercase;
     }
     .session-rail-label span:last-child { color: #526176; font-weight: 600; letter-spacing: 0; text-transform: none; }
+    .rail-count { font-variant-numeric: tabular-nums; }
+    .pinned-list:empty::after {
+      display: block;
+      padding: 4px 8px 7px;
+      color: #536175;
+      content: "No pinned sessions";
+      font-size: 11px;
+    }
+    .sidebar-footer-tools {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 3px;
+    }
+    .sidebar-status {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 2px 4px 0;
+      color: #69788c;
+      font-size: 10px;
+    }
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #55d391;
+      box-shadow: 0 0 0 3px rgba(85, 211, 145, .1);
+    }
+    .sidebar-version { margin-left: auto; color: #4f5d70; font-variant-numeric: tabular-nums; }
 
     @media (max-width: 980px) {
       body { overflow: auto; }
@@ -1853,6 +1913,10 @@ function renderConsoleHtml() {
     <symbol id="icon-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><path d="M12 7v5l3 2"></path></symbol>
     <symbol id="icon-agent" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3"></circle><path d="M5 20c.6-3.5 2.9-5 7-5s6.4 1.5 7 5M12 3v2"></path></symbol>
     <symbol id="icon-skill" viewBox="0 0 24 24"><path d="m12 3 2.2 5.6L20 11l-5.8 2.4L12 19l-2.2-5.6L4 11l5.8-2.4z"></path><path d="m18 16 .8 2.2L21 19l-2.2.8L18 22l-.8-2.2L15 19l2.2-.8z"></path></symbol>
+    <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"></circle><path d="m15 15 5 5"></path></symbol>
+    <symbol id="icon-settings" viewBox="0 0 24 24"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"></path><circle cx="12" cy="12" r="4"></circle></symbol>
+    <symbol id="icon-monitor" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="12" rx="2"></rect><path d="M9 21h6M12 17v4"></path></symbol>
+    <symbol id="icon-moon" viewBox="0 0 24 24"><path d="M19 15.5A7.5 7.5 0 0 1 8.5 5 7.5 7.5 0 1 0 19 15.5z"></path></symbol>
   </svg>
   <div class="shell" id="shell">
     <aside class="sidebar">
@@ -1862,12 +1926,17 @@ function renderConsoleHtml() {
           <strong>Ódinn</strong>
           <span>local gateway</span>
         </div>
+        <div class="brand-tools">
+          <button class="sidebar-icon-button" id="sidebar-search" title="Search sessions" aria-label="Search sessions" type="button"><svg class="icon-svg"><use href="#icon-search"></use></svg></button>
+        </div>
       </div>
       <nav class="nav" aria-label="Console views">
         <button class="active" data-view="overview" data-title="Chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-chat"></use></svg></span><span class="nav-label">Chat</span><span class="badge ok" id="nav-health">...</span></button>
         <div class="menu-chats">
         <button class="secondary" id="new-chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-plus"></use></svg></span><span class="nav-label">New session</span></button>
-          <div class="session-rail-label"><span>Recent chats</span><span id="session-count">0 sessions</span></div>
+          <div class="session-rail-label"><span>Pinned</span><span class="rail-count" id="pinned-count">0</span></div>
+          <div id="pinned-chat-list" class="session-list pinned-list"></div>
+          <div class="session-rail-label"><span>Sessions</span><span class="rail-count" id="chat-session-count">0</span></div>
           <div id="chat-session-list" class="session-list"></div>
         </div>
         <details class="nav-more" open>
@@ -1888,7 +1957,13 @@ function renderConsoleHtml() {
         <button data-view="audit" data-title="Audit" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-audit"></use></svg></span><span class="nav-label">Audit</span></button>
       </nav>
       <div class="sidebar-footer">
-        <button class="secondary" id="refresh" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-refresh"></use></svg></span>Refresh</button>
+        <div class="sidebar-footer-tools">
+          <button class="sidebar-icon-button" id="sidebar-settings" title="Runtime settings" aria-label="Runtime settings" type="button"><svg class="icon-svg"><use href="#icon-settings"></use></svg></button>
+          <button class="sidebar-icon-button" id="sidebar-console" title="Open runtime" aria-label="Open runtime" type="button"><svg class="icon-svg"><use href="#icon-monitor"></use></svg></button>
+          <button class="sidebar-icon-button" id="sidebar-theme" title="Toggle theme" aria-label="Toggle theme" type="button"><svg class="icon-svg"><use href="#icon-moon"></use></svg></button>
+          <button class="sidebar-icon-button" id="refresh" title="Refresh" aria-label="Refresh" type="button"><svg class="icon-svg"><use href="#icon-refresh"></use></svg></button>
+        </div>
+        <div class="sidebar-status"><span class="status-dot"></span><span>Loopback beta</span><span class="sidebar-version">v0.1</span></div>
       </div>
     </aside>
 
@@ -2055,7 +2130,7 @@ function renderConsoleHtml() {
             </div>
             <button class="secondary" id="append-session-message" type="button">Append Message</button>
           </div>
-            <div class="panel stack"><div class="panel-head"><h2>Session records</h2><span class="muted" id="session-count">Loading</span></div><div id="session-list" class="list"></div></div>
+            <div class="panel stack"><div class="panel-head"><h2>Session records</h2><span class="muted" id="session-page-count">Loading</span></div><div id="session-list" class="list"></div></div>
           </div>
           <div class="panel stack"><div class="panel-head"><h2>Selected transcript</h2><span class="chip" id="selected-session-route">No session selected</span></div><div id="session-transcript" class="timeline"><div class="empty-state"><strong>Select a session</strong><span>Its messages and model route will appear here.</span></div></div></div>
         </div>
@@ -2754,8 +2829,12 @@ function renderConsoleHtml() {
         recent.push(session);
         if (recent.length >= 8) break;
       }
+      const pinned = chatSessions.filter((session) => session.pinned === true).slice(0, 6);
+      $("pinned-chat-list").innerHTML = pinned.map(renderChatSession).join("");
+      $("pinned-count").textContent = pinned.length;
       $("chat-session-list").innerHTML = recent.map(renderChatSession).join("") || '<div class="muted session-empty">Your saved chats will appear here.</div>';
-      $("session-count").textContent = sessions.length + " sessions";
+      $("chat-session-count").textContent = sessions.length;
+      $("session-page-count").textContent = sessions.length + " sessions";
       if (!state.activeChatId && sessions.length) {
         const initial = sessions.find((session) => Number(session.messageCount || 0) === 0) || sessions[0];
         await loadChat(initial.id);
@@ -2838,6 +2917,20 @@ function renderConsoleHtml() {
     });
 
     $("refresh").addEventListener("click", refresh);
+    $("sidebar-search").addEventListener("click", () => {
+      const query = window.prompt("Search sessions", "");
+      if (query === null) return;
+      const normalized = query.trim().toLowerCase();
+      document.querySelectorAll(".menu-chat").forEach((item) => {
+        item.hidden = Boolean(normalized) && !item.textContent.toLowerCase().includes(normalized);
+      });
+    });
+    $("sidebar-settings").addEventListener("click", () => switchView("runtime"));
+    $("sidebar-console").addEventListener("click", () => switchView("runtime"));
+    $("sidebar-theme").addEventListener("click", () => {
+      document.body.classList.toggle("soft-contrast");
+      showOutput(document.body.classList.contains("soft-contrast") ? "Soft contrast enabled." : "Soft contrast disabled.");
+    });
     $("model-select").addEventListener("change", (event) => {
       state.modelOverride = event.currentTarget.value;
     });
@@ -2851,7 +2944,7 @@ function renderConsoleHtml() {
         setBusy(event.currentTarget, false);
       }
     });
-    $("chat-session-list").addEventListener("click", (event) => {
+    function handleChatRailClick(event) {
       const action = event.target.closest("[data-session-action]");
       if (action) {
         event.stopPropagation();
@@ -2861,7 +2954,9 @@ function renderConsoleHtml() {
       }
       const item = event.target.closest("[data-chat-session-id]");
       if (item) loadChat(item.dataset.chatSessionId).catch((error) => showOutput(error.message));
-    });
+    }
+    $("chat-session-list").addEventListener("click", handleChatRailClick);
+    $("pinned-chat-list").addEventListener("click", handleChatRailClick);
     $("chat-thread").addEventListener("click", (event) => {
       const prompt = event.target.closest("[data-chat-prompt]");
       if (!prompt) return;

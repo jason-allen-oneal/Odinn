@@ -4,6 +4,17 @@ All notable changes to Odinn Forge will be documented in this file.
 
 The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
+## [0.2.1-beta](https://github.com/jason-allen-oneal/Odinn/compare/v0.2.0...v0.2.1-beta) (2026-07-16)
+
+
+### Bug Fixes
+
+* **ci:** scope scorecard to default branch ([#36](https://github.com/jason-allen-oneal/Odinn/issues/36)) ([1a18cb8](https://github.com/jason-allen-oneal/Odinn/commit/1a18cb8a88160a1a81752e0258c1b8345999ff8e))
+* **release:** align security docs and enforcement ([#26](https://github.com/jason-allen-oneal/Odinn/issues/26)) ([1a6802f](https://github.com/jason-allen-oneal/Odinn/commit/1a6802f2570558b90e517fdee1e9740fb9f452f1))
+* **release:** run checks for generated pull requests ([#32](https://github.com/jason-allen-oneal/Odinn/issues/32)) ([1767488](https://github.com/jason-allen-oneal/Odinn/commit/1767488a3f7724a7fab734372a0852039d1e44d9))
+* **release:** target repository for workflow dispatch ([#34](https://github.com/jason-allen-oneal/Odinn/issues/34)) ([a861b56](https://github.com/jason-allen-oneal/Odinn/commit/a861b567f597fbee41d6f44e3e1540d13dcfdd13))
+* **repo:** support user-owned branch protection ([#28](https://github.com/jason-allen-oneal/Odinn/issues/28)) ([6d42067](https://github.com/jason-allen-oneal/Odinn/commit/6d42067877bf3ac96db475a4db29f0b1ec70e110))
+
 ## [0.2.0](https://github.com/jason-allen-oneal/Odinn/compare/v0.1.0...v0.2.0) (2026-07-16)
 
 

@@ -267,7 +267,7 @@ Release-package validation extracts both source archives, installs with the froz
 ```bash
 pnpm release:package
 pnpm release:checksums
-node scripts/release/verify.mjs
+node scripts/release/verify.ts
 pnpm release:install-smoke
 pnpm storage:drill
 ```
@@ -280,8 +280,8 @@ Versioned install and rollback:
 
 ```bash
 ./scripts/install.sh --prefix "$HOME/.local/share/odinn"
-node scripts/install.mjs upgrade --source . --prefix "$HOME/.local/share/odinn"
-node scripts/install.mjs rollback --prefix "$HOME/.local/share/odinn"
+node scripts/install.ts upgrade --source . --prefix "$HOME/.local/share/odinn"
+node scripts/install.ts rollback --prefix "$HOME/.local/share/odinn"
 ```
 
 Opt-in multi-user host:

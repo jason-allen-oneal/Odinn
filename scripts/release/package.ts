@@ -9,7 +9,7 @@ const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 const base = `odinn-v${pkg.version}`;
 await mkdir(output, { recursive: true });
 
-function archive(format, extension) {
+function archive(format: any, extension: any) {
   const destination = join(output, `${base}.${extension}`);
   const result = spawnSync(
     "git",
@@ -31,7 +31,7 @@ const manifest = {
   name: pkg.name,
   version: pkg.version,
   commit: process.env.GITHUB_SHA || currentCommit(),
-  artifacts: artifacts.map((path) => path.slice(output.length + 1)),
+  artifacts: artifacts.map((path: any) => path.slice(output.length + 1)),
   createdAt: new Date().toISOString()
 };
 await writeFile(join(output, "release-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);

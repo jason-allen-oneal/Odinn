@@ -20,7 +20,7 @@ test("Sentinel blocks a denied command before execution and records the decision
   const { runtime } = await fixture();
   try {
     runtime.ledger.ensureRun({ runId: "run-sentinel", objective: "policy test" });
-    assert.throws(() => runtime.sentinel.evaluate({ runId: "run-sentinel", toolName: "process.exec", input: { command: "terraform apply" }, policy: { version: 1, invariants: [{ id: "deny", type: "command.deny-pattern", values: ["terraform apply"], enforcement: "block" }] } }), (error) => error instanceof OdinnRuntimeError && error.code === "POLICY_VIOLATION");
+    assert.throws(() => runtime.sentinel.evaluate({ runId: "run-sentinel", toolName: "process.exec", input: { command: "terraform apply" }, policy: { version: 1, invariants: [{ id: "deny", type: "command.deny-pattern", values: ["terraform apply"], enforcement: "block" }] } }), (error: any) => error instanceof OdinnRuntimeError && error.code === "POLICY_VIOLATION");
     assert.equal(runtime.ledger.database.db.prepare("SELECT COUNT(*) count FROM policy_evaluations WHERE run_id = ?").get("run-sentinel").count, 1);
   } finally { runtime.ledger.close(); }
 });
@@ -77,14 +77,14 @@ test("capsules verify their checksums and detect tampering", async () => {
     assert.equal(runtime.ledger.getRun(replay.replayRunId).status, "completed-unverified");
     const fullWorkspace = join(root, "full-replay");
     const executed = [];
-    await assert.rejects(runtime.capsules.replay(output, { mode: "full", workspace: fullWorkspace, executor: async () => ({ ok: true }) }), (error) => error.code === "CAPABILITY_DENIED");
-    const full = await runtime.capsules.replay(output, { mode: "full", workspace: fullWorkspace, approveExternal: true, executor: async (task) => { executed.push(task); return { ok: true }; } });
+    await assert.rejects(runtime.capsules.replay(output, { mode: "full", workspace: fullWorkspace, executor: async () => ({ ok: true }) }), (error: any) => error.code === "CAPABILITY_DENIED");
+    const full = await runtime.capsules.replay(output, { mode: "full", workspace: fullWorkspace, approveExternal: true, executor: async (task: any) => { executed.push(task); return { ok: true }; } });
     assert.equal(full.executed, true);
     assert.equal(executed[0].tool, "external.fixture");
     assert.equal(executed[0].external, true);
     assert.equal(executed[0].input.text, "capsule full replay");
     const bytes = await readFile(output); bytes[bytes.length - 1] ^= 1; await writeFile(output, bytes);
-    await assert.rejects(runtime.capsules.verify(output), (error) => error.code === "CAPSULE_TAMPERED");
+    await assert.rejects(runtime.capsules.verify(output), (error: any) => error.code === "CAPSULE_TAMPERED");
   } finally { runtime.ledger.close(); }
 });
 
@@ -117,7 +117,7 @@ test("counterfactual execution runs real audited tasks and supports selection pr
   try {
     runtime.ledger.ensureRun({ runId: "run-source-execute", objective: "branch execution" });
     await writeFile(join(root, "candidate-only.txt"), "before\n");
-    const plans = ["a", "b"].map((id) => ({
+    const plans = ["a", "b"].map((id: any) => ({
       id,
       title: id.toUpperCase(),
       summary: `execute ${id}`,
@@ -129,14 +129,14 @@ test("counterfactual execution runs real audited tasks and supports selection pr
       policy: createDefaultPolicy(),
       proof: runtime.proof,
       capabilities: runtime.capabilities,
-      executor: (task, context) => runTask({ task, auditStore, policy: context.policy, registry: createBuiltInRegistry({ workspaceRoot: context.workspaceRoot, stateDir: state, auditStore }), runLedger: runtime.ledger })
+      executor: (task: any, context: any) => runTask({ task, auditStore, policy: context.policy, registry: createBuiltInRegistry({ workspaceRoot: context.workspaceRoot, stateDir: state, auditStore }), runLedger: runtime.ledger })
     });
-    assert.deepEqual(execution.results.map((result) => result.status), ["completed-unverified", "completed-unverified"]);
-    assert.deepEqual(execution.results.flatMap((result) => result.tasks.map((task) => task.output?.content)), ["before\n", "before\n"]);
+    assert.deepEqual(execution.results.map((result: any) => result.status), ["completed-unverified", "completed-unverified"]);
+    assert.deepEqual(execution.results.flatMap((result: any) => result.tasks.map((task: any) => task.output?.content)), ["before\n", "before\n"]);
     const preview = await runtime.counterfactual.select(group.groupId, group.candidates[0].runId);
     assert.equal(preview.applied, false);
     assert.match(preview.warning, /--apply/);
-    assert.equal(runtime.counterfactual.compare(group.groupId).candidates.filter((candidate) => candidate.status === "completed").length, 2);
+    assert.equal(runtime.counterfactual.compare(group.groupId).candidates.filter((candidate: any) => candidate.status === "completed").length, 2);
   } finally { runtime.ledger.close(); }
 });
 
@@ -146,7 +146,7 @@ test("kernel execution enforces Sentinel and capability tokens at the real tool 
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: state });
   try {
     const policy = createDefaultPolicy({ invariants: [{ id: "deny-prod", type: "command.deny-pattern", values: ["terraform apply"], enforcement: "block" }] });
-    await assert.rejects(runTask({ task: { id: "run-kernel-block", tool: "text.echo", input: { text: "terraform apply" }, actor: "test" }, auditStore, policy, registry, runLedger: runtime.ledger }), (error) => error.code === "POLICY_VIOLATION");
+    await assert.rejects(runTask({ task: { id: "run-kernel-block", tool: "text.echo", input: { text: "terraform apply" }, actor: "test" }, auditStore, policy, registry, runLedger: runtime.ledger }), (error: any) => error.code === "POLICY_VIOLATION");
     assert.equal(runtime.ledger.getRun("run-kernel-block").status, "blocked");
 
     runtime.ledger.ensureRun({ runId: "run-kernel-cap", objective: "capability execution" });

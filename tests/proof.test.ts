@@ -14,14 +14,14 @@ import {
   verifyProof
 } from "../packages/kernel/src/proof.ts";
 
-async function fixture(runId = "run_proof_test") {
+async function fixture(runId: any = "run_proof_test") {
   const root = await mkdtemp(join(tmpdir(), "odinn-proof-"));
   const ledger = createRunLedger({ stateDir: join(root, ".odinn"), workspaceRoot: root, featureFlags: { proof: true } });
   ledger.ensureRun({ runId, objective: "verify the proof contract" });
   return { root, ledger, runId };
 }
 
-function contract(runId, assertions, id = "proof_contract") {
+function contract(runId: any, assertions: any, id: any = "proof_contract") {
   return { schemaVersion: 1, id, runId, assertions };
 }
 
@@ -100,24 +100,24 @@ test("Proof verifies command exit/output and file assertions without invoking a 
     assert.equal(result.status, "passed");
     assert.equal(result.passed, true);
     assert.equal(result.assertions.length, 4);
-    assert.ok(result.assertions.every((assertion) => assertion.passed));
+    assert.ok(result.assertions.every((assertion: any) => assertion.passed));
     await assert.rejects(access(injected), /ENOENT/);
 
     const persisted = ledger.database.db.prepare("SELECT * FROM verification_contracts WHERE id = ?").get("proof_pass");
     assert.equal(persisted.run_id, runId);
     assert.equal(persisted.version, 1);
     assert.equal(JSON.parse(persisted.contract_json).id, "proof_pass");
-    const contractDigest = ledger.getRun(runId).events.find((event) => event.type === "verification-started").payload.contractDigest;
+    const contractDigest = ledger.getRun(runId).events.find((event: any) => event.type === "verification-started").payload.contractDigest;
     assert.match(contractDigest, /^[a-f0-9]{64}$/);
     assert.equal(ledger.database.db.prepare("SELECT COUNT(*) AS count FROM artifacts WHERE digest = ?").get(contractDigest).count, 1);
     const rows = ledger.database.db.prepare("SELECT * FROM assertion_results WHERE contract_id = ?").all("proof_pass")
-      .sort((left, right) => JSON.parse(left.result_json).sequence - JSON.parse(right.result_json).sequence);
+      .sort((left: any, right: any) => JSON.parse(left.result_json).sequence - JSON.parse(right.result_json).sequence);
     assert.equal(rows.length, 4);
-    assert.deepEqual(rows.map((row) => row.status), ["passed", "passed", "passed", "passed"]);
+    assert.deepEqual(rows.map((row: any) => row.status), ["passed", "passed", "passed", "passed"]);
     assert.equal(JSON.parse(rows[0].evidence_artifact_ids_json).length, 2);
-    assert.ok(JSON.parse(rows[0].evidence_artifact_ids_json).every((digest) => /^[a-f0-9]{64}$/.test(digest)));
+    assert.ok(JSON.parse(rows[0].evidence_artifact_ids_json).every((digest: any) => /^[a-f0-9]{64}$/.test(digest)));
     assert.equal(ledger.getRun(runId).status, "verified");
-    assert.deepEqual(ledger.getRun(runId).events.slice(-6).map((event) => event.type), [
+    assert.deepEqual(ledger.getRun(runId).events.slice(-6).map((event: any) => event.type), [
       "verification-started",
       "assertion-result",
       "assertion-result",
@@ -132,11 +132,11 @@ test("Proof verifies command exit/output and file assertions without invoking a 
 
 test("Proof verifies HTTP and git assertions through bounded real operations", async () => {
   const { root, ledger, runId } = await fixture("run_proof_http_git");
-  const server = createServer((request, response) => {
+  const server = createServer((request: any, response: any) => {
     response.writeHead(200, { "content-type": "text/plain" });
     response.end("ODINN_HTTP_OK\n");
   });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   try {
     const normalized = validateVerificationContract(contract(runId, [
@@ -153,7 +153,7 @@ test("Proof verifies HTTP and git assertions through bounded real operations", a
     assert.equal(external.assertions[0].passed, false);
     assert.match(external.assertions[0].message, /external HTTP verification is disabled/);
   } finally {
-    await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve: any) => server.close(resolve));
     ledger.close();
   }
 });
@@ -183,8 +183,8 @@ test("Proof persists every failed assertion and marks the run failed", async () 
     assert.match(result.assertions[0].message, /stdout did not match/);
     assert.match(result.assertions[1].message, /expected file to exist/);
     const rows = ledger.database.db.prepare("SELECT status, result_json FROM assertion_results WHERE contract_id = ?").all("proof_fail")
-      .sort((left, right) => JSON.parse(left.result_json).sequence - JSON.parse(right.result_json).sequence);
-    assert.deepEqual(rows.map((row) => row.status), ["failed", "failed"]);
+      .sort((left: any, right: any) => JSON.parse(left.result_json).sequence - JSON.parse(right.result_json).sequence);
+    assert.deepEqual(rows.map((row: any) => row.status), ["failed", "failed"]);
     assert.equal(JSON.parse(rows[0].result_json).actual.exitCode, 3);
     assert.equal(ledger.getRun(runId).status, "failed");
   } finally {
@@ -192,7 +192,7 @@ test("Proof persists every failed assertion and marks the run failed", async () 
   }
 });
 
-test("File assertions cannot escape the allowed root lexically or through symlinks", async (context) => {
+test("File assertions cannot escape the allowed root lexically or through symlinks", async (context: any) => {
   if (process.platform === "win32") return context.skip("symlink creation is not reliably available to unprivileged Windows CI");
   const { root, ledger, runId } = await fixture("run_proof_confined");
   const outside = join(dirname(root), `${runId}-outside.txt`);

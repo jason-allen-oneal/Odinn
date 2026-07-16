@@ -11,7 +11,7 @@ try {
   });
   process.stdout.write(result.stdout || "");
   process.stderr.write(result.stderr || "");
-} catch (error) {
+} catch (error: any) {
   const output = `${error.stdout || ""}\n${error.stderr || ""}`;
   process.stdout.write(output);
   if (/ERR_PNPM_AUDIT_BAD_RESPONSE|endpoint is being retired|\bHTTP\s*410\b/i.test(output)) {

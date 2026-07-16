@@ -9,12 +9,12 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const mode = process.argv[2];
 const ignored = new Set([".git", "node_modules", "dist", "coverage", ".pnpm-store"]);
 const textExtensions = new Set([
-  ".cjs", ".css", ".html", ".js", ".json", ".jsx", ".md", ".mjs", ".mts",
+  ".cjs", ".css", ".html", ".js", ".json", ".jsx", ".md", ".ts", ".mts",
   ".scss", ".sh", ".ts", ".tsx", ".yaml", ".yml"
 ]);
 
-async function walk(directory) {
-  const output = [];
+async function walk(directory: any): Promise<string[]> {
+  const output: string[] = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     if (ignored.has(entry.name)) continue;
     const absolute = join(directory, entry.name);
@@ -25,10 +25,10 @@ async function walk(directory) {
 }
 
 async function textFiles() {
-  return (await walk(root)).filter((file) => textExtensions.has(extname(file)));
+  return (await walk(root)).filter((file: any) => textExtensions.has(extname(file)));
 }
 
-function fail(messages) {
+function fail(messages: any) {
   for (const message of messages) console.error(message);
   process.exitCode = 1;
 }
@@ -39,11 +39,11 @@ async function checkFormat() {
     const content = await readFile(file, "utf8");
     const name = relative(root, file);
     if (content.length > 0 && !content.endsWith("\n")) errors.push(`${name}: missing final newline`);
-    content.split("\n").forEach((line, index) => {
+    content.split("\n").forEach((line: any, index: any) => {
       if (/[ \t]+$/.test(line)) errors.push(`${name}:${index + 1}: trailing whitespace`);
     });
     if (extname(file) === ".json") {
-      try { JSON.parse(content); } catch (error) { errors.push(`${name}: invalid JSON: ${error.message}`); }
+      try { JSON.parse(content); } catch (error: any) { errors.push(`${name}: invalid JSON: ${error.message}`); }
     }
   }
   if (errors.length) fail(errors);
@@ -78,7 +78,7 @@ async function workspacePackageCount() {
   return count;
 }
 
-function runWorkspaceScript(script) {
+function runWorkspaceScript(script: any) {
   const result = spawnSync(
     "pnpm",
     ["--recursive", "--if-present", "--filter", "./apps/**", "--filter", "./packages/**", "--filter", "./adapters/**", "run", script],
@@ -93,6 +93,16 @@ async function typecheck() {
   const rootPackage = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
   if (rootPackage.engines?.node !== ">=24.0.0") fail(["package.json: engines.node must remain >=24.0.0"]);
   if (await workspacePackageCount()) runWorkspaceScript("typecheck");
+  for (const config of ["tsconfig.tools.json"]) {
+    const tools = spawnSync("pnpm", ["exec", "tsc", "-p", config], {
+      cwd: root,
+      encoding: "utf8",
+      shell: process.platform === "win32"
+    });
+    if (tools.stdout) process.stdout.write(tools.stdout);
+    if (tools.stderr) process.stderr.write(tools.stderr);
+    if (tools.status !== 0) process.exit(tools.status ?? 1);
+  }
   if (!process.exitCode) console.log("typecheck contract passed");
 }
 

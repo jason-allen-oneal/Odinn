@@ -12,9 +12,9 @@ const statePath = join(prefix, "install-state.json");
 if (command === "install" || command === "upgrade") await install(command);
 else if (command === "rollback") await rollback();
 else if (command === "status") console.log(JSON.stringify(await readState(), null, 2));
-else throw new Error("usage: install.mjs install|upgrade|rollback|status [--source DIR] [--prefix DIR] [--version VERSION] [--skip-deps]");
+else throw new Error("usage: install.ts install|upgrade|rollback|status [--source DIR] [--prefix DIR] [--version VERSION] [--skip-deps]");
 
-async function install(operation) {
+async function install(operation: any) {
   const source = resolve(option("--source", process.cwd()));
   const pkg = JSON.parse(await readFile(join(source, "package.json"), "utf8"));
   if (pkg.name !== "odinn") throw new Error("install source is not an Odinn Forge package");
@@ -27,7 +27,7 @@ async function install(operation) {
   const staging = join(versions, `.staging-${process.pid}-${Date.now()}`);
   await mkdir(versions, { recursive: true, mode: 0o700 });
   await rm(staging, { recursive: true, force: true });
-  await cp(source, staging, { recursive: true, filter: (path) => !excluded(path, source) });
+  await cp(source, staging, { recursive: true, filter: (path: any) => !excluded(path, source) });
   if (!has("--skip-deps")) run(process.platform === "win32" ? "corepack.cmd" : "corepack", ["pnpm", "install", "--frozen-lockfile"], staging);
   await rm(destination, { recursive: true, force: true });
   await rename(staging, destination);
@@ -50,10 +50,10 @@ async function rollback() {
 
 async function readState() {
   try { return JSON.parse(await readFile(statePath, "utf8")); }
-  catch (error) { if (error?.code === "ENOENT") return { schemaVersion: 1, current: null, previous: null }; throw error; }
+  catch (error: any) { if (error?.code === "ENOENT") return { schemaVersion: 1, current: null, previous: null }; throw error; }
 }
 
-async function writeState(value) {
+async function writeState(value: any) {
   await mkdir(prefix, { recursive: true, mode: 0o700 });
   const temporary = `${statePath}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
@@ -72,11 +72,11 @@ async function writeLaunchers() {
   await writeFile(join(bin, "odinn.cmd"), cmd);
 }
 
-function excluded(path, source) {
+function excluded(path: any, source: any) {
   const relative = path.slice(source.length).replaceAll("\\", "/");
   return /(^|\/)(\.git|\.odinn|node_modules|dist)(\/|$)/.test(relative);
 }
-function run(commandName, commandArgs, cwd) { const result = spawnSync(commandName, commandArgs, { cwd, stdio: "inherit", shell: false }); if (result.status !== 0) throw new Error(`${commandName} failed with exit code ${result.status}`); }
-function option(name, fallback = "") { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : fallback; }
-function has(name) { return args.includes(name); }
-function shellQuote(value) { return `'${String(value).replaceAll("'", `'\\''`)}'`; }
+function run(commandName: any, commandArgs: any, cwd: any) { const result = spawnSync(commandName, commandArgs, { cwd, stdio: "inherit", shell: false }); if (result.status !== 0) throw new Error(`${commandName} failed with exit code ${result.status}`); }
+function option(name: any, fallback: any = "") { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : fallback; }
+function has(name: any) { return args.includes(name); }
+function shellQuote(value: any) { return `'${String(value).replaceAll("'", `'\\''`)}'`; }

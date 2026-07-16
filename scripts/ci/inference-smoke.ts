@@ -9,7 +9,7 @@ const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
 export async function runInferenceProtocolSmoke() {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-packaged-gateway-") );
-  const provider = createProviderServer(async (request, response) => {
+  const provider = createProviderServer(async (request: any, response: any) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
       response.writeHead(404).end();
       return;
@@ -37,7 +37,7 @@ export async function runInferenceProtocolSmoke() {
     }));
   });
   await listen(provider);
-  const providerPort = provider.address().port;
+  const providerPort = (provider.address() as any).port;
   await writeFile(join(stateDir, "config.json"), `${JSON.stringify({
     version: 1,
     auditLog: "audit.jsonl",
@@ -61,11 +61,11 @@ export async function runInferenceProtocolSmoke() {
   let childError = "";
   let childOutput = "";
   child.stdout.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => { childOutput += chunk; });
-  child.on("error", (error) => { childError += `\n[child error] ${error.message}`; });
-  child.on("exit", (code, signal) => { childOutput += `\n[child exit code=${code} signal=${signal}]`; });
+  child.stdout.on("data", (chunk: any) => { childOutput += chunk; });
+  child.on("error", (error: any) => { childError += `\n[child error] ${error.message}`; });
+  child.on("exit", (code: any, signal: any) => { childOutput += `\n[child exit code=${code} signal=${signal}]`; });
   child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => { childError += chunk; });
+  child.stderr.on("data", (chunk: any) => { childError += chunk; });
   try {
     const gatewayPort = await waitForChildPort(child, () => childOutput, () => childError);
     const gatewayBase = `http://127.0.0.1:${gatewayPort}`;
@@ -83,55 +83,55 @@ export async function runInferenceProtocolSmoke() {
       })
     });
     if (!response.ok) throw new Error(`packaged gateway returned HTTP ${response.status}: ${await response.text()}`);
-    const result = await response.json();
-    const run = await (await fetch(`${gatewayBase}/runs/run_ci_packaged_gateway`, { headers: { cookie } })).json();
-    const persisted = run.events?.find((event) => event.type === "task.completed")?.data?.output?.content;
+    const result: any = await response.json();
+    const run: any = await (await fetch(`${gatewayBase}/runs/run_ci_packaged_gateway`, { headers: { cookie } })).json();
+    const persisted = run.events?.find((event: any) => event.type === "task.completed")?.data?.output?.content;
     if (result.output?.content !== "ODINN_PACKAGED_GATEWAY_OK" || persisted !== "ODINN_PACKAGED_GATEWAY_OK") {
       throw new Error(`configured provider response was not persisted: ${JSON.stringify({ result, persisted })}`);
     }
     return result.output;
-  } catch (error) {
+  } catch (error: any) {
     throw new Error(`${error.message}${error.cause ? ` (${error.cause.message})` : ""}; child=${childOutput}${childError}`);
   } finally {
     child.kill();
-    await new Promise((resolve) => child.once("close", resolve));
+    await new Promise((resolve: any) => child.once("close", resolve));
     await close(provider);
   }
 }
 
-async function listen(server) {
-  await new Promise((resolve, reject) => {
+async function listen(server: any) {
+  await new Promise((resolve: any, reject: any) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
   });
 }
 
-async function close(server) {
-  await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+async function close(server: any) {
+  await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
 }
 
-async function waitForChildPort(child, getOutput, getError) {
+async function waitForChildPort(child: any, getOutput: any, getError: any) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     const match = getOutput().match(/"port"\s*:\s*(\d+)/);
     if (match && Number(match[1]) > 0) return Number(match[1]);
     if (child.exitCode !== null) throw new Error(`packaged gateway exited before binding: ${getError() || getOutput() || "no output"}`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve: any) => setTimeout(resolve, 100));
   }
   throw new Error(`packaged gateway did not report a port: ${getError() || getOutput() || "no output"}`);
 }
 
-async function waitForStatus(url, cookie, child, getChildError) {
+async function waitForStatus(url: any, cookie: any, child: any, getChildError: any) {
   let lastError;
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
       const response = await fetch(url, { headers: { cookie } });
       if (response.ok) return response.json();
       lastError = new Error(`gateway status returned ${response.status}`);
-    } catch (error) {
+    } catch (error: any) {
       lastError = error;
       if (child.exitCode !== null) throw new Error(`packaged gateway exited with ${child.exitCode}: ${getChildError() || "no stderr"}`);
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve: any) => setTimeout(resolve, 100));
   }
   throw new Error(`timed out waiting for packaged gateway: ${lastError?.message ?? "unknown error"}; child=${getChildError() || "no output"}`);
 }

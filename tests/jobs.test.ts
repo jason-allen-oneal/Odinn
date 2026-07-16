@@ -6,11 +6,11 @@ import test from "node:test";
 import { JobSupervisor } from "../packages/kernel/src/jobs.ts";
 import { FileAuditStore, FileJobStore } from "../packages/store-file/src/index.ts";
 
-async function waitFor(check) {
+async function waitFor(check: any) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const value = await check();
     if (value) return value;
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve: any) => setTimeout(resolve, 10));
   }
   throw new Error("timed out waiting for job state");
 }
@@ -20,7 +20,7 @@ test("job supervisor persists completion and replays recovered work", async () =
   const store = new FileJobStore(join(root, "jobs.json"));
   const supervisor = new JobSupervisor({
     store,
-    execute: async (payload) => ({ echoed: payload.value })
+    execute: async (payload: any) => ({ echoed: payload.value })
   });
   await supervisor.start();
   const submitted = await supervisor.submit({ value: "ODINN_JOB_OK" }, { id: "job_persisted" });
@@ -31,7 +31,7 @@ test("job supervisor persists completion and replays recovered work", async () =
 
   const recoveredStore = new FileJobStore(join(root, "jobs-recovered.json"));
   await recoveredStore.create({ id: "job_crashed", status: "running", payload: { value: "recovered" }, attempts: 0 });
-  const recovered = new JobSupervisor({ store: recoveredStore, execute: async (payload) => payload });
+  const recovered = new JobSupervisor({ store: recoveredStore, execute: async (payload: any) => payload });
   await recovered.start();
   const recoveredJob = await waitFor(async () => (await recovered.get("job_crashed"))?.status === "completed" ? recovered.get("job_crashed") : undefined);
   assert.equal(recoveredJob.result.value, "recovered");
@@ -44,7 +44,7 @@ test("job supervisor supports cancellation and timeout recovery", async () => {
   const supervisor = new JobSupervisor({
     store,
     maxAttempts: 1,
-    execute: async (_payload, { signal }) => new Promise((resolve, reject) => {
+    execute: async (_payload: any, { signal }: any) => new Promise((resolve: any, reject: any) => {
       if (signal.aborted) return reject(signal.reason);
       signal.addEventListener("abort", () => reject(signal.reason), { once: true });
     })
@@ -67,9 +67,9 @@ test("job supervisor does not requeue or start work after shutdown begins", asyn
   const supervisor = new JobSupervisor({
     store,
     maxAttempts: 3,
-    execute: async (_payload, { signal }) => {
+    execute: async (_payload: any, { signal }: any) => {
       executions += 1;
-      await new Promise((resolve, reject) => {
+      await new Promise((resolve: any, reject: any) => {
         const timer = setTimeout(resolve, 100);
         signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
       });
@@ -78,7 +78,7 @@ test("job supervisor does not requeue or start work after shutdown begins", asyn
   await supervisor.start();
   await supervisor.submit({}, { id: "job_shutdown" });
   await supervisor.shutdown();
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await new Promise((resolve: any) => setTimeout(resolve, 50));
   assert.equal(executions, 1);
   assert.equal((await supervisor.get("job_shutdown")).status, "failed");
 });

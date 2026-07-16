@@ -6,9 +6,9 @@ import { join } from "node:path";
 import test from "node:test";
 import { createAuditStore, createBuiltInRegistry, listProviderPresets, normalizeModelConfig, normalizeUsage, PROVIDER_PRESETS, runTask } from "../packages/kernel/src/index.ts";
 
-async function listen(handler) {
+async function listen(handler: any) {
   const server = createServer(handler);
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   return server;
 }
 
@@ -37,7 +37,7 @@ test("provider catalog has a conformance contract for every preset", () => {
 
 test("provider transport retries transient failures and normalizes streaming output", async () => {
   let attempts = 0;
-  const server = await listen(async (request, response) => {
+  const server = await listen(async (request: any, response: any) => {
     attempts += 1;
     if (attempts === 1) {
       response.writeHead(503, { "content-type": "application/json" });
@@ -76,6 +76,6 @@ test("provider transport retries transient failures and normalizes streaming out
   } finally {
     if (previous === undefined) delete process.env.ODINN_PROVIDER_TEST_KEY;
     else process.env.ODINN_PROVIDER_TEST_KEY = previous;
-    await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve: any) => server.close(resolve));
   }
 });

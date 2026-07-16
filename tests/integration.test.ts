@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runInferenceProtocolSmoke } from "../scripts/ci/inference-smoke.mjs";
+import { runInferenceProtocolSmoke } from "../scripts/ci/inference-smoke.ts";
 
 test("packaged gateway routes a configured provider and persists the response", async () => {
   const payload = await runInferenceProtocolSmoke();

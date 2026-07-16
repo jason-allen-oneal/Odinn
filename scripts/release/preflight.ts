@@ -44,7 +44,7 @@ if (status.status !== 0) throw new Error("release preflight: git status failed")
 const relevantChanges = status.stdout
   .split("\n")
   .filter(Boolean)
-  .filter((line) => !/^(?:\?\?| M|M |A |D ) (?:dist|coverage|\.reports)(?:[/\\]|$)/.test(line));
+  .filter((line: any) => !/^(?:\?\?| M|M |A |D ) (?:dist|coverage|\.reports)(?:[/\\]|$)/.test(line));
 if (process.env.CI !== "true" && relevantChanges.length > 0) {
   throw new Error(`release preflight: working tree is not clean:\n${relevantChanges.join("\n")}`);
 }

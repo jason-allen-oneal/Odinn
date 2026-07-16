@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const directory = join(root, "dist", "release");
 const files = (await readdir(directory))
-  .filter((name) => name !== "SHA256SUMS.txt")
+  .filter((name: any) => name !== "SHA256SUMS.txt")
   .sort();
 
 const lines = [];

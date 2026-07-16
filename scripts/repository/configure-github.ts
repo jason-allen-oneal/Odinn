@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 const repository = process.argv[2] ?? "jason-allen-oneal/Odinn";
 const ownerUserId = Number(process.argv[3] ?? "8335428");
 
-function gh(endpoint, method = "GET", body) {
+function gh(endpoint: any, method: any = "GET", body: any = undefined) {
   const args = ["api", `repos/${repository}${endpoint}`, "--method", method];
   if (body !== undefined) args.push("--input", "-");
   const result = spawnSync("gh", args, {
@@ -43,7 +43,7 @@ gh("/actions/permissions/workflow", "PUT", {
 gh("/vulnerability-alerts", "PUT");
 try {
   gh("/automated-security-fixes", "PUT");
-} catch (error) {
+} catch (error: any) {
   console.warn(`Dependabot security updates could not be enabled: ${error.message}`);
 }
 
@@ -79,7 +79,7 @@ try {
       custom_branch_policies: false
     }
   });
-} catch (error) {
+} catch (error: any) {
   console.warn(`Release environment reviewer policy could not be applied: ${error.message}`);
   gh("/environments/release", "PUT", {
     wait_timer: 0,

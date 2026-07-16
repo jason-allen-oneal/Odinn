@@ -33,8 +33,8 @@ test("CLI runs a deterministic tool through the audited kernel path", async () =
   const result = JSON.parse(run.stdout);
   assert.equal(result.output.text, "ODINN_CLI_OK");
 
-  const audit = (await readFile(join(state, "audit.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-  assert.deepEqual(audit.map((event) => event.type), ["task.policy", "task.started", "task.completed"]);
+  const audit = (await readFile(join(state, "audit.jsonl"), "utf8")).trim().split("\n").map((line: any) => JSON.parse(line));
+  assert.deepEqual(audit.map((event: any) => event.type), ["task.policy", "task.started", "task.completed"]);
 
   const runs = spawnSync("node", ["apps/cli/src/cli.ts", "runs", "--state", state], {
     cwd: root,
@@ -82,8 +82,8 @@ test("CLI runs a deterministic JSON plan", async () => {
   });
   assert.equal(runs.status, 0, runs.stderr || runs.stdout);
   const summaries = JSON.parse(runs.stdout);
-  assert.ok(summaries.some((summary) => summary.id === "plan_cli" && summary.status === "completed"));
-  assert.ok(summaries.some((summary) => summary.id === "plan_cli:echo" && summary.status === "completed"));
+  assert.ok(summaries.some((summary: any) => summary.id === "plan_cli" && summary.status === "completed"));
+  assert.ok(summaries.some((summary: any) => summary.id === "plan_cli:echo" && summary.status === "completed"));
 });
 
 test("CLI run creates and inspects a durable Phase 0 ledger record", async () => {
@@ -193,7 +193,7 @@ test("CLI exposes explicit security posture controls", async () => {
 });
 
 test("CLI onboarding completes an OAuth PKCE callback locally", async () => {
-  const oauth = createServer(async (request, response) => {
+  const oauth = createServer(async (request: any, response: any) => {
     if (request.url !== "/oauth/token") {
       response.writeHead(404);
       response.end();
@@ -208,7 +208,7 @@ test("CLI onboarding completes an OAuth PKCE callback locally", async () => {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ access_token: "oauth-access", refresh_token: "oauth-refresh", expires_in: 3600 }));
   });
-  await new Promise((resolve) => oauth.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => oauth.listen(0, "127.0.0.1", resolve));
   const { port } = oauth.address();
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-oauth-"));
   const child = spawn("node", [
@@ -236,29 +236,29 @@ test("CLI onboarding completes an OAuth PKCE callback locally", async () => {
   ], { cwd: root, encoding: "utf8" });
   let output = "";
   try {
-    const authUrl = await new Promise((resolve, reject) => {
-      const onData = (chunk) => {
+    const authUrl = await new Promise((resolve: any, reject: any) => {
+      const onData = (chunk: any) => {
         output += chunk.toString();
         const match = output.match(/https?:\/\/[^\s]+/);
         if (match) resolve(match[0]);
       };
       child.stdout.on("data", onData);
-      child.stderr.on("data", (chunk) => { output += chunk.toString(); });
+      child.stderr.on("data", (chunk: any) => { output += chunk.toString(); });
       child.once("error", reject);
-      child.once("close", (code) => code !== 0 && reject(new Error(output || `onboard exited ${code}`)));
+      child.once("close", (code: any) => code !== 0 && reject(new Error(output || `onboard exited ${code}`)));
     });
     const authorization = new URL(authUrl);
     const callback = new URL(authorization.searchParams.get("redirect_uri"));
     callback.searchParams.set("code", "cli-test-code");
     callback.searchParams.set("state", authorization.searchParams.get("state"));
     assert.equal((await fetch(callback)).status, 200);
-    const exitCode = await new Promise((resolve) => child.once("close", resolve));
+    const exitCode = await new Promise((resolve: any) => child.once("close", resolve));
     assert.equal(exitCode, 0, output);
     const token = JSON.parse(await readFile(join(state, "oauth", "local-oauth.json"), "utf8"));
     assert.equal(token.accessToken, "oauth-access");
   } finally {
     if (!child.killed) child.kill();
-    await new Promise((resolve, reject) => oauth.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => oauth.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
@@ -292,7 +292,7 @@ test("CLI exposes URL-free presets for hosted and local providers", async () => 
   ], { cwd: root, encoding: "utf8" });
   assert.equal(catalog.status, 0, catalog.stderr || catalog.stdout);
   const providers = JSON.parse(catalog.stdout);
-  const byName = new Map(providers.map((provider) => [provider.name, provider]));
+  const byName = new Map(providers.map((provider: any) => [provider.name, provider]));
   assert.ok(byName.size >= 30);
   assert.deepEqual(byName.get("groq"), {
     name: "groq",

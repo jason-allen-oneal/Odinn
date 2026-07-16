@@ -1,6 +1,5 @@
 {
   "compilerOptions": {
-    "allowJs": true,
     "allowImportingTsExtensions": true,
     "forceConsistentCasingInFileNames": true,
     "module": "NodeNext",

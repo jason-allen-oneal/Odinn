@@ -15,7 +15,7 @@ const normalizedRoot = root.replace(/\/$/, "");
 test("gateway exposes status, run execution, plans, and run summaries", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const base = `http://127.0.0.1:${port}`;
   try {
@@ -28,7 +28,7 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
     assert.ok(status.tools.includes("agent.run"));
     assert.equal(status.security.web.allowPrivateNetwork, false);
     assert.equal(status.security.browser.requireApproval, true);
-    assert.ok(status.toolDetails.some((tool) => tool.name === "text.echo" && tool.capability === "text.echo"));
+    assert.ok(status.toolDetails.some((tool: any) => tool.name === "text.echo" && tool.capability === "text.echo"));
 
     const run = await postJson(`${base}/run`, { tool: "text.echo", input: { text: "ODINN_GATEWAY_OK" } });
     assert.equal(run.ok, true);
@@ -43,21 +43,21 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
     assert.equal(plan.steps[0].result.output.text, "ODINN_GATEWAY_PLAN_OK");
 
     const runs = await getJson(`${base}/runs`);
-    assert.ok(runs.some((summary) => summary.id === run.id && summary.status === "completed"));
-    assert.ok(runs.some((summary) => summary.id === "plan_gateway" && summary.status === "completed"));
+    assert.ok(runs.some((summary: any) => summary.id === run.id && summary.status === "completed"));
+    assert.ok(runs.some((summary: any) => summary.id === "plan_gateway" && summary.status === "completed"));
 
     const runDetail = await getJson(`${base}/runs/${encodeURIComponent(run.id)}`);
     assert.equal(runDetail.id, run.id);
     assert.equal(runDetail.events.length, 3);
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
 test("gateway serves the local console shell", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-console-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   try {
     const response = await fetch(`http://127.0.0.1:${port}/`);
@@ -91,14 +91,14 @@ test("gateway serves the local console shell", async () => {
     assert.equal(logo.status, 200);
     assert.match(logo.headers.get("content-type"), /image\/png/);
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
 test("gateway stops browser state changes for explicit approval", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-approvals-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const base = `http://127.0.0.1:${port}`;
   try {
@@ -114,11 +114,11 @@ test("gateway stops browser state changes for explicit approval", async () => {
     const runs = await getJson(`${base}/runs`);
     assert.equal(runs[0].status, "awaiting_approval");
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
-test("gateway reuses one browser worker across sequential browser tasks", async (t) => {
+test("gateway reuses one browser worker across sequential browser tasks", async (t: any) => {
   const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
   try {
     await access(chromiumPath);
@@ -128,7 +128,7 @@ test("gateway reuses one browser worker across sequential browser tasks", async 
   }
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-browser-worker-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const base = `http://127.0.0.1:${port}`;
   try {
@@ -142,11 +142,11 @@ test("gateway reuses one browser worker across sequential browser tasks", async 
     assert.equal(snapshot.ok, true);
     assert.equal(snapshot.output.id, tabs.output.tabs[0].id);
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
-test("gateway closes and reopens the persistent browser profile cleanly", async (t) => {
+test("gateway closes and reopens the persistent browser profile cleanly", async (t: any) => {
   const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
   try {
     await access(chromiumPath);
@@ -156,7 +156,7 @@ test("gateway closes and reopens the persistent browser profile cleanly", async 
   }
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-browser-restart-"));
   const first = await createGatewayServer({ stateDir, workspaceRoot: root });
-  await new Promise((resolve) => first.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => first.listen(0, "127.0.0.1", resolve));
   const firstBase = `http://127.0.0.1:${first.address().port}`;
   let stableTabId;
   try {
@@ -164,11 +164,11 @@ test("gateway closes and reopens the persistent browser profile cleanly", async 
     assert.equal(opened.ok, true);
     stableTabId = opened.output.id;
   } finally {
-    await new Promise((resolve, reject) => first.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => first.close((error: any) => error ? reject(error) : resolve()));
   }
 
   const second = await createGatewayServer({ stateDir, workspaceRoot: root });
-  await new Promise((resolve) => second.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => second.listen(0, "127.0.0.1", resolve));
   const secondBase = `http://127.0.0.1:${second.address().port}`;
   try {
     const tabs = await postJson(`${secondBase}/run`, { tool: "browser.tabs", input: {} });
@@ -179,16 +179,16 @@ test("gateway closes and reopens the persistent browser profile cleanly", async 
     });
     assert.equal(snapshot.ok, true);
   } finally {
-    await new Promise((resolve, reject) => second.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => second.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
-test("gateway blocks retries after an uncertain browser mutation until recovery is resolved", async (t) => {
+test("gateway blocks retries after an uncertain browser mutation until recovery is resolved", async (t: any) => {
   const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
   try { await access(chromiumPath); } catch { t.skip(`Chromium not available at ${chromiumPath}`); return; }
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-browser-recovery-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const opened = await postJson(`${base}/run`, { tool: "browser.open", input: { url: "https://example.com" } });
@@ -205,13 +205,13 @@ test("gateway blocks retries after an uncertain browser mutation until recovery 
     assert.match(blocked.error, /uncertain outcome/);
     const resolved = await postJson(`${base}/run`, { tool: "browser.recovery.resolve", input: { outcome: "not-applied", note: "missing selector did not mutate the page" } });
     assert.equal(resolved.output.recovery.status, "resolved");
-  } finally { await new Promise((resolve) => server.close(() => resolve())); }
+  } finally { await new Promise((resolve: any) => server.close(() => resolve())); }
 });
 
 test("gateway rejects invalid and oversized JSON bodies", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-limits-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root, requestMaxBytes: 32 });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const base = `http://127.0.0.1:${port}`;
   try {
@@ -231,14 +231,14 @@ test("gateway rejects invalid and oversized JSON bodies", async () => {
     assert.equal(oversized.status, 413);
     assert.match((await oversized.json()).error, /exceeds 32 bytes/);
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
 test("gateway can replay a persisted task with a new id", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-replay-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const original = await postJson(`${base}/run`, { id: "run_replay_source", tool: "text.echo", input: { text: "replay me" } });
@@ -251,14 +251,14 @@ test("gateway can replay a persisted task with a new id", async () => {
     assert.equal(replay.status, 200);
     assert.equal((await replay.json()).output.text, "replay me");
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
 test("gateway exposes memory remember, search, correction, and curated views", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-memory-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const base = `http://127.0.0.1:${port}`;
   try {
@@ -278,7 +278,7 @@ test("gateway exposes memory remember, search, correction, and curated views", a
     assert.equal(recalled.memories[0].id, stored.id);
 
     const browsed = await getJson(`${base}/memory/browse?namespace=project`);
-    assert.ok(browsed.namespaces.some((entry) => entry.namespace === "project/memory"));
+    assert.ok(browsed.namespaces.some((entry: any) => entry.namespace === "project/memory"));
 
     const corrected = await postJson(`${base}/memory/corrections`, {
       targetId: stored.id,
@@ -291,14 +291,14 @@ test("gateway exposes memory remember, search, correction, and curated views", a
     assert.equal(curated.count, 1);
     assert.equal(curated.kinds.correction[0].text, "Memory records must preserve provenance and supersession.");
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
 test("gateway exposes sessions, goals, and improvement proposals", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-records-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const base = `http://127.0.0.1:${port}`;
   try {
@@ -332,7 +332,7 @@ test("gateway exposes sessions, goals, and improvement proposals", async () => {
     assert.equal(deletedResponse.status, 200);
     assert.equal((await deletedResponse.json()).type, "session.deleted");
     const sessions = await getJson(`${base}/sessions`);
-    assert.equal(sessions.sessions.some((entry) => entry.id === session.id), false);
+    assert.equal(sessions.sessions.some((entry: any) => entry.id === session.id), false);
 
     const goal = await postJson(`${base}/goals`, { title: "Reach beta" });
     assert.equal(goal.type, "goal.created");
@@ -361,7 +361,7 @@ test("gateway exposes sessions, goals, and improvement proposals", async () => {
     const improvements = await getJson(`${base}/improvements`);
     assert.equal(improvements.improvements[0].status, "approved");
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
@@ -374,7 +374,7 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
     experimental: { proof: true, rewind: true, sentinel: true, capsules: true, darwin: true, capabilities: true, counterfactual: true }
   }));
   const server = await createGatewayServer({ stateDir, workspaceRoot });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     const status = await getJson(`${base}/status`);
@@ -399,7 +399,7 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
 
     const timeline = await getJson(`${base}/runtime/runs/gateway-runtime-run`);
     assert.equal(timeline.status, "completed-unverified");
-    assert.ok(timeline.events.some((event) => event.type === "capability-consumed"));
+    assert.ok(timeline.events.some((event: any) => event.type === "capability-consumed"));
     assert.equal(JSON.stringify(timeline).includes(issued.token), false);
     assert.equal((await getJson(`${base}/runtime/runs/gateway-runtime-run/verify`)).valid, true);
 
@@ -437,7 +437,7 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
     assert.equal(verifiedCapsule.valid, true);
     assert.ok(verifiedCapsule.entries.includes("contract.json"));
     assert.ok(verifiedCapsule.entries.includes("policy.json"));
-    assert.ok(verifiedCapsule.entries.some((entry) => entry.startsWith("artifacts/")));
+    assert.ok(verifiedCapsule.entries.some((entry: any) => entry.startsWith("artifacts/")));
 
     const observed = await postJson(`${base}/routing/observe`, {
       runId: "gateway-runtime-run", providerId: "test", modelId: "verified", taskClass: "general", verified: true, durationMs: 10
@@ -454,7 +454,7 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
     assert.equal(branch.candidates.length, 2);
     assert.equal((await getJson(`${base}/counterfactual/${branch.groupId}`)).candidates.length, 2);
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
@@ -483,17 +483,17 @@ test("gateway entrypoint resolves filtered pnpm workspace root from the invocati
     assert.equal(plan.steps[0].result.output.workspaceRoot, normalizedRoot);
   } finally {
     child.kill();
-    await new Promise((resolve) => child.once("close", resolve));
+    await new Promise((resolve: any) => child.once("close", resolve));
   }
 });
 
-async function getJson(url) {
+async function getJson(url: any) {
   const response = await fetch(url);
   assert.equal(response.status, 200);
   return response.json();
 }
 
-async function postJson(url, body) {
+async function postJson(url: any, body: any) {
   const response = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -503,14 +503,14 @@ async function postJson(url, body) {
   return response.json();
 }
 
-async function waitForStatus(url) {
+async function waitForStatus(url: any) {
   let lastError;
   for (let attempt = 0; attempt < 30; attempt += 1) {
     try {
       return await getJson(url);
     } catch (error) {
       lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve: any) => setTimeout(resolve, 100));
     }
   }
   throw lastError;
@@ -518,8 +518,8 @@ async function waitForStatus(url) {
 
 async function openPort() {
   const server = createTcpServer();
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
-  await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   return port;
 }

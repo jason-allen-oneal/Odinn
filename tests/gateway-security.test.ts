@@ -10,7 +10,7 @@ import { createApprovalStore } from "../packages/kernel/src/index.ts";
 test("gateway control surfaces require bootstrap authentication and reject cross-origin mutations", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-security-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     assert.equal((await fetch(`${base}/status`)).status, 401);
@@ -36,7 +36,7 @@ test("gateway control surfaces require bootstrap authentication and reject cross
     });
     assert.equal(hostileOrigin.status, 403);
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
@@ -58,19 +58,19 @@ test("approval records survive restart and claim idempotently", async () => {
 test("gateway state files and directory are owner-only", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-permissions-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   try {
     await stat(join(stateDir, "config.json"));
     assert.equal((await stat(stateDir)).mode & 0o777, 0o700);
     assert.equal((await stat(join(stateDir, "config.json"))).mode & 0o777, 0o600);
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
-function requestRaw({ port, path, headers = {} }) {
-  return new Promise((resolve, reject) => {
-    const request = httpRequest({ host: "127.0.0.1", port, path, headers }, (response) => {
+function requestRaw({ port, path, headers = {} }: any) {
+  return new Promise((resolve: any, reject: any) => {
+    const request = httpRequest({ host: "127.0.0.1", port, path, headers }, (response: any) => {
       response.resume();
       response.on("end", () => resolve({ status: response.statusCode }));
     });

@@ -11,7 +11,7 @@ Requirements:
 Run:
 
 ```bash
-node scripts/repository/configure-github.mjs jason-allen-oneal/Odinn 8335428
+node scripts/repository/configure-github.ts jason-allen-oneal/Odinn 8335428
 ```
 
 The script configures:

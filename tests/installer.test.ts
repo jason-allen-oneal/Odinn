@@ -22,7 +22,7 @@ test("native installer upgrades by atomic pointer and rolls back to the previous
   assert.equal(rolledBack.previous, upgraded.current);
 });
 
-function run(args) {
-  const result = spawnSync(process.execPath, [join(root, "scripts", "install.mjs"), ...args], { cwd: root, encoding: "utf8" });
+function run(args: any) {
+  const result = spawnSync(process.execPath, [join(root, "scripts", "install.ts"), ...args], { cwd: root, encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr || result.stdout);
 }

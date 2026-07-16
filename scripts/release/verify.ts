@@ -13,7 +13,7 @@ const sums = (await readFile(join(releaseDir, "SHA256SUMS.txt"), "utf8"))
   .trim()
   .split("\n")
   .filter(Boolean)
-  .map((line) => {
+  .map((line: any) => {
     const match = /^([a-f0-9]{64})  (.+)$/.exec(line);
     if (!match) throw new Error(`invalid checksum line: ${line}`);
     return { digest: match[1], name: match[2] };
@@ -24,7 +24,7 @@ for (const { digest, name } of sums) {
   if (actual !== digest) throw new Error(`checksum mismatch for ${name}`);
 }
 
-function run(command, args) {
+function run(command: any, args: any) {
   const result = spawnSync(command, args, { encoding: "utf8" });
   if (result.status !== 0) throw new Error(`${command} failed: ${result.stderr || result.stdout}`);
 }

@@ -29,7 +29,7 @@ test("kernel executes an allowed deterministic tool and audits the run", async (
   assert.equal(result.output.text, "ODINN_KERNEL_OK");
 
   const audit = JSON.parse(`[${(await readFile(join(root, ".odinn", "audit.jsonl"), "utf8")).trim().split("\n").join(",")}]`);
-  assert.deepEqual(audit.map((event) => event.type), ["task.policy", "task.started", "task.completed"]);
+  assert.deepEqual(audit.map((event: any) => event.type), ["task.policy", "task.started", "task.completed"]);
   assert.equal(audit[0].decision, "allow");
 
   const runs = await auditStore.readRuns();
@@ -67,7 +67,7 @@ test("security policy is safe by default and supports explicit posture changes",
 });
 
 test("kernel routes model.chat through an OpenAI-compatible provider", async () => {
-  const provider = createHttpServer(async (request, response) => {
+  const provider = createHttpServer(async (request: any, response: any) => {
     assert.equal(request.url, "/v1/chat/completions");
     assert.equal(request.headers.authorization, "Bearer test-key");
     let raw = "";
@@ -82,7 +82,7 @@ test("kernel routes model.chat through an OpenAI-compatible provider", async () 
       usage: { total_tokens: 3 }
     }));
   });
-  await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => provider.listen(0, "127.0.0.1", resolve));
   const { port } = provider.address();
   const { root, auditStore } = await fixture();
   const registry = createBuiltInRegistry({
@@ -119,12 +119,12 @@ test("kernel routes model.chat through an OpenAI-compatible provider", async () 
   } finally {
     if (previousKey === undefined) delete process.env.ODINN_TEST_API_KEY;
     else process.env.ODINN_TEST_API_KEY = previousKey;
-    await new Promise((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => provider.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
 test("kernel refreshes OAuth credentials before model execution", async () => {
-  const providerServer = createHttpServer(async (request, response) => {
+  const providerServer = createHttpServer(async (request: any, response: any) => {
     if (request.url === "/oauth/token") {
       let raw = "";
       for await (const chunk of request) raw += chunk;
@@ -143,7 +143,7 @@ test("kernel refreshes OAuth credentials before model execution", async () => {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ output_text: "ODINN_OAUTH_OK" }));
   });
-  await new Promise((resolve) => providerServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => providerServer.listen(0, "127.0.0.1", resolve));
   const { port } = providerServer.address();
   const { root, auditStore } = await fixture();
   const config = {
@@ -183,18 +183,18 @@ test("kernel refreshes OAuth credentials before model execution", async () => {
     assert.equal(result.output.content, "ODINN_OAUTH_OK");
     assert.equal(result.output.provider, "oauth");
   } finally {
-    await new Promise((resolve, reject) => providerServer.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => providerServer.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
 test("kernel speaks the ChatGPT Codex SSE transport for imported OAuth", async () => {
-  const providerServer = createHttpServer(async (request, response) => {
+  const providerServer = createHttpServer(async (request: any, response: any) => {
     assert.equal(request.url, "/responses");
     assert.equal(request.headers.authorization, "Bearer codex-access");
     assert.equal(request.headers.originator, "openclaw");
-    const body = JSON.parse(await new Promise((resolve) => {
+    const body = JSON.parse(await new Promise((resolve: any) => {
       let raw = "";
-      request.on("data", (chunk) => { raw += chunk; });
+      request.on("data", (chunk: any) => { raw += chunk; });
       request.on("end", () => resolve(raw));
     }));
     assert.equal(body.stream, true);
@@ -206,7 +206,7 @@ test("kernel speaks the ChatGPT Codex SSE transport for imported OAuth", async (
       'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_test","usage":{"total_tokens":3}}}\n\n'
     ].join(""));
   });
-  await new Promise((resolve) => providerServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => providerServer.listen(0, "127.0.0.1", resolve));
   const { port } = providerServer.address();
   const { root, auditStore } = await fixture();
   const stateDir = join(root, ".odinn");
@@ -242,7 +242,7 @@ test("kernel speaks the ChatGPT Codex SSE transport for imported OAuth", async (
     assert.equal(result.output.content, "ODINN_CODEX_OK");
     assert.equal(result.output.id, "resp_test");
   } finally {
-    await new Promise((resolve, reject) => providerServer.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => providerServer.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
@@ -329,13 +329,13 @@ test("self-improvement autonomously applies and rolls back allowlisted runtime t
 
 test("web.fetch rejects a public-looking hostname that resolves to loopback", async () => {
   const { root, auditStore } = await fixture();
-  const server = createServer((_request, response) => response.end("private"));
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const server = createServer((_request: any, response: any) => response.end("private"));
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn") });
   try {
     await assert.rejects(runTask({ task: { id: "run-dns-rebind", tool: "web.fetch", input: { url: `http://127.0.0.1.nip.io:${server.address().port}/` }, actor: "test" }, auditStore, registry }), /private|link-local|DNS validation/);
   } finally {
-    await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve: any) => server.close(resolve));
   }
 });
 
@@ -374,11 +374,11 @@ test("kernel runs deterministic multi-step plans and materializes plan state", a
 
   const plan = await auditStore.readRun("plan_smoke");
   assert.equal(plan.status, "completed");
-  assert.equal(plan.events.map((event) => event.type).join(","), "plan.started,plan.completed");
+  assert.equal(plan.events.map((event: any) => event.type).join(","), "plan.started,plan.completed");
 
   const runs = await auditStore.readRuns();
-  assert.ok(runs.some((run) => run.id === "plan_smoke:health" && run.status === "completed"));
-  assert.ok(runs.some((run) => run.id === "plan_smoke:echo" && run.status === "completed"));
+  assert.ok(runs.some((run: any) => run.id === "plan_smoke:health" && run.status === "completed"));
+  assert.ok(runs.some((run: any) => run.id === "plan_smoke:echo" && run.status === "completed"));
 });
 
 test("memory records are typed, searchable, curated, and superseded by corrections", async () => {
@@ -440,7 +440,7 @@ test("memory records are typed, searchable, curated, and superseded by correctio
     auditStore,
     registry
   });
-  assert.ok(browsed.output.namespaces.some((entry) => entry.namespace === "user/preferences"));
+  assert.ok(browsed.output.namespaces.some((entry: any) => entry.namespace === "user/preferences"));
 });
 
 test("memory compacts session context into an L0 summary", async () => {
@@ -467,7 +467,7 @@ test("memory compacts session context into an L0 summary", async () => {
 
 test("agent auto-learns explicit facts and recalls them into later model context", async () => {
   const requests = [];
-  const provider = createHttpServer(async (request, response) => {
+  const provider = createHttpServer(async (request: any, response: any) => {
     let raw = "";
     for await (const chunk of request) raw += chunk;
     requests.push(JSON.parse(raw));
@@ -477,7 +477,7 @@ test("agent auto-learns explicit facts and recalls them into later model context
       choices: [{ message: { role: "assistant", content: "Memory-aware response." } }]
     }));
   });
-  await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve: any) => provider.listen(0, "127.0.0.1", resolve));
   const { port } = provider.address();
   const { root, auditStore } = await fixture();
   const registry = createBuiltInRegistry({
@@ -526,10 +526,10 @@ test("agent auto-learns explicit facts and recalls them into later model context
       registry
     });
     assert.equal(recalled.output.memory.recalled, 1);
-    const contextMessage = requests[1].messages.find((message) => message.content.includes("Durable context recalled"));
+    const contextMessage = requests[1].messages.find((message: any) => message.content.includes("Durable context recalled"));
     assert.match(contextMessage.content, /dark themes/);
   } finally {
-    await new Promise((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve: any, reject: any) => provider.close((error: any) => error ? reject(error) : resolve()));
   }
 });
 
@@ -586,7 +586,7 @@ test("kernel records sessions, goals, and self-improvement proposals", async () 
     auditStore,
     registry
   });
-  assert.equal(sessions.output.sessions.some((entry) => entry.id === session.output.id), false);
+  assert.equal(sessions.output.sessions.some((entry: any) => entry.id === session.output.id), false);
   await assert.rejects(
     () => runTask({
       task: { id: "run_session_message_deleted", tool: "session.message", input: { sessionId: session.output.id, role: "user", content: "Should fail" }, actor: "test" },

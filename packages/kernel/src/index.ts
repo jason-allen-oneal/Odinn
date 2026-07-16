@@ -572,7 +572,7 @@ export function listProviderPresets() {
   }));
 }
 
-export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore }: any = {}) {
+export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore, resolveNetworkAddresses = dnsLookupAll }: any = {}) {
   const root = resolve(workspaceRoot);
   const recordStore = new FileRecordStore(join(resolve(stateDir), "records.jsonl"));
   const modelConfig = normalizeModelConfig(config);
@@ -623,7 +623,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["web.fetch", {
       capability: "web.read",
       description: "Fetch and extract readable content from a public web page.",
-      execute: async (input: any, context: any) => withWebRequestSlot(() => fetchWebPage(input, context.policy?.security?.web))
+      execute: async (input: any, context: any) => withWebRequestSlot(() => fetchWebPage(input, context.policy?.security?.web, resolveNetworkAddresses))
     }],
     ["browser.tabs", {
       capability: "browser.read",
@@ -633,7 +633,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
     ["browser.open", {
       capability: "browser.read",
       description: "Open a URL in Ódinn Forge's persistent browser profile.",
-      execute: async (input: any, context: any) => browserOpen(stateDir, input, context.policy?.security?.browser)
+      execute: async (input: any, context: any) => browserOpen(stateDir, input, context.policy?.security?.browser, resolveNetworkAddresses)
     }],
     ["browser.snapshot", {
       capability: "browser.read",
@@ -924,9 +924,9 @@ function normalizeSearchUrl(value: any) {
   }
 }
 
-async function fetchWebPage(input: any = {}, security: any = {}) {
+async function fetchWebPage(input: any = {}, security: any = {}, resolveNetworkAddresses: any = dnsLookupAll) {
   const url = assertPublicWebUrl(input.url, security);
-  const response: any = await fetchPublicUrl(url, security);
+  const response: any = await fetchPublicUrl(url, security, resolveNetworkAddresses);
   const bytes = response.body;
   if (bytes.byteLength > WEB_MAX_BYTES) throw new Error(`web page exceeds ${WEB_MAX_BYTES} bytes`);
   const raw = bytes.toString("utf8");
@@ -943,10 +943,10 @@ async function fetchWebPage(input: any = {}, security: any = {}) {
   };
 }
 
-async function fetchPublicUrl(url: any, security: any) {
+async function fetchPublicUrl(url: any, security: any, resolveNetworkAddresses: any = dnsLookupAll) {
   let current = url;
   for (let redirects = 0; redirects <= 5; redirects += 1) {
-    const response: any = await requestValidatedUrl(current, security);
+    const response: any = await requestValidatedUrl(current, security, resolveNetworkAddresses);
     if (![301, 302, 303, 307, 308].includes(response.status)) return response;
     const location = response.headers.location;
     if (!location) return response;
@@ -967,10 +967,10 @@ function assertPublicWebUrl(value: any, security: any = {}) {
   return parsed.href;
 }
 
-async function requestValidatedUrl(value: any, security: any = {}) {
+async function requestValidatedUrl(value: any, security: any = {}, resolveNetworkAddresses: any = dnsLookupAll) {
   const parsed = new URL(assertPublicWebUrl(value, security));
   const transport = parsed.protocol === "https:" ? httpsRequest : httpRequest;
-  const addresses = await dnsLookupAll(parsed.hostname);
+  const addresses = await resolveNetworkAddresses(parsed.hostname);
   if (security.allowPrivateNetwork !== true && addresses.some(isPrivateAddress)) {
     throw new Error("web.fetch resolved to a private or link-local network address");
   }
@@ -1083,12 +1083,12 @@ function isPrivateAddress(value: any) {
   return false;
 }
 
-async function validateBrowserNetworkUrl(value: any, security: any = {}) {
+async function validateBrowserNetworkUrl(value: any, security: any = {}, resolveNetworkAddresses: any = dnsLookupAll) {
   let parsed;
   try { parsed = new URL(String(value)); } catch { throw new Error("browser blocked an invalid network URL"); }
   if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password) throw new Error("browser only allows credential-free http(s) URLs");
   assertDomainAllowed(parsed.hostname, security);
-  const addresses = await dnsLookupAll(parsed.hostname);
+  const addresses = await resolveNetworkAddresses(parsed.hostname);
   if (security.allowPrivateNetwork !== true && addresses.some(isPrivateAddress)) {
     throw new Error(`browser blocked non-public DNS answer for ${parsed.hostname}`);
   }
@@ -1426,10 +1426,10 @@ async function browserTabs(stateDir: any, security: any = {}) {
   return { tabs: await Promise.all(context.pages().map((page: any) => manager.describe(page))) };
 }
 
-async function browserOpen(stateDir: any, input: any = {}, security: any = {}) {
+async function browserOpen(stateDir: any, input: any = {}, security: any = {}, resolveNetworkAddresses: any = dnsLookupAll) {
   const url = cleanRequired(input.url, "browser.open requires url");
   if (!/^https?:\/\//i.test(url)) throw new Error("browser.open requires an http(s) url");
-  await validateBrowserNetworkUrl(url, security);
+  await validateBrowserNetworkUrl(url, security, resolveNetworkAddresses);
   const manager = await getBrowserManager(stateDir);
   const page = await manager.page(input.tabId, security);
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: WEB_TIMEOUT_MS });

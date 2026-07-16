@@ -4,6 +4,18 @@ All notable changes to Odinn Forge will be documented in this file.
 
 The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
+## [0.3.0-beta.1](https://github.com/jason-allen-oneal/Odinn/compare/v0.2.1-beta.1...v0.3.0-beta.1) (2026-07-16)
+
+
+### Features
+
+* **gateway:** improve activity and create agent manifests ([8519fbc](https://github.com/jason-allen-oneal/Odinn/commit/8519fbca97f13543cbe8b79cba48fe3c518b40f9))
+
+
+### Bug Fixes
+
+* restore public beta model and web execution ([9ced00d](https://github.com/jason-allen-oneal/Odinn/commit/9ced00d6d66b40d45c0bb46f7c04bf71873e8352))
+
 ## [0.2.1-beta.1](https://github.com/jason-allen-oneal/Odinn/compare/v0.2.1-beta...v0.2.1-beta.1) (2026-07-16)
 
 

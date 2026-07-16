@@ -21,6 +21,38 @@ test("required CI/CD workflows exist", async () => {
   }
 });
 
+test("Release Please hands token-created tags to the protected release workflow", async () => {
+  const releasePlease = await read(".github/workflows/release-please.yml");
+  const release = await read(".github/workflows/release.yml");
+  const config = JSON.parse(await read("release-please-config.json"));
+
+  assert.match(releasePlease, /release_created:\s*\$\{\{ steps\.release\.outputs\.release_created \}\}/);
+  assert.match(releasePlease, /uses:\s*\.\/\.github\/workflows\/release\.yml/);
+  assert.match(releasePlease, /tag:\s*\$\{\{ needs\.release_please\.outputs\.tag_name \}\}/);
+  assert.match(release, /^\s{2}workflow_call:/m);
+  assert.match(release, /\*-\*\) prerelease=\(--prerelease\)/);
+  assert.equal(config.packages["."].versioning, "prerelease");
+  assert.equal(config.packages["."]["prerelease-type"], "beta");
+  assert.equal(config.packages["."].prerelease, true);
+});
+
+test("public beta support and reporting surfaces ship in the release tree", async () => {
+  for (const path of [
+    "docs/public-beta.md",
+    ".github/ISSUE_TEMPLATE/bug-report.yml",
+    ".github/ISSUE_TEMPLATE/feature-request.yml",
+    ".github/ISSUE_TEMPLATE/config.yml"
+  ]) {
+    assert.ok((await read(path)).trim().length > 0, `${path} must not be empty`);
+  }
+});
+
+test("release packaging removes stale assets before creating a version", async () => {
+  const packaging = await read("scripts/release/package.ts");
+  assert.match(packaging, /rm\(output, \{ recursive: true, force: true \}\)/);
+  assert.ok(packaging.indexOf("rm(output") < packaging.indexOf("mkdir(output"));
+});
+
 test("third-party workflow actions are pinned to immutable commit SHAs", async () => {
   const workflowRoot = new URL("../.github/workflows/", import.meta.url);
   for (const file of await readdir(workflowRoot)) {

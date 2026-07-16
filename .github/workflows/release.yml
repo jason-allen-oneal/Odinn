@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing release tag to publish
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -122,6 +128,10 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --generate-notes --title "Odinn Forge $TAG"
+            prerelease=()
+            case "$TAG" in
+              *-*) prerelease=(--prerelease) ;;
+            esac
+            gh release create "$TAG" --verify-tag --generate-notes --title "Odinn Forge $TAG" "${prerelease[@]}"
           fi
           gh release upload "$TAG" release-assets/* --clobber

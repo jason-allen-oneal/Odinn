@@ -45,7 +45,9 @@ Workflow Lint runs actionlint on every pull request and on workflow changes push
 
 ### Release Please
 
-Pushes to `main` are analyzed for Conventional Commit messages. Release Please maintains a release pull request that updates `package.json`, `CHANGELOG.md`, and the release manifest. Merging that pull request creates a version tag.
+Pushes to `main` are analyzed for Conventional Commit messages. During public beta, Release Please maintains a prerelease pull request that updates `package.json`, `CHANGELOG.md`, and the release manifest. Merging that pull request creates a beta version tag and GitHub prerelease.
+
+GitHub deliberately does not emit a second workflow event for a tag created with the workflow `GITHUB_TOKEN`. The Release Please workflow therefore calls `release.yml` directly when `release_created` is true and passes the exact generated tag into the protected reusable release workflow. The tag-push and manual-dispatch triggers remain available for operator-created recovery runs.
 
 ### Release
 

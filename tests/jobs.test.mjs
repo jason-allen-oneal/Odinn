@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { JobSupervisor } from "../packages/kernel/src/jobs.mjs";
-import { FileAuditStore, FileJobStore } from "../packages/store-file/src/index.mjs";
+import { FileAuditStore, FileJobStore } from "../packages/store-file/src/index.ts";
 
 async function waitFor(check) {
   for (let attempt = 0; attempt < 100; attempt += 1) {

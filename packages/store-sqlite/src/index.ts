@@ -4,17 +4,24 @@ import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 
 export const SQLITE_SCHEMA_VERSION = 2;
+type JsonMap = { [key: string]: unknown };
+type SqlRow = { [key: string]: any };
+type FeatureFlags = Record<string, boolean>;
+type Artifact = { digest: string; path: string; mediaType: string; sizeBytes: number };
 
 const SECRET_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|capability(?:[_-]?token)?|authorization|cookie|credential|password|secret|private[_-]?key)/i;
 const SECRET_VALUE = /Bearer\s+[A-Za-z0-9._~+\/-]+|(?:sk|rk)-[A-Za-z0-9_-]{12,}/g;
 
-function stable(value) {
+function stable(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
-  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}`;
+  if (value && typeof value === "object") {
+    const record = value as JsonMap;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stable(record[key])}`).join(",")}}`;
+  }
   return JSON.stringify(value);
 }
 
-export function redact(value, key = "", depth = 0) {
+export function redact(value: unknown, key = "", depth = 0): unknown {
   if (depth > 8) return "[redacted-depth]";
   if (SECRET_KEY.test(key)) return "[redacted]";
   if (typeof value === "string") return value.replace(SECRET_VALUE, "[redacted]").slice(0, 100_000);
@@ -36,9 +43,9 @@ const SHA256_K = Uint32Array.from([
   0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 ]);
 
-function rotateRight(value, bits) { return (value >>> bits) | (value << (32 - bits)); }
+function rotateRight(value: number, bits: number) { return (value >>> bits) | (value << (32 - bits)); }
 
-function digest(value) {
+function digest(value: string | Buffer): string {
   const input = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
   const bitLength = input.length * 8;
   const paddedLength = Math.ceil((input.length + 9) / 64) * 64;
@@ -73,8 +80,8 @@ function digest(value) {
   return [a0, b0, c0, d0, e0, f0, g0, h0].map((word) => word.toString(16).padStart(8, "0")).join("");
 }
 
-function parseJson(value, fallback) {
-  try { return value ? JSON.parse(value) : fallback; } catch { return fallback; }
+function parseJson<T>(value: unknown, fallback: T): T {
+  try { return typeof value === "string" && value ? JSON.parse(value) as T : fallback; } catch { return fallback; }
 }
 
 const MIGRATIONS = [
@@ -280,7 +287,10 @@ const MIGRATIONS = [
 ];
 
 export class SqliteStore {
-  constructor(path) {
+  readonly path: string;
+  readonly db: DatabaseSync;
+
+  constructor(path: string) {
     if (!path) throw new Error("SqliteStore requires a path");
     this.path = resolve(path);
     mkdirSync(dirname(this.path), { recursive: true });
@@ -291,11 +301,11 @@ export class SqliteStore {
   }
 
   migrate() {
-    const current = this.db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get().version;
+    const current = (this.db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get() as SqlRow).version;
     for (let version = Number(current) + 1; version <= MIGRATIONS.length; version += 1) {
       this.db.exec("BEGIN IMMEDIATE");
       try {
-        this.db.exec(MIGRATIONS[version - 1]);
+        this.db.exec(MIGRATIONS[version - 1]!);
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(version, new Date().toISOString());
         this.db.exec("COMMIT");
       } catch (error) {
@@ -305,7 +315,7 @@ export class SqliteStore {
     }
   }
 
-  transaction(callback) {
+  transaction<T>(callback: (database: DatabaseSync) => T): T {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const result = callback(this.db);
@@ -323,12 +333,14 @@ export class SqliteStore {
 }
 
 export class ArtifactStore {
-  constructor(root) {
+  readonly root: string;
+
+  constructor(root: string) {
     this.root = resolve(root);
     mkdirSync(this.root, { recursive: true });
   }
 
-  put(value, { mediaType = "application/octet-stream" } = {}) {
+  put(value: string | Buffer, { mediaType = "application/octet-stream" }: { mediaType?: string } = {}): Artifact {
     const bytes = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
     const hash = digest(bytes);
     const relativePath = join("sha256", hash.slice(0, 2), hash);
@@ -338,13 +350,19 @@ export class ArtifactStore {
     return { digest: hash, path: relativePath.replaceAll("\\", "/"), mediaType, sizeBytes: bytes.byteLength };
   }
 
-  putJson(value) {
+  putJson(value: unknown): Artifact {
     return this.put(JSON.stringify(redact(value)), { mediaType: "application/json" });
   }
 }
 
 export class RunLedger {
-  constructor({ database, artifacts, workspaceRoot, stateDir, featureFlags = {} } = {}) {
+  readonly database: SqliteStore;
+  readonly artifacts: ArtifactStore;
+  readonly workspaceRoot: string;
+  readonly stateDir: string;
+  readonly featureFlags: FeatureFlags;
+
+  constructor({ database, artifacts, workspaceRoot, stateDir, featureFlags = {} }: { database: SqliteStore; artifacts: ArtifactStore; workspaceRoot?: string; stateDir?: string; featureFlags?: FeatureFlags }) {
     if (!database || !artifacts) throw new Error("RunLedger requires database and artifacts");
     this.database = database;
     this.artifacts = artifacts;
@@ -353,7 +371,7 @@ export class RunLedger {
     this.featureFlags = { ...featureFlags };
   }
 
-  ensureRun({ runId, objective, modelId = "", providerId = "", parentRunId, branchPointStepId, workspaceRoot = this.workspaceRoot } = {}) {
+  ensureRun({ runId, objective, modelId = "", providerId = "", parentRunId, branchPointStepId, workspaceRoot = this.workspaceRoot }: { runId: string; objective?: string; modelId?: string; providerId?: string; parentRunId?: string; branchPointStepId?: string; workspaceRoot?: string }) {
     if (!runId) throw new Error("RunLedger requires runId");
     const now = new Date().toISOString();
     this.database.db.prepare(`INSERT OR IGNORE INTO runs
@@ -363,12 +381,12 @@ export class RunLedger {
     return runId;
   }
 
-  appendEvent({ runId, type, payload = {}, timestamp = new Date().toISOString() } = {}) {
+  appendEvent({ runId, type, payload = {}, timestamp = new Date().toISOString() }: { runId: string; type: string; payload?: JsonMap; timestamp?: string }) {
     return this.database.transaction((db) => this.appendEventUnsafe(db, { runId, type, payload, timestamp }));
   }
 
-  appendEventUnsafe(db, { runId, type, payload = {}, timestamp }) {
-    const previous = db.prepare("SELECT sequence, hash FROM ledger_events WHERE run_id = ? ORDER BY sequence DESC LIMIT 1").get(runId);
+  appendEventUnsafe(db: DatabaseSync, { runId, type, payload = {}, timestamp }: { runId: string; type: string; payload?: JsonMap; timestamp: string }) {
+    const previous = db.prepare("SELECT sequence, hash FROM ledger_events WHERE run_id = ? ORDER BY sequence DESC LIMIT 1").get(runId) as SqlRow | undefined;
     const sequence = Number(previous?.sequence ?? 0) + 1;
     const safePayload = redact(payload);
     const envelope = { id: randomUUID(), runId, sequence, type, timestamp, payload: safePayload, previousHash: previous?.hash ?? null };
@@ -380,13 +398,13 @@ export class RunLedger {
     return { ...envelope, hash };
   }
 
-  beginTool({ runId, toolName, input, safety, metadata = {} } = {}) {
+  beginTool({ runId, toolName, input, safety, metadata = {} }: { runId: string; toolName: string; input?: unknown; safety?: unknown; metadata?: JsonMap }) {
     const inputArtifact = this.artifacts.putJson(input ?? {});
     const now = new Date().toISOString();
     const stepId = `step_${randomUUID()}`;
     this.database.transaction((db) => {
       db.prepare("UPDATE runs SET status = 'executing', started_at = COALESCE(started_at, ?) WHERE id = ?").run(now, runId);
-      const next = db.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM run_steps WHERE run_id = ?").get(runId).sequence + 1;
+      const next = Number((db.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM run_steps WHERE run_id = ?").get(runId) as SqlRow).sequence) + 1;
       db.prepare(`INSERT INTO run_steps
         (id, run_id, sequence, type, status, started_at, input_digest, metadata_json)
         VALUES (?, ?, ?, 'tool-request', 'running', ?, ?, ?)`)
@@ -398,11 +416,11 @@ export class RunLedger {
     return { stepId, inputArtifact };
   }
 
-  recordPolicy({ runId, stepId, decision, reason, details } = {}) {
+  recordPolicy({ runId, stepId, decision, reason, details }: { runId: string; stepId: string; decision: string; reason?: string; details?: unknown }) {
     return this.appendEvent({ runId, type: "policy-check", payload: { stepId, decision, reason, details } });
   }
 
-  finishTool({ runId, stepId, output, status = "succeeded", error } = {}) {
+  finishTool({ runId, stepId, output, status = "succeeded", error }: { runId: string; stepId: string; output?: unknown; status?: string; error?: unknown }) {
     const outputArtifact = output === undefined ? undefined : this.artifacts.putJson(output);
     const now = new Date().toISOString();
     this.database.transaction((db) => {
@@ -418,20 +436,20 @@ export class RunLedger {
     return outputArtifact;
   }
 
-  listRuns({ limit = 20 } = {}) {
-    return this.database.db.prepare("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?").all(Math.max(1, Math.min(Number(limit) || 20, 200))).map((row) => this.hydrateRun(row));
+  listRuns({ limit = 20 }: { limit?: number } = {}) {
+    return (this.database.db.prepare("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?").all(Math.max(1, Math.min(Number(limit) || 20, 200))) as SqlRow[]).map((row) => this.hydrateRun(row));
   }
 
-  getRun(runId) {
-    const row = this.database.db.prepare("SELECT * FROM runs WHERE id = ?").get(runId);
+  getRun(runId: string) {
+    const row = this.database.db.prepare("SELECT * FROM runs WHERE id = ?").get(runId) as SqlRow | undefined;
     if (!row) return undefined;
-    const steps = this.database.db.prepare("SELECT * FROM run_steps WHERE run_id = ? ORDER BY sequence").all(runId).map((step) => ({ ...step, metadata: parseJson(step.metadata_json, {}) }));
-    const events = this.database.db.prepare("SELECT * FROM ledger_events WHERE run_id = ? ORDER BY sequence").all(runId).map((event) => ({ ...event, payload: parseJson(event.payload_json, {}) }));
+    const steps = (this.database.db.prepare("SELECT * FROM run_steps WHERE run_id = ? ORDER BY sequence").all(runId) as SqlRow[]).map((step) => ({ ...step, metadata: parseJson(step.metadata_json, {}) }));
+    const events = (this.database.db.prepare("SELECT * FROM ledger_events WHERE run_id = ? ORDER BY sequence").all(runId) as SqlRow[]).map((event) => ({ ...event, payload: parseJson(event.payload_json, {}) }));
     return { ...this.hydrateRun(row), steps, events };
   }
 
-  verify(runId) {
-    const events = this.database.db.prepare("SELECT * FROM ledger_events WHERE run_id = ? ORDER BY sequence").all(runId);
+  verify(runId: string) {
+    const events = this.database.db.prepare("SELECT * FROM ledger_events WHERE run_id = ? ORDER BY sequence").all(runId) as SqlRow[];
     let previousHash = null;
     let valid = true;
     for (const event of events) {
@@ -446,7 +464,7 @@ export class RunLedger {
     this.database.close();
   }
 
-  hydrateRun(row) {
+  hydrateRun(row: SqlRow) {
     return {
       id: row.id,
       parentRunId: row.parent_run_id ?? undefined,
@@ -464,7 +482,7 @@ export class RunLedger {
   }
 }
 
-export function createRunLedger({ stateDir = ".odinn", workspaceRoot = process.cwd(), featureFlags = {} } = {}) {
+export function createRunLedger({ stateDir = ".odinn", workspaceRoot = process.cwd(), featureFlags = {} }: { stateDir?: string; workspaceRoot?: string; featureFlags?: FeatureFlags } = {}) {
   const state = resolve(stateDir);
   const database = new SqliteStore(join(state, "db", "odinn.sqlite"));
   const artifacts = new ArtifactStore(join(state, "artifacts"));

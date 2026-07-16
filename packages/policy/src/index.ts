@@ -1,12 +1,41 @@
+export type SecuritySurface = {
+  enabled: boolean;
+  allowPrivateNetwork: boolean;
+  allowedDomains: string[];
+  blockedDomains: string[];
+  requireApproval?: boolean;
+  allowDownloads?: boolean;
+  allowUploads?: boolean;
+};
+
+export interface RuntimePolicy {
+  deniedTools: string[];
+  allowedCapabilities: string[];
+  maxInputBytes: number;
+  security: { web: SecuritySurface; browser: SecuritySurface };
+}
+
+export interface PolicyTool { capability: string }
+export interface PolicyRequest { tool: string; input: Record<string, unknown> }
+export type PolicyDecision =
+  | { allowed: true; decision: "allow"; capability: string }
+  | { allowed: false; decision: "deny"; reason: string; details: Record<string, unknown> };
+
+type PolicyOverrides = Partial<Omit<RuntimePolicy, "security">> & {
+  security?: { web?: Partial<SecuritySurface>; browser?: Partial<SecuritySurface> };
+};
+
 export class PolicyError extends Error {
-  constructor(message, details = {}) {
+  readonly details: Record<string, unknown>;
+
+  constructor(message: string, details: Record<string, unknown> = {}) {
     super(message);
     this.name = "PolicyError";
     this.details = details;
   }
 }
 
-export function createDefaultPolicy(overrides = {}) {
+export function createDefaultPolicy(overrides: PolicyOverrides = {}): RuntimePolicy {
   const defaultCapabilities = [
     "job.healthcheck",
     "text.echo",
@@ -59,7 +88,7 @@ const LEGACY_DEFAULT_CAPABILITIES = [
   "improve.write"
 ];
 
-function sameCapabilities(left, right) {
+function sameCapabilities(left: string[], right: string[]) {
   return left.length === right.length && [...left].sort().every((value, index) => value === [...right].sort()[index]);
 }
 
@@ -81,7 +110,7 @@ const defaultsSecurity = {
   }
 };
 
-export function evaluateTaskPolicy({ policy = createDefaultPolicy(), request, tool }) {
+export function evaluateTaskPolicy({ policy = createDefaultPolicy(), request, tool }: { policy?: RuntimePolicy; request: PolicyRequest; tool?: PolicyTool }): PolicyDecision {
   if (!tool) {
     return deny(`unknown tool: ${request.tool}`, { code: "UNKNOWN_TOOL" });
   }
@@ -102,10 +131,10 @@ export function evaluateTaskPolicy({ policy = createDefaultPolicy(), request, to
   return { allowed: true, decision: "allow", capability: tool.capability };
 }
 
-export function assertAllowed(result) {
+export function assertAllowed(result: PolicyDecision): asserts result is Extract<PolicyDecision, { allowed: true }> {
   if (!result.allowed) throw new PolicyError(result.reason, result.details);
 }
 
-function deny(reason, details) {
+function deny(reason: string, details: Record<string, unknown>): PolicyDecision {
   return { allowed: false, decision: "deny", reason, details };
 }

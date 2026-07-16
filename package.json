@@ -34,5 +34,9 @@
     "release:checksums": "node scripts/release/checksums.mjs",
     "release:install-smoke": "node scripts/release/install-smoke.mjs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
 }

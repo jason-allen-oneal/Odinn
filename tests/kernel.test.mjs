@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createAuditStore, createBuiltInRegistry, normalizeModelConfig, runPlan, runTask, saveOAuthToken } from "../packages/kernel/src/index.mjs";
-import { createDefaultPolicy } from "../packages/policy/src/index.mjs";
+import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "odinn-kernel-"));

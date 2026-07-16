@@ -1,7 +1,7 @@
 import { cp, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FileAuditStore, FileJobStore, FileRecordStore } from "../../packages/store-file/src/index.mjs";
+import { FileAuditStore, FileJobStore, FileRecordStore } from "../../packages/store-file/src/index.ts";
 
 const root = await mkdtemp(join(tmpdir(), "odinn-storage-drill-"));
 const state = join(root, "state");

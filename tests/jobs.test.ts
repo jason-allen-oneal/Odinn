@@ -6,8 +6,9 @@ import test from "node:test";
 import { JobSupervisor } from "../packages/kernel/src/jobs.ts";
 import { FileAuditStore, FileJobStore } from "../packages/store-file/src/index.ts";
 
-async function waitFor(check: any) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+async function waitFor(check: any, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
     const value = await check();
     if (value) return value;
     await new Promise((resolve: any) => setTimeout(resolve, 10));

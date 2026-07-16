@@ -96,7 +96,7 @@ jobs:
         if: steps.dependency-graph.outputs.available != 'true' || steps.dependency-review.outcome == 'failure'
         run: |
           pnpm install --frozen-lockfile
-          node scripts/ci/audit.mjs high
+          node scripts/ci/audit.ts high
 
   audit:
     name: Dependency and lockfile audit
@@ -113,7 +113,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: node scripts/ci/audit.mjs high
+      - run: node scripts/ci/audit.ts high
       - run: pnpm lint
 
   secrets:

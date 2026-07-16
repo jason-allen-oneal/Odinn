@@ -23,6 +23,6 @@ const result: any = await new Promise((resolve: any, reject: any) => {
   child.once("close", (code: any) => resolve({ code, stdout, stderr }));
 });
 assert.equal(result.code, 0, result.stderr || result.stdout);
-assert.match(result.stdout, /Odinn Forge local onboarding/);
+assert.match(result.stdout, /Ódinn Forge is ready/);
 assert.match(result.stdout, /State:/);
 console.log("ODINN_ONBOARDING_OK");

@@ -83,6 +83,7 @@ test("gateway serves the local console shell", async () => {
     assert.match(html, /Web &amp; browser/);
     assert.match(html, /web-search-run/);
     assert.match(html, /approval-gated/);
+    assert.doesNotMatch(html, /catch \(error: any\)/);
     assert.match(html, /sidebar-collapsed/);
     assert.match(html, /data-session-action="rename"/);
     assert.match(html, /data-session-action="delete"/);

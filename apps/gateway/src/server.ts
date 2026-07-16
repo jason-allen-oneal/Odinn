@@ -2707,7 +2707,7 @@ function renderConsoleHtml() {
         if (!state.browserTabId && tabs[0]) state.browserTabId = tabs[0].id;
         if (state.browserTabId) await inspectBrowserTab(state.browserTabId);
         $("cap-browser-status").textContent = "READY";
-      } catch (error: any) {
+      } catch (error) {
         $("cap-browser-status").textContent = "OFFLINE";
         showOutput(error.message);
       }
@@ -2729,7 +2729,7 @@ function renderConsoleHtml() {
         const result = await api("/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "web.search", input: { query, limit: 6 } }) });
         $("web-search-results").innerHTML = (result.output?.results || []).map(renderWebResult).join("") || '<div class="empty-state"><strong>No results</strong><span>Try a broader query.</span></div>';
         showOutput(result);
-      } catch (error: any) { showOutput(error.message); }
+      } catch (error) { showOutput(error.message); }
       finally { setBusy($("web-search-run"), false); }
     }
 
@@ -2742,7 +2742,7 @@ function renderConsoleHtml() {
         state.browserTabId = result.output?.id || state.browserTabId;
         await refreshBrowser();
         showOutput(result);
-      } catch (error: any) { showOutput(error.message); }
+      } catch (error) { showOutput(error.message); }
       finally { setBusy($("browser-open"), false); }
     }
 
@@ -2798,7 +2798,7 @@ function renderConsoleHtml() {
         await refreshGoals();
         await refreshImprovements();
         await refreshApprovals();
-      } catch (error: any) {
+      } catch (error) {
         $("health").textContent = "Error";
         $("nav-health").textContent = "error";
         $("status-pill").textContent = "Error";
@@ -2959,7 +2959,7 @@ function renderConsoleHtml() {
       try {
         setBusy(event.currentTarget, true);
         await createChat("Gateway beta chat");
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -2988,7 +2988,7 @@ function renderConsoleHtml() {
       try {
         setBusy(event.currentTarget, true);
         await sendChatMessage($("chat-input").value);
-      } catch (error: any) {
+      } catch (error) {
         $("chat-status").textContent = "Error";
         showOutput(error.message);
       } finally {
@@ -3005,7 +3005,7 @@ function renderConsoleHtml() {
       try {
         setBusy(event.currentTarget, true);
         await sendChatMessage("Run a local healthcheck.", { tool: "job.healthcheck" });
-      } catch (error: any) {
+      } catch (error) {
         $("chat-status").textContent = "Error";
         showOutput(error.message);
       } finally {
@@ -3080,7 +3080,7 @@ function renderConsoleHtml() {
           body: JSON.stringify(planTemplates.smoke)
         }));
         await refreshRuns();
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3096,7 +3096,7 @@ function renderConsoleHtml() {
           body: JSON.stringify(body)
         }));
         await refreshRuns();
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3111,7 +3111,7 @@ function renderConsoleHtml() {
           body: $("plan").value
         }));
         await refreshRuns();
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3135,7 +3135,7 @@ function renderConsoleHtml() {
         }));
         await refreshMemory();
         await refreshRuns();
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3153,7 +3153,7 @@ function renderConsoleHtml() {
         showOutput(session);
         await refreshSessions();
         await refreshRuns();
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3170,7 +3170,7 @@ function renderConsoleHtml() {
         }));
         await refreshSessions();
         await refreshRuns();
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3188,7 +3188,7 @@ function renderConsoleHtml() {
         showOutput(goal);
         await refreshGoals();
         await refreshRuns();
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3205,7 +3205,7 @@ function renderConsoleHtml() {
         }));
         await refreshGoals();
         await refreshRuns();
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3227,7 +3227,7 @@ function renderConsoleHtml() {
         showOutput(improvement);
         await refreshImprovements();
         await refreshRuns();
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3239,7 +3239,7 @@ function renderConsoleHtml() {
         showOutput(await api("/improvements/learn", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: 1000 }) }));
         await refreshImprovements();
         await refreshRuns();
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3256,7 +3256,7 @@ function renderConsoleHtml() {
         }));
         await refreshImprovements();
         await refreshRuns();
-      } catch (error: any) {
+      } catch (error) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);

@@ -140,8 +140,8 @@ test("CLI onboarding and TUI expose a local beta entrypoint", async () => {
     encoding: "utf8"
   });
   assert.equal(onboard.status, 0, onboard.stderr || onboard.stdout);
-  assert.match(onboard.stdout, /Odinn Forge local onboarding/);
-  assert.match(onboard.stdout, /pnpm --filter @odinn\/cli start -- tui/);
+  assert.match(onboard.stdout, /Ódinn Forge is ready/);
+  assert.match(onboard.stdout, /odinn start/);
 
   const tui = spawnSync("node", ["apps/cli/src/cli.ts", "tui", "--state", state], {
     cwd: root,
@@ -150,6 +150,37 @@ test("CLI onboarding and TUI expose a local beta entrypoint", async () => {
   assert.equal(tui.status, 0, tui.stderr || tui.stdout);
   assert.match(tui.stdout, /Odinn Forge TUI/);
   assert.match(tui.stdout, /Recent runs/);
+});
+
+test("CLI start launches the local chat console", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-start-"));
+  const child = spawn("node", ["apps/cli/src/cli.ts", "start", "--state", state, "--port", "0", "--no-open"], {
+    cwd: root,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: any) => { stdout += chunk; });
+  child.stderr.on("data", (chunk: any) => { stderr += chunk; });
+  try {
+    const url = await new Promise<string>((resolveUrl, rejectUrl) => {
+      const timeout = setTimeout(() => rejectUrl(new Error(`start timed out: ${stderr || stdout}`)), 10_000);
+      child.stdout.on("data", () => {
+        const match = stdout.match(/running at (http:\/\/[^\s]+)/);
+        if (match?.[1]) { clearTimeout(timeout); resolveUrl(match[1]); }
+      });
+      child.once("error", rejectUrl);
+      child.once("close", (code: any) => code !== 0 && rejectUrl(new Error(stderr || `start exited ${code}`)));
+    });
+    const response = await fetch(url);
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /Ódinn Forge/);
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise((resolveClose: any) => child.once("close", resolveClose));
+  }
 });
 
 test("CLI onboarding configures a provider without storing a secret", async () => {

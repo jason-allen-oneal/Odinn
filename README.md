@@ -38,6 +38,15 @@ pnpm gui:start
 
 Open [http://127.0.0.1:18790/](http://127.0.0.1:18790/).
 
+After installing a release, the normal path is shorter:
+
+```bash
+odinn onboard --provider openai
+odinn start
+```
+
+`odinn start` launches the local gateway and opens the chat console. Use `--no-open` on headless machines. See [Getting started](docs/getting-started.md) for provider, local-model, and troubleshooting examples.
+
 For a deterministic smoke test:
 
 ```bash

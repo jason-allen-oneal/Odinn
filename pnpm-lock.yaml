@@ -17,6 +17,9 @@ importers:
 
   apps/cli:
     dependencies:
+      '@odinn/gateway':
+        specifier: workspace:*
+        version: link:../gateway
       '@odinn/kernel':
         specifier: workspace:*
         version: link:../../packages/kernel

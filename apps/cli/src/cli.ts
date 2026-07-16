@@ -46,6 +46,16 @@ async function main() {
     case "tui":
       await tui(args);
       break;
+    case "start":
+    case "serve":
+    case "gateway":
+      await startGateway(args);
+      break;
+    case "help":
+    case "--help":
+    case "-h":
+      hasFlag(args, "--all") ? usage() : quickUsage();
+      break;
     case "run":
       await run(args);
       break;
@@ -107,13 +117,32 @@ async function main() {
       await routingCommand(args);
       break;
     default:
-      usage();
+      quickUsage(command);
       process.exitCode = command ? 1 : 0;
   }
 }
 
+function quickUsage(unknownCommand: string | undefined = undefined) {
+  if (unknownCommand) console.error(`Unknown command: ${unknownCommand}\n`);
+  console.log(`Ódinn Forge — local-first agent runtime
+
+Get started:
+  odinn onboard --provider openai   Connect a model provider
+  odinn start                       Open the local chat console
+
+Common commands:
+  odinn status                      Check configuration and runtime health
+  odinn sessions                    List chats
+  odinn runs                        Inspect recent work
+  odinn doctor                      Diagnose the current setup
+
+Help:
+  odinn help --all                  Show every advanced command`);
+}
+
 function usage() {
   console.log(`Usage:
+  odinn start [--state .odinn] [--port 18790] [--no-open]
   odinn init [--state .odinn]
   odinn onboard [--provider <name>] [--auth api-key|oauth|device|cli] [--state .odinn]
   odinn config provider add <name> [--auth api-key|oauth|device|cli] [--base-url <url>] [--model <model[,model]>] [--api-key-env <ENV>] [--authorization-url <url>] [--token-url <url>] [--client-id <id>] [--scope <scope[,scope]>] [--state .odinn]
@@ -259,6 +288,34 @@ async function onboard(args: any) {
   const store = createAuditStore(join(state, current.auditLog ?? "audit.jsonl"));
   const runs = await store.readRuns();
   console.log(renderOnboarding({ ...current, configPath, runs }));
+}
+
+async function startGateway(args: any) {
+  const stateDir = stateDirForStart(args);
+  const host = option(args, "--host", "127.0.0.1");
+  const port = Number.parseInt(option(args, "--port", "18790"), 10);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("--port must be between 0 and 65535");
+  const { createGatewayServer } = await import("@odinn/gateway");
+  const server: any = await createGatewayServer({ stateDir, workspaceRoot: invocationRoot() });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(port, host, resolveListen);
+  });
+  const actualPort = (server.address() as any).port;
+  const url = `http://${host === "::1" ? "[::1]" : host}:${actualPort}/`;
+  console.log(`Ódinn Forge is running at ${url}`);
+  console.log("Press Ctrl+C to stop.");
+  if (!hasFlag(args, "--no-open")) openAuthorizationUrl(url);
+  const shutdown = () => server.close((error: any) => {
+    if (error) console.error(error.message);
+    process.exitCode = error ? 1 : 0;
+  });
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+}
+
+function stateDirForStart(args: any) {
+  return resolveInvocationPath(option(args, "--state", ".odinn"));
 }
 
 async function status(args: any) {
@@ -1719,42 +1776,26 @@ function renderOnboarding({ state, workspaceRoot, configPath, tools, allowedCapa
     ? providers.map((provider: any) => `  - ${provider.name} [${provider.authMode}]: ${provider.models.join(", ")} (${provider.baseUrl})${provider.configured ? "" : provider.authMode === "oauth" ? " [not connected]" : provider.apiKeyEnv ? " [credential missing]" : ""}`)
     : ["  - none"];
   return [
-    "Odinn Forge local onboarding",
+    "Ódinn Forge is ready",
     "",
     `State: ${state}`,
-    `Config: ${configPath}`,
     `Workspace: ${workspaceRoot}`,
-    "",
-    "Available tools:",
-    ...tools.map((tool: any) => `  - ${tool}`),
-    "",
-    "Allowed capabilities:",
-    ...allowedCapabilities.map((capability: any) => `  - ${capability}`),
     "",
     "Configured providers:",
     ...providerLines,
     `Default model: ${defaultModel || "(none)"}`,
     "",
-    `Provider presets: ${listProviderPresets().map((provider: any) => provider.name).join(", ")}`,
-    "Use a preset without passing URLs:",
-    "  pnpm odinn onboard --provider <preset> --state .odinn",
-    "  pnpm odinn config provider catalog",
+    providers.length ? "Next step:" : "Connect a provider:",
+    ...(providers.length
+      ? ["  odinn start"]
+      : ["  odinn onboard --provider openai", "  odinn onboard --provider ollama --model <installed-model>"]),
     "",
-    `Recorded runs: ${runs.length}`,
+    "Then open the chat console:",
+    "  odinn start",
     "",
-    "Try next:",
-    "  pnpm odinn onboard --provider ollama --model <installed-model> --state .odinn",
-    "  pnpm odinn onboard --provider openai --state .odinn",
-    "  pnpm odinn onboard --provider openai --auth api-key --model gpt-4.1-mini --state .odinn",
-    "  pnpm odinn config model default <provider:model> --state .odinn",
-    "  pnpm --filter @odinn/cli start -- run --tool text.echo --input-json '{\"text\":\"Hello, Odinn Forge\"}'",
-    "  pnpm --filter @odinn/cli start -- plan --file examples/local-smoke.plan.json",
-    "  pnpm odinn memory remember --kind preference --subject cli --text 'Prefer exact commands.'",
-    "  pnpm --filter @odinn/cli start -- tui",
-    "  pnpm --filter @odinn/gateway start",
-    "",
-    "Open the GUI after starting the gateway:",
-    "  http://127.0.0.1:18790/"
+    `${tools.length} tools · ${allowedCapabilities.length} allowed capabilities · ${runs.length} recorded runs`,
+    `Config: ${configPath}`,
+    "Use `odinn status` for details or `odinn help --all` for advanced commands."
   ].join("\n");
 }
 

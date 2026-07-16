@@ -17,9 +17,9 @@ else throw new Error("usage: install.mjs install|upgrade|rollback|status [--sour
 async function install(operation) {
   const source = resolve(option("--source", process.cwd()));
   const pkg = JSON.parse(await readFile(join(source, "package.json"), "utf8"));
-  if (pkg.name !== "odinn") throw new Error("install source is not an Odinn package");
+  if (pkg.name !== "odinn") throw new Error("install source is not an Odinn Forge package");
   const version = option("--version", pkg.version);
-  if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) throw new Error("invalid Odinn version");
+  if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) throw new Error("invalid Odinn Forge version");
   const identity = createHash("sha256").update(await readFile(join(source, "pnpm-lock.yaml"))).digest("hex").slice(0, 12);
   const versionId = `${version}-${identity}`;
   const versions = join(prefix, "versions");
@@ -40,7 +40,7 @@ async function install(operation) {
 
 async function rollback() {
   const current = await readState();
-  if (!current.previous) throw new Error("no previous Odinn installation is available for rollback");
+  if (!current.previous) throw new Error("no previous Odinn Forge installation is available for rollback");
   const priorPath = join(prefix, "versions", current.previous, "package.json");
   await readFile(priorPath);
   const next = { ...current, current: current.previous, previous: current.current, rolledBackAt: new Date().toISOString(), operation: "rollback" };

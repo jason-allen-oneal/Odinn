@@ -1,6 +1,6 @@
 # Multi-user host
 
-The default Ódinn gateway is a single-user loopback service and must not be bound to a public interface. Remote deployments use the separate multi-user host, which terminates TLS and proxies each authenticated user to an independent loopback gateway.
+The default Ódinn Forge gateway is a single-user loopback service and must not be bound to a public interface. Remote deployments use the separate multi-user host, which terminates TLS and proxies each authenticated user to an independent loopback gateway.
 
 ## Provision a user
 

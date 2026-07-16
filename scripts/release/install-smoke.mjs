@@ -44,4 +44,4 @@ for (const extension of ["zip", "tar.gz"]) {
   }
 }
 
-console.log(`verified clean-tree install and CLI execution for both Odinn ${pkg.version} source archives`);
+console.log(`verified clean-tree install and CLI execution for both Odinn Forge ${pkg.version} source archives`);

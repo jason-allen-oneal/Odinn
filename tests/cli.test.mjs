@@ -140,7 +140,7 @@ test("CLI onboarding and TUI expose a local beta entrypoint", async () => {
     encoding: "utf8"
   });
   assert.equal(onboard.status, 0, onboard.stderr || onboard.stdout);
-  assert.match(onboard.stdout, /Odinn local onboarding/);
+  assert.match(onboard.stdout, /Odinn Forge local onboarding/);
   assert.match(onboard.stdout, /pnpm --filter @odinn\/cli start -- tui/);
 
   const tui = spawnSync("node", ["apps/cli/src/cli.mjs", "tui", "--state", state], {
@@ -148,7 +148,7 @@ test("CLI onboarding and TUI expose a local beta entrypoint", async () => {
     encoding: "utf8"
   });
   assert.equal(tui.status, 0, tui.stderr || tui.stdout);
-  assert.match(tui.stdout, /Odinn TUI/);
+  assert.match(tui.stdout, /Odinn Forge TUI/);
   assert.match(tui.stdout, /Recent runs/);
 });
 

@@ -1,16 +1,16 @@
-# Ódinn
+# Ódinn Forge
 
-![Ódinn — local-first agent runtime](docs/odinn-header.png)
+![Ódinn Forge — local-first agent runtime](docs/odinn-header.png)
 
 > A local-first personal AI agent runtime with durable memory, model freedom, real-world tools, and security controls that make dangerous choices explicit.
 
-Ódinn is a cross-platform agent runtime for people who want an assistant that can do more than generate text without turning the machine into an unattended blast radius. It provides the kernel, policy layer, model/provider adapters, browser and web capabilities, sessions, audit trails, and a chat-first local console in one small Node.js workspace.
+Ódinn Forge is a cross-platform agent runtime for people who want an assistant that can do more than generate text without turning the machine into an unattended blast radius. It provides the kernel, policy layer, model/provider adapters, browser and web capabilities, sessions, audit trails, and a chat-first local console in one small Node.js workspace.
 
-The project is a clean-room implementation. It does not copy OpenClaw, Hermes, OpenViking, or any other agent framework. It takes architectural inspiration from the problems those projects solve and implements Ódinn's own contracts, storage, and security model.
+The project is a clean-room implementation. It does not copy OpenClaw, Hermes, OpenViking, or any other agent framework. It takes architectural inspiration from the problems those projects solve and implements Ódinn Forge's own contracts, storage, and security model.
 
 ## Beta status
 
-Ódinn is an initial local beta. The core loop is usable:
+Ódinn Forge is an initial local beta. The core loop is usable:
 
 - chat with configured models through API keys, OAuth, imported OAuth sessions, local servers, or CLI adapters;
 - recall durable user and project context across sessions;
@@ -105,9 +105,9 @@ Local models work without a cloud account:
 pnpm odinn onboard --provider ollama --model <installed-model>
 ```
 
-Ódinn does not assume a particular local model. Pass the model name already served by your Ollama instance.
+Ódinn Forge does not assume a particular local model. Pass the model name already served by your Ollama instance.
 
-Ódinn also includes URL-free presets for OpenRouter, Groq, Together, Mistral, DeepSeek, xAI, Moonshot, Fireworks, Cerebras, Cohere, DeepInfra, NVIDIA, Z.ai, Qianfan, Volcengine, Xiaomi, Hugging Face, Venice, Chutes, LiteLLM, vLLM, SGLang, LM Studio, GitHub Copilot, xAI device OAuth, and Antigravity.
+Ódinn Forge also includes URL-free presets for OpenRouter, Groq, Together, Mistral, DeepSeek, xAI, Moonshot, Fireworks, Cerebras, Cohere, DeepInfra, NVIDIA, Z.ai, Qianfan, Volcengine, Xiaomi, Hugging Face, Venice, Chutes, LiteLLM, vLLM, SGLang, LM Studio, GitHub Copilot, xAI device OAuth, and Antigravity.
 
 Inspect the catalog with:
 
@@ -134,7 +134,7 @@ Gateway API clients bootstrap a per-state bearer token by requesting `/` once, w
 
 ## Memory
 
-Ódinn's memory is an original local context system built around an append-only journal and explicit provenance. It is not a proprietary database clone and does not depend on a closed memory service.
+Ódinn Forge's memory is an original local context system built around an append-only journal and explicit provenance. It is not a proprietary database clone and does not depend on a closed memory service.
 
 The current memory spine provides:
 
@@ -173,7 +173,7 @@ The memory layer is deliberately transparent: inspect the journal, inspect the r
 
 Public web access is available through `web.search` and `web.fetch`.
 
-Private-account access uses Ódinn's isolated persistent browser profile. The user logs in manually; Ódinn does not silently extract cookies from another browser. Browser reads are available to the agent, while clicks, typing, and keypresses require approval by default.
+Private-account access uses Ódinn Forge's isolated persistent browser profile. The user logs in manually; Ódinn Forge does not silently extract cookies from another browser. Browser reads are available to the agent, while clicks, typing, and keypresses require approval by default.
 
 Security controls are configurable:
 
@@ -202,7 +202,7 @@ pnpm odinn extension disable --id example-tool
 pnpm odinn extension rollback --id example-tool
 ```
 
-Only explicitly trusted `process` extensions can execute. Tool extensions use Ódinn's JSONL call contract; MCP extensions use a JSON-RPC `tools/call` JSONL contract. Container execution, unsandboxed execution, automatic installation, and implicit trust are not enabled by this beta.
+Only explicitly trusted `process` extensions can execute. Tool extensions use Ódinn Forge's JSONL call contract; MCP extensions use a JSON-RPC `tools/call` JSONL contract. Container execution, unsandboxed execution, automatic installation, and implicit trust are not enabled by this beta.
 
 ## Architecture
 

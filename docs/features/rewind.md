@@ -1,4 +1,4 @@
-# Odinn Rewind / Norn Transactions
+# Odinn Forge Rewind / Norn Transactions
 
 Rewind snapshots selected local files before mutation. Snapshots store content-addressed artifacts and original existence, mode, and digest metadata. The default CLI operation is a dry-run; `--apply` performs restoration.
 

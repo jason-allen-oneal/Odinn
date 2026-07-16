@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Until Odinn reaches a stable 1.0 release, security fixes are applied only to the latest commit on `main` and the newest published prerelease.
+Until Odinn Forge reaches a stable 1.0 release, security fixes are applied only to the latest commit on `main` and the newest published prerelease.
 
 ## Reporting a vulnerability
 
@@ -21,7 +21,7 @@ Reports will be acknowledged as soon as practical. Disclosure timing will be coo
 
 ## Security boundaries
 
-Ódinn's beta has explicit capability boundaries, append-only audit events, restart-safe approval and browser-recovery claims, isolated task workers, isolated browser profiles, durable stores, and a loopback-only default control plane. Remote hosting is a separate opt-in service that requires TLS and gives every provisioned user an independent gateway and state/workspace boundary.
+Ódinn Forge's beta has explicit capability boundaries, append-only audit events, restart-safe approval and browser-recovery claims, isolated task workers, isolated browser profiles, durable stores, and a loopback-only default control plane. Remote hosting is a separate opt-in service that requires TLS and gives every provisioned user an independent gateway and state/workspace boundary.
 
 Before the first stable release:
 
@@ -64,7 +64,7 @@ Proof is evidence-based: model text cannot set `verified`. Sentinel decisions ar
 - The local operator controls the config, provider credentials, browser login, and approval decisions.
 - Model output and imported skills are untrusted input; they cannot bypass the kernel policy evaluator.
 - Extension and MCP manifests are metadata, not trust. They are disabled by default, require provenance review, and receive only explicit capability grants when enabled. The process adapter validates the entrypoint stays inside the configured workspace, launches without a shell, enforces a timeout, and rejects disabled, untrusted, ungranted, container, and unsandboxed execution.
-- Public web content is untrusted data and may contain prompt injection. Ódinn must not treat page instructions as operator authorization.
+- Public web content is untrusted data and may contain prompt injection. Ódinn Forge must not treat page instructions as operator authorization.
 - State directories are repaired to `0700` and sensitive JSON/JSONL records to `0600` when the gateway opens them. Idempotency keys are bound to a canonical request hash; reusing a key with different content returns `409`.
 - Browser read access is not action authorization. An external side effect requires the approval gate unless the operator explicitly disables it.
 - The single-user gateway remains loopback-only. Remote deployment uses `host.mjs`; non-loopback startup fails without a certificate, key, and exact public origin. Passwords are scrypt-derived, sessions are signed, cookies are HttpOnly/SameSite=Strict/Secure under TLS, and tenants never share state roots or gateway bearer tokens.

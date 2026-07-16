@@ -1,6 +1,6 @@
-# Odinn CI/CD
+# Odinn Forge CI/CD
 
-Odinn uses separate workflows for correctness, security, scheduled verification, version management, and release publication. A green release requires every required workflow to succeed independently.
+Odinn Forge uses separate workflows for correctness, security, scheduled verification, version management, and release publication. A green release requires every required workflow to succeed independently.
 
 ## Workflows
 

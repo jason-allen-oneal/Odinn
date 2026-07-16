@@ -1,6 +1,6 @@
-# Contributing to Odinn
+# Contributing to Odinn Forge
 
-Odinn is early-stage infrastructure. Changes should preserve cross-platform behavior, explicit security boundaries, durable state transitions, and a small understandable core.
+Odinn Forge is early-stage infrastructure. Changes should preserve cross-platform behavior, explicit security boundaries, durable state transitions, and a small understandable core.
 
 ## Development setup
 

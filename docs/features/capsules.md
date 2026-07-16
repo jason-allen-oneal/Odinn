@@ -1,4 +1,4 @@
-# Odinn Capsule
+# Odinn Forge Capsule
 
 Capsules are ZIP-compatible, redacted run bundles containing the manifest, run record, events, environment metadata, verification results, snapshot index, referenced content-addressed artifacts, optional contract/policy, and checksums. Secrets are represented only as redaction categories; credentials are not exported.
 

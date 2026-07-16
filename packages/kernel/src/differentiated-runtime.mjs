@@ -307,7 +307,7 @@ export class CapsuleManager {
       writeFileSync(join(staging, "run.json"), `${json(redact(run))}\n`);
       writeFileSync(join(staging, "events.jsonl"), `${(run.events ?? []).map((event) => json(redact(event))).join("\n")}\n`);
       writeFileSync(join(staging, "environment.json"), `${json({ platform: process.platform, arch: process.arch, node: process.version })}\n`);
-      writeFileSync(join(staging, "README.txt"), "This Odinn capsule is content-addressed, redacted, and safe to inspect before replay.\n");
+      writeFileSync(join(staging, "README.txt"), "This Odinn Forge capsule is content-addressed, redacted, and safe to inspect before replay.\n");
       if (effectiveContract) writeFileSync(join(staging, "contract.json"), `${json(redact(effectiveContract))}\n`);
       if (effectivePolicy) writeFileSync(join(staging, "policy.json"), `${json(redact(effectivePolicy))}\n`);
       const referenced = this.referencedArtifactRows(runId);

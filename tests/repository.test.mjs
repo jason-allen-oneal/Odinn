@@ -4,7 +4,7 @@ import test from "node:test";
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
-test("package metadata names Odinn and pins the toolchain", async () => {
+test("package metadata names Odinn Forge and pins the toolchain", async () => {
   const pkg = JSON.parse(await read("package.json"));
   assert.equal(pkg.name, "odinn");
   assert.match(pkg.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);

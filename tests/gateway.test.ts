@@ -2,7 +2,7 @@ process.env.ODINN_GATEWAY_AUTH = "off";
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -67,11 +67,15 @@ test("gateway serves the local console shell", async () => {
     assert.match(html, /Odinn Forge Console/);
     assert.match(html, /Ódinn Forge/);
     assert.match(html, /odinn-logo\.png/);
-    assert.match(html, /Run Tool/);
-    assert.match(html, /Recent Runs/);
+    assert.match(html, /Proof &amp; execution ledger/);
+    assert.match(html, /Scheduled automation/);
+    assert.match(html, /Agent SDK v0\.3/);
+    assert.match(html, /Skill authoring pipeline/);
+    assert.doesNotMatch(html, /data-title="Instances"/);
+    assert.doesNotMatch(html, /<h1>Run tools<\/h1>/);
     assert.match(html, /Memory/);
     assert.match(html, /Goals/);
-    assert.match(html, /Improvements/);
+    assert.match(html, /Skill Workshop/);
     assert.match(html, /modelOverride/);
     assert.match(html, /provider \+ ":" \+ message\.model/);
     assert.match(html, /chat-empty/);
@@ -96,6 +100,35 @@ test("gateway serves the local console shell", async () => {
   }
 });
 
+test("gateway backs cron, Agent SDK packages, skills, and workshop with persisted APIs", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "odinn-console-data-"));
+  const stateDir = join(workspace, ".odinn");
+  await mkdir(join(workspace, "skills", "fixture"), { recursive: true });
+  await writeFile(join(workspace, "skills", "fixture", "SKILL.md"), '---\nname: "fixture-skill"\ndescription: "Use for fixture validation work."\n---\n\n# Fixture\n');
+  const server = await createGatewayServer({ stateDir, workspaceRoot: workspace });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const cron = await postJson(`${base}/cron`, { name: "Health wake", schedule: "*/15 * * * *", timezone: "UTC", tool: "job.healthcheck", input: {} });
+    assert.equal(cron.job.name, "Health wake");
+    assert.equal((await getJson(`${base}/cron`)).jobs.length, 1);
+
+    const manifest = { sdkVersion: "0.3", id: "fixture-agent", version: "1.0.0", name: "Fixture Agent", tools: ["job.healthcheck"] };
+    assert.equal((await postJson(`${base}/agents/validate`, manifest)).manifest.validation.valid, true);
+    assert.equal((await postJson(`${base}/agents`, manifest)).agent.status, "disabled");
+    assert.equal((await postJson(`${base}/agents/fixture-agent/lifecycle`, { action: "enable" })).agent.status, "enabled");
+
+    const skills = await getJson(`${base}/skills`);
+    assert.ok(skills.skills.some((skill: any) => skill.name === "fixture-skill"));
+    const draft = { name: "draft-skill", description: "Use when a validated draft workflow is needed.", instructions: "## Workflow\n\n1. Inspect state.\n2. Execute a bounded action.\n3. Verify the evidence artifact." };
+    assert.equal((await postJson(`${base}/skills/workshop/validate`, draft)).valid, true);
+    assert.equal((await postJson(`${base}/skills/workshop/save`, draft)).status, "draft");
+    assert.ok((await getJson(`${base}/skills`)).skills.some((skill: any) => skill.name === "draft-skill" && skill.status === "draft"));
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
 test("gateway stops browser state changes for explicit approval", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-approvals-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
@@ -110,8 +143,15 @@ test("gateway stops browser state changes for explicit approval", async () => {
     assert.equal(response.ok, true);
     assert.equal(response.output.type, "approval.required");
     assert.match(response.output.summary, /Click/);
+    const typed = await postJson(`${base}/run`, {
+      tool: "browser.type",
+      input: { selector: "input#password", value: "must-never-enter-audit", tabId: "tab_test" }
+    });
+    assert.equal(typed.output.type, "approval.required");
+    assert.doesNotMatch(typed.output.summary, /must-never-enter-audit/);
     const approvals = await getJson(`${base}/approvals`);
-    assert.equal(approvals.length, 1);
+    assert.equal(approvals.length, 2);
+    assert.doesNotMatch(JSON.stringify(approvals), /must-never-enter-audit/);
     const runs = await getJson(`${base}/runs`);
     assert.equal(runs[0].status, "awaiting_approval");
   } finally {

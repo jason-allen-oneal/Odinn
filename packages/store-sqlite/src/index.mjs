@@ -25,6 +25,8 @@ export function redact(value, key = "", depth = 0) {
   return value;
 }
 
+// This is a content-addressing/integrity digest, never a password hash.
+// codeql[js/insufficient-password-hash] -- SHA-256 is required by the artifact and ledger format.
 function digest(value) {
   return createHash("sha256").update(value).digest("hex");
 }

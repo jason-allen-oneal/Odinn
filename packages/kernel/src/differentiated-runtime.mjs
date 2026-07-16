@@ -53,20 +53,22 @@ function isLoopbackUrl(value) {
 // contracts and policies so the CLI remains dependency-free and rejects ambiguous input.
 export function parseStructuredDocument(source, label = "document") {
   try { return JSON.parse(source); } catch {}
-  const lines = String(source).split(/\r?\n/).map((line) => line.replace(/\s+#.*$/, "")).filter((line) => line.trim());
+  const lines = String(source).split(/\r?\n/).map((line) => { const comment = line.indexOf(" #"); return comment === -1 ? line : line.slice(0, comment); }).filter((line) => line.trim());
   const root = {};
   let currentList;
   for (const line of lines) {
-    if (/^\s*-\s+/.test(line)) {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("- ")) {
       if (!currentList) throw new OdinnRuntimeError("CAPSULE_INVALID", `${label} YAML list has no parent`);
-      const item = line.replace(/^\s*-\s+/, "");
+      const item = trimmed.slice(2).trimStart();
       if (item.includes(": ")) { const [key, ...rest] = item.split(": "); currentList.push({ [key.trim()]: scalar(rest.join(": ").trim()) }); }
       else currentList.push(scalar(item));
       continue;
     }
-    const match = line.match(/^\s*([A-Za-z0-9_.-]+):\s*(.*)$/);
-    if (!match) throw new OdinnRuntimeError("CAPSULE_INVALID", `${label} must be JSON or simple YAML`);
-    const [, key, raw] = match;
+    const colon = line.indexOf(":");
+    const key = colon === -1 ? "" : line.slice(0, colon).trim();
+    const raw = colon === -1 ? "" : line.slice(colon + 1).trim();
+    if (!key || [...key].some((character) => !/[A-Za-z0-9_.-]/.test(character))) throw new OdinnRuntimeError("CAPSULE_INVALID", `${label} must be JSON or simple YAML`);
     if (!raw) { root[key] = []; currentList = root[key]; }
     else { root[key] = scalar(raw); currentList = undefined; }
   }

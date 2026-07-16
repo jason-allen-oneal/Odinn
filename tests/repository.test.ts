@@ -45,6 +45,10 @@ test("dispatched release pull requests receive dependency and title checks", asy
   const title = await read(".github/workflows/pr-title.yml");
   assert.match(security, /inputs\.base_sha != '' && inputs\.head_sha != ''/);
   assert.match(security, /github\.event\.pull_request\.base\.sha \|\| inputs\.base_sha/);
+  assert.match(
+    security,
+    /github\.event_name != 'workflow_dispatch' \|\| github\.ref_name == github\.event\.repository\.default_branch/,
+  );
   assert.match(title, /github\.event\.pull_request\.title \|\| inputs\.pr_title/);
 });
 

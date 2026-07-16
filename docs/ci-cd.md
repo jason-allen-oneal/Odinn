@@ -29,7 +29,7 @@ It includes:
 - GitHub dependency review on pull requests
 - Frozen-lockfile installation and a fail-closed advisory audit. The audit uses `pnpm audit` when available and queries npm's bulk advisory endpoint directly when the legacy endpoint returns its retirement response.
 - Full-history Gitleaks secret scanning
-- OpenSSF Scorecard reporting on trusted events
+- OpenSSF Scorecard reporting on default-branch pushes, schedules, and manual default-branch runs (Scorecard does not support non-default refs)
 
 ### Nightly
 

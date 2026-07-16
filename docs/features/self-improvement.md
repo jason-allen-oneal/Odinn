@@ -1,14 +1,35 @@
 # Ódinn self-improvement
 
-Ódinn has a review-gated evidence loop, not autonomous self-modifying code.
+Ódinn includes a configurable autonomous evidence loop. It observes signed audit history, groups repeated failures, creates deduplicated proposals, and can apply allowlisted runtime tuning without waiting for a human decision.
 
-The `improve.learn` tool reads bounded audit history, groups repeated failures or policy blocks, and creates a deduplicated improvement proposal with run IDs as evidence:
+The default remains review-gated:
+
+```bash
+pnpm odinn config self-improvement show
+pnpm odinn config self-improvement set --enabled true --mode propose
+```
+
+Enable autonomous application explicitly:
+
+```bash
+pnpm odinn config self-improvement set \
+  --enabled true \
+  --mode auto \
+  --interval-ms 300000 \
+  --max-changes 1
+```
+
+Disable the loop:
+
+```bash
+pnpm odinn config self-improvement set --enabled false --mode disabled
+```
+
+When the gateway is running in `auto` mode it performs a bounded analysis cycle on the configured interval. `improve.learn` can also run a cycle immediately. Applied changes capture the prior configuration under `.odinn/improvements/` and can be rolled back:
 
 ```bash
 pnpm odinn improve learn --limit 1000
-pnpm odinn improvements
+pnpm odinn improve rollback --improvement <id>
 ```
 
-The gateway exposes the same operation at `POST /improvements/learn`, and the console's Skill Workshop page presents it as **Analyze activity**. Proposals can be approved, rejected, or marked applied through the existing human decision path.
-
-The loop does not write source files, alter policy, install or enable skills, change provider routing, or approve its own proposal. Any future autonomous optimization must remain behind a separate experimental flag and preserve an auditable approval boundary.
+Autonomy is deliberately narrow. The controller may tune only explicitly allowlisted reliability settings. It cannot disable approvals, expand network domains, grant capabilities, weaken Sentinel, install extensions, change credentials, edit source code, or approve arbitrary model-generated actions. Unknown recommendations remain proposals. Every application, failure, and rollback is persisted in the record and audit stores.

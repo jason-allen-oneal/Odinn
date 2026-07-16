@@ -6,7 +6,7 @@ import { createServer } from "node:http";
 import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract } from "@odinn/kernel";
+import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 
 const rawArgs = process.argv.slice(2);
@@ -285,11 +285,29 @@ async function status(args) {
 
 async function configCommand(args) {
   const [section, subcommand, ...rest] = args;
-  if (!["provider", "model", "security", "experimental"].includes(section)) {
-    throw new Error("config requires provider, model, security, or experimental");
+  if (!["provider", "model", "security", "experimental", "self-improvement"].includes(section)) {
+    throw new Error("config requires provider, model, security, experimental, or self-improvement");
   }
   const state = stateDir(rest);
   const config = await readConfig(state);
+  if (section === "self-improvement") {
+    if (subcommand === "show" || !subcommand) { await printJson(normalizeSelfImprovementConfig(config.selfImprovement)); return; }
+    if (subcommand !== "set") throw new Error("config self-improvement requires show or set");
+    const current = normalizeSelfImprovementConfig(config.selfImprovement);
+    const enabled = option(rest, "--enabled", "");
+    const mode = option(rest, "--mode", current.mode);
+    if (!["disabled", "propose", "auto"].includes(mode)) throw new Error("--mode requires disabled, propose, or auto");
+    config.selfImprovement = normalizeSelfImprovementConfig({
+      ...current,
+      mode,
+      ...(enabled === "" ? {} : { enabled: parseBoolean(enabled, "--enabled") }),
+      intervalMs: Number.parseInt(option(rest, "--interval-ms", String(current.intervalMs)), 10),
+      maxChangesPerCycle: Number.parseInt(option(rest, "--max-changes", String(current.maxChangesPerCycle)), 10)
+    });
+    await saveConfig(state, config);
+    await printJson({ ok: true, selfImprovement: config.selfImprovement });
+    return;
+  }
   if (section === "security") {
     await configSecurityCommand(state, config, subcommand, rest);
     return;
@@ -1437,13 +1455,19 @@ async function improve(args) {
         source: option(rest, "--source", "cli")
       });
       break;
+    case "rollback":
+      await runRecordTool(rest, "improve.rollback", {
+        improvementId: option(rest, "--improvement"),
+        source: option(rest, "--source", "cli")
+      });
+      break;
     case "list":
       await runRecordTool(rest, "improve.list", {
         limit: Number.parseInt(option(rest, "--limit", "20"), 10)
       });
       break;
     default:
-      throw new Error("improve requires subcommand: learn, propose, decide, or list");
+      throw new Error("improve requires subcommand: learn, propose, decide, rollback, or list");
   }
 }
 
@@ -1548,11 +1572,34 @@ async function branchCommand(command, args) {
 }
 
 async function capsuleCommand(args) {
-  const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); try {
+  const [subcommand, ...rest] = args; const { state, runtime } = runtimeFor(rest); try {
     const path = rest.find((value) => !value.startsWith("--"));
     if (subcommand === "export") await printJson(await runtime.capsules.export(path, { output: option(rest, "--output") }));
     else if (subcommand === "inspect" || subcommand === "verify") await printJson(await runtime.capsules.verify(path));
-    else if (subcommand === "replay") await printJson(await runtime.capsules.replay(path, { mode: option(rest, "--mode", "verification-only"), workspace: option(rest, "--workspace", "") }));
+    else if (subcommand === "replay") {
+      const mode = option(rest, "--mode", "verification-only");
+      const config = await readConfig(state);
+      const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+      await printJson(await runtime.capsules.replay(path, {
+        mode,
+        workspace: option(rest, "--workspace", ""),
+        approveExternal: hasFlag(rest, "--approve-external"),
+        executor: mode === "full" ? async ({ tool, input, replayRunId, stepIndex, workspaceRoot }) => {
+          const taskId = `${replayRunId}-step-${stepIndex}`;
+          if (runtime.ledger.featureFlags.capabilities === true) {
+            const issued = runtime.capabilities.issue({ runId: taskId, stepId: `replay-step-${stepIndex}`, toolName: tool, scopes: [tool], resourceConstraints: input.resource ?? {} });
+            input = { ...input, capabilityToken: issued.token };
+          }
+          return runTask({
+            task: { id: taskId, tool, input, actor: "capsule-replay" },
+            auditStore,
+            policy: createDefaultPolicy(config.policy),
+            registry: createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore }),
+            runLedger: runtime.ledger
+          });
+        } : undefined
+      }));
+    }
     else throw new Error("capsule requires export, inspect, verify, or replay");
   } finally { runtime.ledger.close(); }
 }
@@ -1632,7 +1679,7 @@ async function readConfig(state) {
     return JSON.parse(await readFile(path, "utf8"));
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
-    return { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: normalizeExperimentalFlags() };
+    return { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: normalizeExperimentalFlags(), selfImprovement: normalizeSelfImprovementConfig() };
   }
 }
 
@@ -1645,7 +1692,8 @@ async function ensureConfig(state) {
     auditLog: "audit.jsonl",
     providers: {},
     defaultModel: "",
-    experimental: normalizeExperimentalFlags()
+    experimental: normalizeExperimentalFlags(),
+    selfImprovement: normalizeSelfImprovementConfig()
   }, null, 2)}\n`, { flag: "wx" }).catch((error) => {
     if (error?.code !== "EEXIST") throw error;
   });
@@ -1660,6 +1708,8 @@ async function saveConfig(state, config) {
     auditLog: config.auditLog ?? "audit.jsonl",
     providers: config.providers ?? {},
     experimental: normalizeExperimentalFlags(config.experimental),
+    selfImprovement: normalizeSelfImprovementConfig(config.selfImprovement),
+    runtime: config.runtime ?? {},
     ...(config.defaultModel ? { defaultModel: config.defaultModel } : {})
   }, null, 2)}\n`);
 }

@@ -183,6 +183,31 @@ test("gateway closes and reopens the persistent browser profile cleanly", async 
   }
 });
 
+test("gateway blocks retries after an uncertain browser mutation until recovery is resolved", async (t) => {
+  const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
+  try { await access(chromiumPath); } catch { t.skip(`Chromium not available at ${chromiumPath}`); return; }
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-browser-recovery-"));
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const opened = await postJson(`${base}/run`, { tool: "browser.open", input: { url: "https://example.com" } });
+    const requested = await postJson(`${base}/run`, { tool: "browser.click", input: { tabId: opened.output.id, snapshotId: opened.output.snapshotId, selector: "#definitely-missing" } });
+    const failedResponse = await fetch(`${base}/approvals/${requested.output.approvalId}/approve`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const failed = await failedResponse.json();
+    assert.equal(failedResponse.status, 400);
+    assert.match(failed.error, /outcome is unknown/);
+    const status = await postJson(`${base}/run`, { tool: "browser.recovery.status", input: {} });
+    assert.equal(status.output.recovery.status, "unknown");
+    const blockedResponse = await fetch(`${base}/run`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.press", input: { tabId: opened.output.id, key: "Escape", confirmed: true } }) });
+    const blocked = await blockedResponse.json();
+    assert.equal(blockedResponse.status, 400);
+    assert.match(blocked.error, /uncertain outcome/);
+    const resolved = await postJson(`${base}/run`, { tool: "browser.recovery.resolve", input: { outcome: "not-applied", note: "missing selector did not mutate the page" } });
+    assert.equal(resolved.output.recovery.status, "resolved");
+  } finally { await new Promise((resolve) => server.close(() => resolve())); }
+});
+
 test("gateway rejects invalid and oversized JSON bodies", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-limits-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root, requestMaxBytes: 32 });

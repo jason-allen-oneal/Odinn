@@ -7,6 +7,16 @@ import { ExtensionExecutor, ExtensionRegistry } from "../packages/kernel/src/ext
 import { createAuditStore, createDifferentiatedRuntime } from "../packages/kernel/src/index.mjs";
 import { createDefaultPolicy } from "../packages/policy/src/index.mjs";
 
+function auditedExtensionRuntime(root, name) {
+  const stateDir = join(root, `.odinn-${name}`);
+  const differentiated = createDifferentiatedRuntime({ stateDir, workspaceRoot: root });
+  const auditStore = createAuditStore(join(stateDir, "audit.jsonl"));
+  return {
+    differentiated,
+    value: { runId: `run-${name}`, runLedger: differentiated.ledger, auditStore, policy: createDefaultPolicy(), workspaceRoot: root }
+  };
+}
+
 test("extension manifests are disabled, grant-scoped, provenance-aware, and rollbackable", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-extensions-"));
   const registry = new ExtensionRegistry(join(root, "extensions.json"));
@@ -39,7 +49,10 @@ test("trusted process extensions execute only with an explicit grant", async () 
   const executor = new ExtensionExecutor(registry, { workspaceRoot: root, defaultTimeoutMs: 2_000 });
   await assert.rejects(() => executor.invoke("process-tool", { text: "blocked" }), /not enabled and trusted/);
   await registry.enable("process-tool", { grants: ["text.echo"], trust: true });
-  assert.deepEqual(await executor.invoke("process-tool", { text: "ODINN_EXTENSION_OK" }), { echoed: "ODINN_EXTENSION_OK", capability: "text.echo" });
+  await assert.rejects(() => executor.invoke("process-tool", { text: "bypass" }), /audited runtime boundary/);
+  const runtime = auditedExtensionRuntime(root, "process");
+  assert.deepEqual(await executor.invoke("process-tool", { text: "ODINN_EXTENSION_OK" }, { runtime: runtime.value }), { echoed: "ODINN_EXTENSION_OK", capability: "text.echo" });
+  runtime.differentiated.ledger.close();
 });
 
 test("trusted MCP manifests use the explicit JSONL tools/call adapter", async () => {
@@ -50,7 +63,9 @@ test("trusted MCP manifests use the explicit JSONL tools/call adapter", async ()
   await registry.install({ id: "mcp-tool", version: "1.0.0", type: "mcp", entrypoint: "mcp.mjs", capabilities: ["mcp.call"], sandbox: "process" });
   await registry.enable("mcp-tool", { grants: ["mcp.call"], trust: true });
   const executor = new ExtensionExecutor(registry, { workspaceRoot: root, defaultTimeoutMs: 2_000 });
-  assert.deepEqual(await executor.invoke("mcp-tool", { name: "fixture", arguments: {} }, { capability: "mcp.call" }), { content: [{ type: "text", text: "ODINN_MCP_OK" }] });
+  const runtime = auditedExtensionRuntime(root, "mcp");
+  assert.deepEqual(await executor.invoke("mcp-tool", { name: "fixture", arguments: {} }, { capability: "mcp.call", runtime: runtime.value }), { content: [{ type: "text", text: "ODINN_MCP_OK" }] });
+  runtime.differentiated.ledger.close();
 });
 
 test("extension execution crosses the audited Sentinel and capability boundary", async () => {

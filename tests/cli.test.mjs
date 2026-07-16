@@ -627,5 +627,5 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
     encoding: "utf8"
   });
   assert.equal(learned.status, 0, learned.stderr || learned.stdout);
-  assert.equal(JSON.parse(learned.stdout).applied, false);
+  assert.equal(JSON.parse(learned.stdout).applied.length, 0);
 });

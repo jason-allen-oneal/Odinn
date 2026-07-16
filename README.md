@@ -20,9 +20,9 @@ The project is a clean-room implementation. It does not copy OpenClaw, Hermes, O
 - inspect sessions, memory, runs, goals, improvements, providers, and audit events;
 - run deterministic tools and bounded model/tool loops through one audited kernel path.
 
-It is not a hosted multi-user service. Do not expose the gateway to the public internet yet. The default posture is loopback-only, private-network blocking, and approval-required browser actions.
+The default gateway remains single-user and loopback-only. An opt-in multi-user host is available for remote deployments; it terminates TLS and routes each authenticated user into an independent loopback gateway, state root, workspace, audit ledger, OAuth store, and browser profile.
 
-The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval claims, provider retries and usage normalization, trusted process/MCP extension adapters with a CLI Sentinel/capability boundary, DNS-pinned public web fetches, symlink-safe workspace reads, owner-only state repair, cross-platform package smoke, signed audit-key rotation, persistent browser tab recovery, bounded counterfactual execution, tool-mocked capsule replay, and nightly storage recovery drills. Native installers, application upgrade rollback, immutable extension versions, complete external-adapter interposition, full external-action capsule replay, and the remaining browser recovery matrix remain open. See [the P0 beta ledger](docs/P0-BETA-GATES.md).
+The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval and browser-recovery journals, provider retries and usage normalization, universally audited process/MCP extension execution, DNS-pinned public web fetches, symlink-safe workspace reads, owner-only state repair, versioned native installers with pointer rollback, signed audit-key rotation, bounded counterfactual execution, approved full capsule replay in disposable workspaces, autonomous rollback-safe reliability tuning, and tenant-isolated remote hosting. See [the P0 beta ledger](docs/P0-BETA-GATES.md).
 
 ## Quick start
 
@@ -274,7 +274,28 @@ pnpm storage:drill
 
 ## Security
 
-Read [SECURITY.md](SECURITY.md) before enabling remote access, disabling approvals, allowing private networks, or installing imported skills. The default gateway binds to `127.0.0.1`; remote binding requires an explicit environment override and is not a supported deployment mode yet.
+Read [SECURITY.md](SECURITY.md) before enabling remote access, autonomous improvement, disabling approvals, allowing private networks, or installing imported skills. Never bind the single-user gateway publicly. Remote deployments must use the separate multi-user host with TLS and explicit user provisioning.
+
+Versioned install and rollback:
+
+```bash
+./scripts/install.sh --prefix "$HOME/.local/share/odinn"
+node scripts/install.mjs upgrade --source . --prefix "$HOME/.local/share/odinn"
+node scripts/install.mjs rollback --prefix "$HOME/.local/share/odinn"
+```
+
+Opt-in multi-user host:
+
+```bash
+ODINN_HOST_STATE=/srv/odinn ODINN_USER_PASSWORD='use-a-password-manager' \
+  node apps/gateway/src/host.mjs user-add --id alice --workspace /srv/workspaces/alice
+
+ODINN_HOST=0.0.0.0 ODINN_PORT=443 ODINN_HOST_STATE=/srv/odinn \
+ODINN_PUBLIC_ORIGIN=https://odinn.example.com \
+ODINN_TLS_CERT=/etc/letsencrypt/live/odinn.example.com/fullchain.pem \
+ODINN_TLS_KEY=/etc/letsencrypt/live/odinn.example.com/privkey.pem \
+  pnpm host:start
+```
 
 ## License
 

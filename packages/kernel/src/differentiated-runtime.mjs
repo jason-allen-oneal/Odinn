@@ -23,6 +23,12 @@ export class OdinnRuntimeError extends Error {
 
 function now() { return new Date().toISOString(); }
 function json(value) { return JSON.stringify(value); }
+function containsRedaction(value) {
+  if (value === "[redacted]") return true;
+  if (Array.isArray(value)) return value.some(containsRedaction);
+  if (value && typeof value === "object") return Object.values(value).some(containsRedaction);
+  return false;
+}
 function hash(value) { return createHash("sha256").update(value).digest("hex"); }
 function parse(value, fallback = {}) { try { return value ? JSON.parse(value) : fallback; } catch { return fallback; } }
 function requireExperimental(flags, name) {
@@ -339,12 +345,43 @@ export class CapsuleManager {
     const staging = join(this.root, `.verify-${randomUUID()}`); mkdirSync(staging, { recursive: true }); const extracted = await runProcess("unzip", ["-q", archive, "-d", staging], { timeoutMs: 60_000 }); if (extracted.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule extraction failed");
     const manifest = parse(readFileSync(join(staging, "manifest.json"), "utf8"), null); if (!manifest || manifest.formatVersion !== 1) throw new OdinnRuntimeError("CAPSULE_INVALID", "unsupported capsule version"); const checksums = readFileSync(join(staging, "checksums.sha256"), "utf8").split(/\r?\n/).filter(Boolean); const failures = []; for (const line of checksums) { const match = line.match(/^([a-f0-9]{64})  (.+)$/); if (!match || !names.includes(match[2]) || !existsSync(join(staging, match[2])) || hash(readFileSync(join(staging, match[2]))) !== match[1]) failures.push(match?.[2] ?? line); } await rm(staging, { recursive: true, force: true }); if (failures.length) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule checksum verification failed", { failures }); return { valid: true, manifest, entries: names };
   }
-  async replay(path, { mode = "verification-only", workspace } = {}) {
+  async replay(path, { mode = "verification-only", workspace, executor, approveExternal = false } = {}) {
     const verified = await this.verify(path);
     if (!["verification-only", "tool-mocked", "full"].includes(mode)) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", `unsupported replay mode: ${mode}`);
     if (mode === "full") {
       if (!workspace) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", "full replay requires a disposable workspace");
-      return { ...verified, mode, executed: false, message: "full replay is fail-closed until every adapter declares a replay-safe contract" };
+      if (typeof executor !== "function") throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", "full replay requires an audited task executor");
+      const target = resolve(workspace);
+      if (target === resolve(this.ledger.workspaceRoot)) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", "full replay refuses the original workspace");
+      mkdirSync(target, { recursive: true });
+      const runJson = await runProcess("unzip", ["-p", resolve(path), "run.json"], { timeoutMs: 30_000 });
+      const eventsJson = await runProcess("unzip", ["-p", resolve(path), "events.jsonl"], { timeoutMs: 30_000 });
+      if (runJson.code !== 0 || eventsJson.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule is missing replay metadata");
+      const sourceRun = parse(runJson.stdout, null);
+      const requests = eventsJson.stdout.split(/\r?\n/).filter(Boolean).map((line) => parse(line, null)).filter((event) => event?.type === "tool-request");
+      const replayRunId = `replay_${randomUUID()}`;
+      this.ledger.ensureRun({ runId: replayRunId, objective: `full replay of ${sourceRun?.id ?? verified.manifest.runId}`, workspaceRoot: target });
+      this.ledger.appendEvent({ runId: replayRunId, type: "capsule-replay-started", payload: { sourceRunId: sourceRun?.id ?? verified.manifest.runId, mode, taskCount: requests.length } });
+      const results = [];
+      for (let index = 0; index < requests.length; index += 1) {
+        const event = requests[index];
+        const tool = event.payload?.toolName;
+        const digest = event.payload?.inputDigest;
+        if (!tool || !digest) throw new OdinnRuntimeError("CAPSULE_INVALID", "recorded tool request is missing replay metadata");
+        const artifact = await runProcess("unzip", ["-p", resolve(path), `artifacts/${digest}`], { timeoutMs: 30_000 });
+        if (artifact.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule is missing input artifact ${digest}`);
+        const input = parse(artifact.stdout, null);
+        if (!input || containsRedaction(input)) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", `tool ${tool} requires redacted or missing input`);
+        const safety = event.payload?.safety ?? {};
+        const external = safety.reversibility === "irreversible" || (safety.effects ?? []).some((effect) => ["network", "credential", "external-state"].includes(effect));
+        if (external && approveExternal !== true) throw new OdinnRuntimeError("CAPABILITY_DENIED", `full replay of external tool ${tool} requires explicit approval`);
+        const result = await executor({ tool, input, external, replayRunId, stepIndex: index, workspaceRoot: target, sourceEvent: event });
+        results.push({ tool, external, result: redact(result) });
+        this.ledger.appendEvent({ runId: replayRunId, type: "capsule-replay-action", payload: { sourceEventId: event.id, tool, external, result: redact(result) } });
+      }
+      this.ledger.appendEvent({ runId: replayRunId, type: "capsule-replay-completed", payload: { sourceRunId: sourceRun?.id ?? verified.manifest.runId, taskCount: results.length } });
+      this.ledger.database.db.prepare("UPDATE runs SET status = 'completed-unverified', completed_at = ? WHERE id = ?").run(now(), replayRunId);
+      return { ...verified, mode, executed: true, replayRunId, results, message: "recorded actions re-executed through the audited runtime in a disposable workspace" };
     }
     if (mode === "verification-only") return { ...verified, mode, executed: false, contractIncluded: verified.entries.includes("contract.json"), message: "capsule integrity verified; run the included contract against a supplied workspace" };
 

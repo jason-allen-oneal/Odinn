@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { createServer as createHttpServer } from "node:http";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -289,15 +289,42 @@ test("workspace.readText is confined to the workspace root", async () => {
   );
 });
 
-test("self-improvement mines repeated audited failures but never applies them", async () => {
+test("self-improvement defaults to review-gated proposals", async () => {
   const { root, auditStore } = await fixture();
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn"), auditStore });
   await auditStore.append({ runId: "failed-a", type: "task.failed", actor: "test", tool: "web.fetch", message: "DNS validation failed" });
   await auditStore.append({ runId: "failed-b", type: "task.failed", actor: "test", tool: "web.fetch", message: "DNS validation failed" });
   const result = await runTask({ task: { id: "learn-1", tool: "improve.learn", input: {}, actor: "test" }, auditStore, registry });
-  assert.equal(result.output.applied, false);
+  assert.equal(result.output.applied.length, 0);
   assert.equal(result.output.requiresHumanDecision, true);
   assert.equal(result.output.generated.length, 1);
+});
+
+test("self-improvement autonomously applies and rolls back allowlisted runtime tuning", async () => {
+  const { root, auditStore } = await fixture();
+  const stateDir = join(root, ".odinn");
+  const config = {
+    version: 1,
+    policy: createDefaultPolicy(),
+    providers: {},
+    runtime: { modelRetries: 1 },
+    selfImprovement: { enabled: true, mode: "auto", maxChangesPerCycle: 1, rollbackOnFailure: true }
+  };
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify(config, null, 2)}\n`);
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir, config, auditStore });
+  await auditStore.append({ runId: "model-a", type: "task.failed", actor: "test", tool: "model.chat", message: "model provider returned 429: rate limit" });
+  await auditStore.append({ runId: "model-b", type: "task.failed", actor: "test", tool: "model.chat", message: "model provider returned 429: rate limit" });
+
+  const learned = await runTask({ task: { id: "learn-auto", tool: "improve.learn", input: {}, actor: "test" }, auditStore, registry });
+  assert.equal(learned.output.mode, "auto");
+  assert.equal(learned.output.applied.length, 1);
+  assert.equal(JSON.parse(await readFile(join(stateDir, "config.json"), "utf8")).runtime.modelRetries, 2);
+
+  const improvementId = learned.output.applied[0].improvementId;
+  const rolledBack = await runTask({ task: { id: "learn-rollback", tool: "improve.rollback", input: { improvementId }, actor: "test" }, auditStore, registry });
+  assert.equal(rolledBack.output.type, "improvement.rolled-back");
+  assert.equal(JSON.parse(await readFile(join(stateDir, "config.json"), "utf8")).runtime.modelRetries, 1);
 });
 
 test("web.fetch rejects a public-looking hostname that resolves to loopback", async () => {
@@ -310,6 +337,19 @@ test("web.fetch rejects a public-looking hostname that resolves to loopback", as
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("browser recovery journal turns interrupted mutations into explicit operator resolution", async () => {
+  const { root, auditStore } = await fixture();
+  const stateDir = join(root, ".odinn");
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(join(stateDir, "browser-recovery.json"), `${JSON.stringify({ schemaVersion: 1, id: "browser_tx_interrupted", status: "executing", tool: "browser.click", tabId: "tab_lost" })}\n`);
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir });
+  const status = await runTask({ task: { id: "browser-recovery-status", tool: "browser.recovery.status", input: {}, actor: "test" }, auditStore, registry });
+  assert.equal(status.output.recovery.status, "unknown");
+  const resolved = await runTask({ task: { id: "browser-recovery-resolve", tool: "browser.recovery.resolve", input: { outcome: "manual-recovery", note: "operator inspected target" }, actor: "test" }, auditStore, registry });
+  assert.equal(resolved.output.recovery.status, "resolved");
+  assert.equal(resolved.output.recovery.outcome, "manual-recovery");
 });
 
 test("kernel runs deterministic multi-step plans and materializes plan state", async () => {

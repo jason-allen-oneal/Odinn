@@ -67,12 +67,22 @@ test("capsules verify their checksums and detect tampering", async () => {
   const { root, runtime } = await fixture();
   try {
     runtime.ledger.ensureRun({ runId: "run-capsule", objective: "capsule test" });
+    const step = runtime.ledger.beginTool({ runId: "run-capsule", toolName: "external.fixture", input: { text: "capsule full replay" }, safety: { effects: ["external-state"], reversibility: "compensatable" } });
+    runtime.ledger.finishTool({ runId: "run-capsule", stepId: step.stepId, output: { text: "capsule full replay" } });
     const output = join(root, "run.odinn");
     await runtime.capsules.export("run-capsule", { output });
     assert.equal((await runtime.capsules.verify(output)).valid, true);
     const replay = await runtime.capsules.replay(output, { mode: "tool-mocked" });
     assert.equal(replay.executed, true);
     assert.equal(runtime.ledger.getRun(replay.replayRunId).status, "completed-unverified");
+    const fullWorkspace = join(root, "full-replay");
+    const executed = [];
+    await assert.rejects(runtime.capsules.replay(output, { mode: "full", workspace: fullWorkspace, executor: async () => ({ ok: true }) }), (error) => error.code === "CAPABILITY_DENIED");
+    const full = await runtime.capsules.replay(output, { mode: "full", workspace: fullWorkspace, approveExternal: true, executor: async (task) => { executed.push(task); return { ok: true }; } });
+    assert.equal(full.executed, true);
+    assert.equal(executed[0].tool, "external.fixture");
+    assert.equal(executed[0].external, true);
+    assert.equal(executed[0].input.text, "capsule full replay");
     const bytes = await readFile(output); bytes[bytes.length - 1] ^= 1; await writeFile(output, bytes);
     await assert.rejects(runtime.capsules.verify(output), (error) => error.code === "CAPSULE_TAMPERED");
   } finally { runtime.ledger.close(); }

@@ -2334,6 +2334,15 @@ function renderConsoleHtml() {
     .agent-package.selected { border-color: var(--accent); background: #14231f; }
     .agent-inspector { display: grid; gap: 12px; }
     .agent-section { padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #0d1218; }
+    .activity-event { border-left: 3px solid #456071; }
+    .activity-event.error { border-left-color: #d86a78; }
+    .activity-summary { margin: 8px 0 0; color: var(--text); line-height: 1.45; }
+    .activity-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+    .activity-meta span { color: var(--muted); font-size: 12px; }
+    .activity-details { margin-top: 10px; }
+    .activity-details summary { color: var(--muted); cursor: pointer; font-size: 12px; }
+    .manifest-fields { display: grid; gap: 12px; }
+    .manifest-advanced { border-top: 1px solid var(--line); padding-top: 12px; }
     .skill-card { min-height: 150px; }
     .skill-path { word-break: break-all; }
     @media (max-width: 900px) {
@@ -2613,7 +2622,7 @@ function renderConsoleHtml() {
       </section>
 
       <section id="view-agents" class="view">
-        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Agent SDK v0.3</div><h1>Agents</h1><p>Install, validate, enable, disable, quarantine, and inspect declarative agent packages.</p></div><div class="row"><button id="new-agent" type="button">Install Package</button><button class="secondary" id="refresh-agents" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="agent-total">0</strong><span>packages</span></div><div class="stat-card"><strong id="agent-enabled">0</strong><span>enabled</span></div><div class="stat-card"><strong id="agent-quarantined">0</strong><span>quarantined</span></div><div class="stat-card"><strong>v0.3</strong><span>SDK contract</span></div></div><div class="agent-layout"><div class="panel stack"><div class="panel-head"><h2>Package registry</h2><input id="agent-query" placeholder="Filter agents"></div><div id="agent-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Package inspector</h2><span class="chip" id="agent-detail-status">No selection</span></div><div id="agent-detail" class="empty-state"><strong>Select an agent package</strong><span>Identity, instructions, tools, plugins, secrets, sandbox, network, schedules, channels, memory, integrity, and tests will appear here.</span></div><div class="row"><button id="agent-enable" type="button" disabled>Enable</button><button class="secondary" id="agent-disable" type="button" disabled>Disable</button><button class="danger-button" id="agent-quarantine" type="button" disabled>Quarantine</button></div></div></div><dialog id="agent-dialog" class="editor-dialog"><form method="dialog" id="agent-form"><div class="panel-head"><h2>Install Agent SDK package</h2><button class="secondary" value="cancel">Close</button></div><div class="field"><label for="agent-manifest">Manifest JSON</label><textarea id="agent-manifest" class="manifest-editor">{"sdkVersion":"0.3","id":"example-agent","version":"1.0.0","name":"Example Agent","identity":{"name":"Example"},"instructions":["AGENTS.md"],"tools":["workspace.readText"],"plugins":[],"secrets":[],"sandbox":{"mode":"workspace-write"},"network":{"default":"deny","allow":[]},"schedules":[],"channels":[],"memory":{},"tests":[]}</textarea></div><div class="row"><button id="validate-agent" value="default" type="submit">Validate &amp; Install</button></div></form></dialog></div>
+        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Agent SDK v0.3</div><h1>Agents</h1><p>Create a manifest from the fields below, then validate and install it. Advanced JSON remains available for unusual packages.</p></div><div class="row"><button id="new-agent" type="button">Create Manifest</button><button class="secondary" id="refresh-agents" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="agent-total">0</strong><span>packages</span></div><div class="stat-card"><strong id="agent-enabled">0</strong><span>enabled</span></div><div class="stat-card"><strong id="agent-quarantined">0</strong><span>quarantined</span></div><div class="stat-card"><strong>v0.3</strong><span>SDK contract</span></div></div><div class="agent-layout"><div class="panel stack"><div class="panel-head"><h2>Package registry</h2><input id="agent-query" placeholder="Filter agents"></div><div id="agent-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Package inspector</h2><span class="chip" id="agent-detail-status">No selection</span></div><div id="agent-detail" class="empty-state"><strong>Select an agent package</strong><span>Identity, instructions, tools, plugins, secrets, sandbox, network, schedules, channels, memory, integrity, and tests will appear here.</span></div><div class="row"><button id="agent-enable" type="button" disabled>Enable</button><button class="secondary" id="agent-disable" type="button" disabled>Disable</button><button class="danger-button" id="agent-quarantine" type="button" disabled>Quarantine</button></div></div></div><dialog id="agent-dialog" class="editor-dialog"><form method="dialog" id="agent-form"><div class="panel-head"><div><h2>Create Agent SDK manifest</h2><span class="muted">New packages install disabled until explicitly enabled.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div id="manifest-fields" class="manifest-fields"><div class="grid-2"><div class="field"><label for="agent-id">Package ID</label><input id="agent-id" pattern="[a-z0-9][a-z0-9._-]{1,63}" value="example-agent" required></div><div class="field"><label for="agent-version">Version</label><input id="agent-version" value="1.0.0" required></div></div><div class="field"><label for="agent-name">Display name</label><input id="agent-name" value="Example Agent" required></div><div class="field"><label for="agent-identity">Identity name</label><input id="agent-identity" value="Example"></div><div class="field"><label for="agent-instructions">Instruction files <span class="muted">comma-separated</span></label><input id="agent-instructions" value="AGENTS.md"></div><div class="field"><label for="agent-tools">Tools <span class="muted">comma-separated</span></label><input id="agent-tools" value="workspace.readText"></div><div class="grid-2"><div class="field"><label for="agent-plugins">Plugins <span class="muted">comma-separated</span></label><input id="agent-plugins"></div><div class="field"><label for="agent-secrets">Secret names <span class="muted">comma-separated</span></label><input id="agent-secrets"></div></div><div class="grid-2"><div class="field"><label for="agent-sandbox">Sandbox mode</label><select id="agent-sandbox"><option value="workspace-write">workspace-write</option><option value="workspace-read">workspace-read</option><option value="container">container</option></select></div><div class="field"><label for="agent-network">Network allowlist <span class="muted">comma-separated</span></label><input id="agent-network" placeholder="api.example.com"></div></div></div><div class="manifest-advanced"><label><input type="checkbox" id="agent-advanced-toggle"> Edit full manifest JSON</label><textarea id="agent-manifest" class="manifest-editor" hidden>{"sdkVersion":"0.3","id":"example-agent","version":"1.0.0","name":"Example Agent","identity":{"name":"Example"},"instructions":["AGENTS.md"],"tools":["workspace.readText"],"plugins":[],"secrets":[],"sandbox":{"mode":"workspace-write"},"network":{"default":"deny","allow":[]},"schedules":[],"channels":[],"memory":{},"tests":[]}</textarea></div><div class="row"><button id="validate-agent" value="default" type="submit">Validate &amp; Install</button></div></form></dialog></div>
       </section>
 
       <section id="view-skills" class="view">
@@ -2853,7 +2862,17 @@ function renderConsoleHtml() {
       const query = $("audit-query")?.value.trim().toLowerCase();
       if (query && !text.toLowerCase().includes(query)) return "";
       const tone = isError ? "danger" : isModel ? "ok" : "";
-      return '<div class="item"><div class="item-line"><strong>' + escapeHtml(event.tool || event.type || event.event || "audit event") + '</strong><span class="chip ' + tone + '">' + escapeHtml(event.status || (isError ? "error" : "recorded")) + '</span></div><div class="muted">' + escapeHtml(event.at || event.timestamp || "") + '</div><pre>' + escapeHtml(JSON.stringify(event, null, 2)) + '</pre></div>';
+      const kind = event.type || event.event || "audit event";
+      const labels = {
+        "task.policy": "Policy decision", "task.started": "Task started", "task.completed": "Task completed",
+        "task.failed": "Task failed", "task.approval_required": "Approval required", "task.cancelled": "Task cancelled",
+        "model.request": "Model request", "model.response": "Model response", "memory.curate": "Memory curation"
+      };
+      const title = labels[kind] || event.tool || kind;
+      const subject = event.tool ? "Tool " + event.tool : event.capability ? "Capability " + event.capability : "Runtime event";
+      const summary = event.message || (event.decision ? "Decision: " + event.decision : event.status ? "Status: " + event.status : subject);
+      const metadata = [event.actor && "Actor: " + event.actor, event.runId && "Run: " + event.runId, event.capability && "Capability: " + event.capability, event.tool && "Tool: " + event.tool].filter(Boolean);
+      return '<div class="item activity-event ' + (isError ? "error" : "") + '"><div class="item-line"><strong>' + escapeHtml(title) + '</strong><span class="chip ' + tone + '">' + escapeHtml(event.status || event.decision || (isError ? "error" : "recorded")) + '</span></div><div class="muted">' + escapeHtml(event.at || event.timestamp || "") + ' · ' + escapeHtml(kind) + '</div><p class="activity-summary">' + escapeHtml(summary) + '</p><div class="activity-meta">' + metadata.map((value) => '<span>' + escapeHtml(value) + '</span>').join("") + '</div><details class="activity-details"><summary>Show event details</summary><pre>' + escapeHtml(JSON.stringify(event, null, 2)) + '</pre></details></div>';
     }
 
     function renderProvider(provider) {
@@ -3699,13 +3718,22 @@ function renderConsoleHtml() {
     });
 
     $("new-agent").addEventListener("click", () => $("agent-dialog").showModal());
+    $("agent-advanced-toggle").addEventListener("change", (event) => {
+      $("agent-manifest").hidden = !event.target.checked;
+      $("manifest-fields").hidden = event.target.checked;
+    });
     $("refresh-agents").addEventListener("click", () => refreshAgents().catch((error) => showOutput(error.message)));
     $("agent-query").addEventListener("input", () => refreshAgents().catch((error) => showOutput(error.message)));
     $("agent-form").addEventListener("submit", async (event) => {
       if (event.submitter?.value === "cancel") return;
       event.preventDefault();
       try {
-        const manifest = JSON.parse($("agent-manifest").value);
+        const list = (id) => $(id).value.split(",").map((value) => value.trim()).filter(Boolean);
+        const manifest = $("agent-advanced-toggle").checked ? JSON.parse($("agent-manifest").value) : {
+          sdkVersion: "0.3", id: $("agent-id").value.trim(), version: $("agent-version").value.trim(), name: $("agent-name").value.trim(),
+          identity: { name: $("agent-identity").value.trim() }, instructions: list("agent-instructions"), tools: list("agent-tools"), plugins: list("agent-plugins"), secrets: list("agent-secrets"),
+          sandbox: { mode: $("agent-sandbox").value }, network: { default: "deny", allow: list("agent-network") }, schedules: [], channels: [], memory: {}, tests: []
+        };
         await api("/agents/validate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
         const result = await api("/agents", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
         state.selectedAgentId = result.agent.id;

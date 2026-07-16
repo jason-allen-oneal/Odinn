@@ -2,7 +2,7 @@ process.env.ODINN_GATEWAY_AUTH = "off";
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, mkdtemp } from "node:fs/promises";
+import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -333,6 +333,99 @@ test("gateway exposes sessions, goals, and improvement proposals", async () => {
 
     const improvements = await getJson(`${base}/improvements`);
     assert.equal(improvements.improvements[0].status, "approved");
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("gateway exposes the experimental runtime against persisted SQLite state", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-runtime-"));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-workspace-"));
+  await writeFile(join(workspaceRoot, "fixture.txt"), "before\n");
+  await writeFile(join(stateDir, "config.json"), JSON.stringify({
+    version: 1,
+    experimental: { proof: true, rewind: true, sentinel: true, capsules: true, darwin: true, capabilities: true, counterfactual: true }
+  }));
+  const server = await createGatewayServer({ stateDir, workspaceRoot });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const status = await getJson(`${base}/status`);
+    assert.equal(status.experimental.proof, true);
+    assert.equal(status.experimental.capabilities, true);
+
+    const issued = await postJson(`${base}/capabilities/issue`, {
+      runId: "gateway-runtime-run",
+      stepId: "step-gateway-runtime",
+      toolName: "text.echo",
+      scopes: ["text:echo"]
+    });
+    assert.equal(issued.claims.toolName, "text.echo");
+    assert.ok(issued.token);
+
+    const run = await postJson(`${base}/run`, {
+      id: "gateway-runtime-run",
+      tool: "text.echo",
+      input: { text: "gateway runtime proof", capabilityToken: issued.token }
+    });
+    assert.equal(run.output.text, "gateway runtime proof");
+
+    const timeline = await getJson(`${base}/runtime/runs/gateway-runtime-run`);
+    assert.equal(timeline.status, "completed-unverified");
+    assert.ok(timeline.events.some((event) => event.type === "capability-consumed"));
+    assert.equal(JSON.stringify(timeline).includes(issued.token), false);
+    assert.equal((await getJson(`${base}/runtime/runs/gateway-runtime-run/verify`)).valid, true);
+
+    const proof = await postJson(`${base}/proof`, {
+      schemaVersion: 1,
+      id: "gateway-runtime-proof",
+      runId: "gateway-runtime-run",
+      assertions: [{ id: "fixture", type: "file", path: "fixture.txt", expect: { exists: true, content: { contains: "before" } } }]
+    });
+    assert.equal(proof.status, "passed");
+    assert.equal((await getJson(`${base}/proof/gateway-runtime-run`)).assertions.length, 1);
+
+    const checkpoint = await postJson(`${base}/checkpoints`, {
+      runId: "gateway-runtime-run",
+      stepId: "step-gateway-checkpoint",
+      paths: ["fixture.txt"],
+      label: "before-change"
+    });
+    await writeFile(join(workspaceRoot, "fixture.txt"), "after\n");
+    const preview = await postJson(`${base}/rewind/${encodeURIComponent(checkpoint.snapshotId)}`, {});
+    assert.equal(preview.applied, false);
+    const restored = await postJson(`${base}/rewind/${encodeURIComponent(checkpoint.snapshotId)}`, { apply: true });
+    assert.equal(restored.applied, true);
+    assert.equal(await readFile(join(workspaceRoot, "fixture.txt"), "utf8"), "before\n");
+
+    const policyResult = await postJson(`${base}/policy/evaluate`, {
+      runId: "gateway-runtime-run",
+      toolName: "text.echo",
+      input: { text: "safe" },
+      policy: { version: 1, invariants: [{ id: "allow-safe", type: "command.deny-pattern", values: ["never-match"], enforcement: "block" }] }
+    });
+    assert.equal(policyResult.allowed, true);
+    const capsule = await postJson(`${base}/capsules/export`, { runId: "gateway-runtime-run" });
+    const verifiedCapsule = await postJson(`${base}/capsules/verify`, { path: capsule.path });
+    assert.equal(verifiedCapsule.valid, true);
+    assert.ok(verifiedCapsule.entries.includes("contract.json"));
+    assert.ok(verifiedCapsule.entries.includes("policy.json"));
+    assert.ok(verifiedCapsule.entries.some((entry) => entry.startsWith("artifacts/")));
+
+    const observed = await postJson(`${base}/routing/observe`, {
+      runId: "gateway-runtime-run", providerId: "test", modelId: "verified", taskClass: "general", verified: true, durationMs: 10
+    });
+    assert.equal(observed.modelId, "verified");
+    const choice = await postJson(`${base}/routing/choose`, { taskClass: "general" });
+    assert.equal(choice.model, "test:verified");
+
+    const branch = await postJson(`${base}/counterfactual`, {
+      sourceRunId: "gateway-runtime-run",
+      sourceStepId: timeline.steps[0].id,
+      plans: [{ id: "a", title: "A", summary: "candidate A" }, { id: "b", title: "B", summary: "candidate B" }]
+    });
+    assert.equal(branch.candidates.length, 2);
+    assert.equal((await getJson(`${base}/counterfactual/${branch.groupId}`)).candidates.length, 2);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }

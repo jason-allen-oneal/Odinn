@@ -25,10 +25,17 @@ test("gateway exposes durable jobs with idempotent submission", async () => {
     const replay = await fetch(`${base}/jobs`, {
       method: "POST",
       headers: { "content-type": "application/json", "idempotency-key": "job_gateway_idempotent" },
-      body: JSON.stringify({ task: { tool: "text.echo", input: { text: "different payload" } } })
+      body: JSON.stringify({ task: { tool: "text.echo", input: { text: "ODINN_GATEWAY_JOB_OK" } } })
     });
     assert.equal(replay.status, 200);
     assert.equal((await replay.json()).replayed, true);
+
+    const conflict = await fetch(`${base}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "job_gateway_idempotent" },
+      body: JSON.stringify({ task: { tool: "text.echo", input: { text: "different payload" } } })
+    });
+    assert.equal(conflict.status, 409);
 
     let job;
     for (let attempt = 0; attempt < 100; attempt += 1) {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { createServer as createHttpServer } from "node:http";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -286,6 +287,29 @@ test("workspace.readText is confined to the workspace root", async () => {
     }),
     /path escapes workspace root/
   );
+});
+
+test("self-improvement mines repeated audited failures but never applies them", async () => {
+  const { root, auditStore } = await fixture();
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn"), auditStore });
+  await auditStore.append({ runId: "failed-a", type: "task.failed", actor: "test", tool: "web.fetch", message: "DNS validation failed" });
+  await auditStore.append({ runId: "failed-b", type: "task.failed", actor: "test", tool: "web.fetch", message: "DNS validation failed" });
+  const result = await runTask({ task: { id: "learn-1", tool: "improve.learn", input: {}, actor: "test" }, auditStore, registry });
+  assert.equal(result.output.applied, false);
+  assert.equal(result.output.requiresHumanDecision, true);
+  assert.equal(result.output.generated.length, 1);
+});
+
+test("web.fetch rejects a public-looking hostname that resolves to loopback", async () => {
+  const { root, auditStore } = await fixture();
+  const server = createServer((_request, response) => response.end("private"));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn") });
+  try {
+    await assert.rejects(runTask({ task: { id: "run-dns-rebind", tool: "web.fetch", input: { url: `http://127.0.0.1.nip.io:${server.address().port}/` }, actor: "test" }, auditStore, registry }), /private|link-local|DNS validation/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("kernel runs deterministic multi-step plans and materializes plan state", async () => {

@@ -17,7 +17,7 @@ Required jobs:
 - `Integration and inference protocol`
 - Three platform-specific package smoke jobs
 
-The inference job currently uses a deterministic OpenAI-compatible protocol fixture. It must not be described as proof of production-model quality. Once the Odinn runtime is present, the same job should launch the packaged Gateway and verify a persisted model response through the public API.
+The inference job launches the packaged Gateway, configures a local OpenAI-compatible protocol provider, and verifies a persisted model response through the public API. It is real packaged gateway behavior proof, but it is not proof of production-model quality or a live cloud-provider account.
 
 ### Security
 

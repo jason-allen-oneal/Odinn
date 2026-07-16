@@ -1,16 +1,26 @@
 import { hostname, platform, release } from "node:os";
+import { lookup as dnsLookup } from "node:dns/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
+import { isIP } from "node:net";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
 import { chromium } from "playwright-core";
+import { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.mjs";
+import { toolSafetyDescriptor } from "./tool-safety.mjs";
+import { CapabilityBroker, Sentinel } from "./differentiated-runtime.mjs";
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.mjs";
 export { ExtensionRegistry, ExtensionExecutor } from "./extensions.mjs";
+export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.mjs";
+export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.mjs";
+export { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
 
 const execFile = promisify(execFileCallback);
 
@@ -562,7 +572,7 @@ export function listProviderPresets() {
   }));
 }
 
-export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore() } = {}) {
+export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore } = {}) {
   const root = resolve(workspaceRoot);
   const recordStore = new FileRecordStore(join(resolve(stateDir), "records.jsonl"));
   const modelConfig = normalizeModelConfig(config);
@@ -588,9 +598,13 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       description: "Read a UTF-8 text file confined to the workspace root.",
       execute: async ({ path, maxBytes = 65_536 }) => {
         if (typeof path !== "string" || path.trim() === "") throw new Error("workspace.readText requires path");
-        const target = resolve(root, path);
-        const rel = relative(root, target);
-        if (rel === "" || rel.startsWith("..") || rel.includes("..\\")) {
+        const realRoot = await realpath(root);
+        const lexicalTarget = resolve(realRoot, path);
+        const lexicalRelative = relative(realRoot, lexicalTarget);
+        if (lexicalRelative === "" || lexicalRelative.startsWith("..") || lexicalRelative.includes("..\\")) throw new Error("workspace.readText path escapes workspace root");
+        const target = await realpath(lexicalTarget);
+        const rel = relative(realRoot, target);
+        if (rel === "" || rel.startsWith("..") || rel.includes("..\\") || target !== realRoot && !target.startsWith(`${realRoot}${sep}`)) {
           throw new Error("workspace.readText path escapes workspace root");
         }
         const content = await readFile(target, "utf8");
@@ -648,7 +662,8 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
         stateDir,
         memoryStore: recordStore,
         registry: context.registry,
-        runTool: context.runTool
+        runTool: context.runTool,
+        runLedger: context.runLedger
       })
     }],
     ["model.chat", {
@@ -745,6 +760,11 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       capability: "improve.write",
       description: "Record a self-improvement proposal without applying it.",
       execute: async (input) => proposeImprovement(recordStore, input)
+    }],
+    ["improve.learn", {
+      capability: "improve.write",
+      description: "Mine repeated runtime failures into reviewable improvement proposals without applying changes.",
+      execute: async (input) => learnImprovements(recordStore, auditStore, input)
     }],
     ["improve.list", {
       capability: "improve.read",
@@ -871,10 +891,10 @@ function normalizeSearchUrl(value) {
 async function fetchWebPage(input = {}, security = {}) {
   const url = assertPublicWebUrl(input.url, security);
   const response = await fetchPublicUrl(url, security);
-  const bytes = Buffer.from(await response.arrayBuffer());
+  const bytes = response.body;
   if (bytes.byteLength > WEB_MAX_BYTES) throw new Error(`web page exceeds ${WEB_MAX_BYTES} bytes`);
   const raw = bytes.toString("utf8");
-  const contentType = response.headers.get("content-type") || "";
+  const contentType = response.headers["content-type"] || "";
   const title = contentType.includes("html") ? decodeHtml(raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "") : "";
   const content = contentType.includes("html") ? htmlToText(raw) : raw;
   return {
@@ -890,13 +910,9 @@ async function fetchWebPage(input = {}, security = {}) {
 async function fetchPublicUrl(url, security) {
   let current = url;
   for (let redirects = 0; redirects <= 5; redirects += 1) {
-    const response = await fetch(current, {
-      redirect: "manual",
-      headers: { "user-agent": "Odinn/0.1 beta web-fetch" },
-      signal: AbortSignal.timeout(WEB_TIMEOUT_MS)
-    });
+    const response = await requestValidatedUrl(current, security);
     if (![301, 302, 303, 307, 308].includes(response.status)) return response;
-    const location = response.headers.get("location");
+    const location = response.headers.location;
     if (!location) return response;
     current = assertPublicWebUrl(new URL(location, current).href, security);
   }
@@ -907,12 +923,70 @@ function assertPublicWebUrl(value, security = {}) {
   let parsed;
   try { parsed = new URL(cleanRequired(value, "web.fetch requires url")); } catch { throw new Error("web.fetch requires a valid http(s) url"); }
   const host = parsed.hostname.toLowerCase();
-  const privateHost = host === "localhost" || host.endsWith(".local") || host === "127.0.0.1" || host === "::1" || /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\./.test(host);
+  const privateHost = isPrivateAddress(host);
   if (!/^https?:$/.test(parsed.protocol) || (privateHost && security.allowPrivateNetwork !== true)) {
     throw new Error("web.fetch only allows public http(s) URLs");
   }
   assertDomainAllowed(host, security);
   return parsed.href;
+}
+
+async function requestValidatedUrl(value, security = {}) {
+  const parsed = new URL(assertPublicWebUrl(value, security));
+  const transport = parsed.protocol === "https:" ? httpsRequest : httpRequest;
+  const addresses = await dnsLookupAll(parsed.hostname);
+  if (security.allowPrivateNetwork !== true && addresses.some(isPrivateAddress)) {
+    throw new Error("web.fetch resolved to a private or link-local network address");
+  }
+  const address = addresses[0];
+  return new Promise((resolveResponse, rejectResponse) => {
+    const request = transport(parsed, {
+      headers: { "user-agent": "Odinn/0.1 beta web-fetch" },
+      timeout: WEB_TIMEOUT_MS,
+      lookup: (_hostname, _options, callback) => callback(null, address, isIP(address))
+    }, (response) => {
+      const chunks = [];
+      let bytes = 0;
+      response.on("data", (chunk) => {
+        bytes += chunk.length;
+        if (bytes <= WEB_MAX_BYTES + 1) chunks.push(chunk);
+      });
+      response.on("end", () => resolveResponse({
+        status: response.statusCode ?? 0,
+        headers: response.headers,
+        url: parsed.href,
+        body: Buffer.concat(chunks)
+      }));
+      response.on("error", rejectResponse);
+    });
+    request.on("timeout", () => request.destroy(new Error("web.fetch request timed out")));
+    request.on("error", rejectResponse);
+    request.end();
+  });
+}
+
+async function dnsLookupAll(hostnameValue) {
+  if (isIP(hostnameValue)) return [hostnameValue];
+  try {
+    const results = await dnsLookup(hostnameValue, { all: true, verbatim: true });
+    if (!results.length) throw new Error("hostname did not resolve");
+    return results.map((result) => result.address);
+  } catch (error) {
+    throw new Error(`web.fetch DNS validation failed for ${hostnameValue}: ${error.message}`);
+  }
+}
+
+function isPrivateAddress(value) {
+  const address = String(value || "").toLowerCase().replace(/^::ffff:/, "");
+  if (address === "localhost" || address.endsWith(".local")) return true;
+  if (isIP(address) === 4) {
+    const [a, b] = address.split(".").map(Number);
+    return a === 10 || a === 127 || a === 169 && b === 254 || a === 192 && b === 168 || a === 172 && b >= 16 && b <= 31 || a === 100 && b >= 64 && b <= 127;
+  }
+  if (isIP(address) === 6) {
+    return address === "::1" || address.startsWith("fc") || address.startsWith("fd") || address.startsWith("fe8") || address.startsWith("fe9") || address.startsWith("fea") || address.startsWith("feb");
+  }
+  return false;
 }
 
 function assertDomainAllowed(host, security = {}) {
@@ -1123,7 +1197,7 @@ const AGENT_TOOL_SCHEMAS = [
   { type: "function", function: { name: "browser.press", description: "Press a key; Ódinn will ask for approval first.", parameters: { type: "object", properties: { tabId: { type: "string" }, snapshotId: { type: "string" }, key: { type: "string" } }, required: ["key"] } } }
 ];
 
-async function runAgent(modelConfig, input = {}, { stateDir, memoryStore, runTool } = {}) {
+async function runAgent(modelConfig, input = {}, { stateDir, memoryStore, runTool, runLedger } = {}) {
   const messages = Array.isArray(input.messages) ? input.messages.map((message) => ({ ...message })) : [{ role: "user", content: cleanRequired(input.prompt, "agent.run requires prompt") }];
   const memoryOptions = normalizeMemoryOptions(input.memory);
   const learned = memoryStore && memoryOptions.autoLearn
@@ -1149,7 +1223,7 @@ async function runAgent(modelConfig, input = {}, { stateDir, memoryStore, runToo
     for (const call of result.toolCalls) {
       let args;
       try { args = JSON.parse(call.arguments || "{}"); } catch { args = {}; }
-      const nested = await runTool({ tool: call.name, input: args, actor: "agent", reason: "agent tool call" });
+      const nested = await runTool({ tool: call.name, input: args, actor: "agent", reason: "agent tool call", runLedger });
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(nested.output) });
       if (nested.output?.type === "approval.required") {
         return { ...result, content: `I need your approval before I ${nested.output.summary.toLowerCase()}.`, pendingApproval: nested.output };
@@ -1165,7 +1239,8 @@ export async function runTask({
   policy = createDefaultPolicy(),
   registry = createBuiltInRegistry(),
   now = () => new Date().toISOString(),
-  signal
+  signal,
+  runLedger
 }) {
   const request = normalizeTaskRequest(task);
   const tool = registry.get(request.tool);
@@ -1179,6 +1254,19 @@ export async function runTask({
   }
 
   throwIfAborted(signal);
+  const safety = toolSafetyDescriptor(request.tool, tool);
+  let ledgerStep;
+  if (runLedger) {
+    const modelRef = typeof request.input?.model === "string" ? request.input.model : "";
+    const separator = modelRef.indexOf(":");
+    runLedger.ensureRun({
+      runId: request.id,
+      objective: request.reason ?? `execute ${request.tool}`,
+      providerId: separator > 0 ? modelRef.slice(0, separator) : "",
+      modelId: separator > 0 ? modelRef.slice(separator + 1) : modelRef
+    });
+    ledgerStep = runLedger.beginTool({ runId: request.id, toolName: request.tool, input: request.input, safety, metadata: { actor: request.actor } });
+  }
   const decision = evaluateTaskPolicy({ policy, request, tool });
 
   await auditStore.append({
@@ -1193,7 +1281,45 @@ export async function runTask({
     data: decision.details
   });
 
-  assertAllowed(decision);
+  runLedger?.recordPolicy({ runId: request.id, stepId: ledgerStep?.stepId, decision: decision.decision, reason: decision.reason, details: decision.details });
+
+  try {
+    assertAllowed(decision);
+  } catch (error) {
+    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: "blocked", error: error.message });
+    throw error;
+  }
+
+  let capabilityClaims;
+  try {
+    if (runLedger?.featureFlags?.sentinel === true) {
+      if (Array.isArray(policy?.invariants)) {
+        new Sentinel({ ledger: runLedger, featureFlags: runLedger.featureFlags }).evaluate({
+          runId: request.id,
+          stepId: ledgerStep?.stepId,
+          toolName: request.tool,
+          input: request.input,
+          policy,
+          workspaceRoot: runLedger.workspaceRoot
+        });
+      } else {
+        runLedger.appendEvent({ runId: request.id, type: "policy-check", payload: { stepId: ledgerStep?.stepId, decision: "allow", reason: "sentinel enabled with no configured invariants" } });
+      }
+    }
+    if (runLedger?.featureFlags?.capabilities === true && safety.requiresCapability) {
+      const token = request.input?.capabilityToken;
+      if (typeof token !== "string" || !token) {
+        const error = new Error(`capability token required for ${request.tool}`);
+        error.code = "CAPABILITY_DENIED";
+        throw error;
+      }
+      capabilityClaims = new CapabilityBroker({ ledger: runLedger, stateDir: runLedger.stateDir, featureFlags: runLedger.featureFlags }).consume(token, { runId: request.id, toolName: request.tool, resource: request.input?.resource ?? {} });
+    }
+  } catch (error) {
+    await auditStore.append({ at: now(), runId: request.id, type: "task.blocked", actor: request.actor, tool: request.tool, capability: tool?.capability, decision: "deny", message: error.message, data: { code: error.code ?? "POLICY_VIOLATION" } });
+    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: "blocked", error: error.message });
+    throw error;
+  }
 
   await auditStore.append({
     at: now(),
@@ -1217,13 +1343,16 @@ export async function runTask({
       registry,
       auditStore,
       signal,
+      runLedger,
+      capability: capabilityClaims,
       runTool: (nestedTask) => runTask({
         task: { ...nestedTask, actor: nestedTask.actor ?? request.actor },
         auditStore,
         policy,
         registry,
         now,
-        signal
+        signal,
+        runLedger: nestedTask.runLedger ?? runLedger
       })
     });
     throwIfAborted(signal);
@@ -1241,6 +1370,7 @@ export async function runTask({
         ? { approvalId: output.approvalId, expiresInSeconds: output.expiresInSeconds }
         : { output: safeAuditValue(output) }
     });
+    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, output, status: awaitingApproval ? "blocked" : "succeeded" });
     return { id: request.id, tool: request.tool, capability: tool.capability, ok: true, output };
   } catch (error) {
     const cancelled = signal?.aborted === true || error?.name === "AbortError";
@@ -1254,6 +1384,7 @@ export async function runTask({
       decision: "allow",
       message: cancelled ? "task cancelled" : error.message
     });
+    runLedger?.finishTool({ runId: request.id, stepId: ledgerStep?.stepId, status: cancelled ? "failed" : "failed", error: cancelled ? "task cancelled" : error.message });
     throw error;
   }
 }
@@ -1264,10 +1395,14 @@ export async function runPlan({
   policy = createDefaultPolicy(),
   registry = createBuiltInRegistry(),
   actor = "local",
-  now = () => new Date().toISOString()
+  now = () => new Date().toISOString(),
+  runLedger
 }) {
   const normalized = normalizePlan(plan, actor);
   if (!auditStore) throw new Error("runPlan requires an auditStore");
+
+  runLedger?.ensureRun({ runId: normalized.id, objective: normalized.name });
+  runLedger?.appendEvent({ runId: normalized.id, type: "plan-started", payload: { name: normalized.name, steps: normalized.steps.length } });
 
   await auditStore.append({
     at: now(),
@@ -1294,7 +1429,8 @@ export async function runPlan({
         auditStore,
         policy,
         registry,
-        now
+        now,
+        runLedger
       });
       steps.push({ id: step.id, ok: true, result });
     }
@@ -1308,6 +1444,7 @@ export async function runPlan({
       decision: "allow",
       data: { name: normalized.name, steps: steps.length }
     });
+    runLedger?.appendEvent({ runId: normalized.id, type: "plan-completed", payload: { name: normalized.name, steps: steps.length } });
     return { id: normalized.id, name: normalized.name, ok: true, steps };
   } catch (error) {
     await auditStore.append({
@@ -1321,6 +1458,7 @@ export async function runPlan({
       message: error.message,
       data: { name: normalized.name, completedSteps: steps.length }
     });
+    runLedger?.appendEvent({ runId: normalized.id, type: "plan-failed", payload: { name: normalized.name, completedSteps: steps.length, error: error.message } });
     throw error;
   }
 }
@@ -2214,6 +2352,39 @@ async function proposeImprovement(store, input = {}) {
   });
 }
 
+async function learnImprovements(store, auditStore, input = {}) {
+  if (!auditStore || typeof auditStore.readAll !== "function") return { generated: [], message: "audit observation source unavailable" };
+  const events = await auditStore.readAll();
+  const limit = normalizeLimit(input.limit, 1000);
+  const failures = events.filter((event) => ["task.failed", "task.policy", "task.cancelled"].includes(event.type)).slice(-limit);
+  const groups = new Map();
+  for (const event of failures) {
+    const key = `${event.type}:${event.tool ?? "unknown"}:${event.message ?? event.decision ?? ""}`;
+    const current = groups.get(key) ?? { key, count: 0, tool: event.tool ?? "unknown", reason: event.message ?? event.decision ?? "runtime failure", runs: [] };
+    current.count += 1;
+    if (event.runId && current.runs.length < 8 && !current.runs.includes(event.runId)) current.runs.push(event.runId);
+    groups.set(key, current);
+  }
+  const records = await store.readAll();
+  const existing = new Set(records.filter((record) => record.type === "improvement.proposed").map((record) => `${record.target}:${record.title}`));
+  const generated = [];
+  for (const group of groups.values()) {
+    if (group.count < 2) continue;
+    const title = `Investigate repeated ${group.tool} failures`;
+    const target = `runtime/${group.tool}`;
+    if (existing.has(`${target}:${title}`)) continue;
+    generated.push(await proposeImprovement(store, {
+      title,
+      rationale: `${group.count} audited events reported: ${group.reason}. Review the trace before changing runtime behavior.`,
+      target,
+      priority: group.count >= 5 ? "high" : "normal",
+      evidence: group.runs.map((runId) => ({ runId, type: "audit-event", count: group.count })),
+      source: "autonomous-observation"
+    }));
+  }
+  return { generated, observedEvents: failures.length, applied: false, requiresHumanDecision: true };
+}
+
 async function listImprovements(store, input = {}) {
   const limit = normalizeLimit(input.limit, 20);
   return { improvements: reduceImprovements(await store.readAll()).slice(0, limit) };
@@ -2318,7 +2489,7 @@ function safeAuditValue(value, depth = 0) {
   if (typeof value !== "object") return undefined;
   const output = {};
   for (const [key, entry] of Object.entries(value).slice(0, 100)) {
-    if (/api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|authorization|cookie|credential/i.test(key)) {
+    if (/api[-_]?key|access[-_]?token|refresh[-_]?token|capability(?:[-_]?token)?|secret|password|authorization|cookie|credential/i.test(key)) {
       output[key] = "[redacted]";
     } else {
       output[key] = safeAuditValue(entry, depth + 1);

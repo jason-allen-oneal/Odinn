@@ -22,7 +22,7 @@ The project is a clean-room implementation. It does not copy OpenClaw, Hermes, O
 
 It is not a hosted multi-user service. Do not expose the gateway to the public internet yet. The default posture is loopback-only, private-network blocking, and approval-required browser actions.
 
-The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval claims, provider retries and usage normalization, trusted process/MCP extension adapters, cross-platform package smoke, and nightly storage recovery drills. Native installers, application upgrade rollback, audit-journal key rotation, and the full browser restart/tab-loss recovery matrix remain open. See [the P0 beta ledger](docs/P0-BETA-GATES.md).
+The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval claims, provider retries and usage normalization, trusted process/MCP extension adapters, DNS-pinned public web fetches, symlink-safe workspace reads, owner-only state repair, cross-platform package smoke, and nightly storage recovery drills. Native installers, application upgrade rollback, audit-journal key rotation, complete external-adapter interposition, and full counterfactual/replay execution remain open. See [the P0 beta ledger](docs/P0-BETA-GATES.md).
 
 ## Quick start
 
@@ -48,6 +48,41 @@ pnpm odinn audit
 ```
 
 The packaged release gate is stronger than the local echo smoke: CI launches the gateway as a child process, configures a local OpenAI-compatible provider endpoint, sends a model request through the gateway, and verifies the assistant response was written to the run record. See [the P0 beta ledger](docs/P0-BETA-GATES.md) for what is implemented and what is still deliberately blocked.
+
+### Phase 0 runtime ledger
+
+Every CLI and gateway tool boundary can now write a durable SQLite run ledger with ordered steps, redacted content-addressed artifacts, conservative tool-safety metadata, experimental feature flags, and a SHA-256 event chain. Inspect a run without reading raw JSONL:
+
+```bash
+pnpm odinn run show <run-id> --state .odinn
+pnpm odinn run events <run-id> --state .odinn
+pnpm odinn run verify <run-id> --state .odinn
+```
+
+This is the shared foundation for the experimental Proof, Rewind, Sentinel, Capsule, Darwin, Capability, and Counterfactual slices. They are disabled by default and must be enabled individually:
+
+```bash
+pnpm odinn config experimental enable proof
+pnpm odinn config experimental enable sentinel
+pnpm odinn config experimental enable capabilities
+```
+
+Use `pnpm odinn config experimental show` to inspect the posture. Read the feature notes under [docs/features](docs/features/) before enabling them. See [the event-ledger architecture note](docs/architecture/event-ledger.md).
+
+### Experimental runtime slices
+
+- **Proof** runs shell-free command and file acceptance assertions, stores bounded evidence, and is the only path that can mark a run verified.
+- **Sentinel** evaluates deterministic command, filesystem-root, and approval invariants before an operation.
+- **Capability Tokens** bind short-lived, one-use authority to a run, step, tool, and resource constraint.
+- **Rewind** snapshots selected local files and defaults to a dry-run restore preview.
+- **Capsules** export redacted ZIP-compatible run bundles with checksum verification and safe extraction.
+- **Counterfactual** creates physically isolated candidate workspaces and compares their durable run records; candidate execution and branch commit are still operator-driven.
+- **Darwin** scores models from recorded verification, reliability, speed, cost, and policy outcomes.
+- **Self-improvement** mines repeated audited failures into reviewable proposals. It does not rewrite code, change policy, install skills, or approve its own changes.
+
+These are initial local slices, not a claim that arbitrary remote effects can be reversed or perfectly replayed. Browser sessions, external mutations, nondeterministic models, automatic counterfactual execution, and public hosting remain outside the safe beta boundary.
+
+The authenticated gateway exposes the same experimental surfaces through `/runtime/runs`, `/proof`, `/policy/evaluate`, `/capabilities/*`, `/checkpoints`, `/rewind/*`, `/capsules/*`, `/counterfactual/*`, and `/routing/*`. Each surface remains disabled until its matching experimental flag is enabled in `.odinn/config.json`.
 
 ## Model providers
 
@@ -183,9 +218,11 @@ chat / CLI / plans
           │              ├─ OAuth / device OAuth
           │              ├─ local OpenAI-compatible servers
           │              └─ CLI adapters
-          ├── web and isolated browser tools
-          ├── durable sessions, goals, improvements
-          ├── original memory journal and ranked recall
+  ├── web and isolated browser tools
+  ├── durable sessions, goals, improvements
+  ├── original memory journal and ranked recall
+          ├── SQLite run ledger, artifacts, snapshots, and verification evidence
+          ├── Proof, Sentinel, capabilities, rewind, capsules, branches, and routing
           └── append-only audit events
 ```
 

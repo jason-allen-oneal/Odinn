@@ -1,8 +1,19 @@
-import { mkdir, readFile, rename, writeFile, copyFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile, copyFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { normalizeAuditEvent } from "@odinn/protocol";
 
 export const STORE_SCHEMA_VERSION = 1;
+
+export async function ensureSecureStateDirectory(path) {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  await chmod(path, 0o700);
+  return path;
+}
+
+async function secureStoreFile(path) {
+  await ensureSecureStateDirectory(dirname(path));
+  try { await chmod(path, 0o600); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+}
 
 export class StoreCorruptionError extends Error {
   constructor(path, line, cause) {
@@ -22,8 +33,9 @@ export class FileAuditStore {
 
   async append(event) {
     const normalized = normalizeAuditEvent(event);
-    await mkdir(dirname(this.path), { recursive: true });
+    await ensureSecureStateDirectory(dirname(this.path));
     await writeFile(this.path, `${JSON.stringify(normalized)}\n`, { flag: "a" });
+    await secureStoreFile(this.path);
     return normalized;
   }
 
@@ -41,6 +53,7 @@ export class FileAuditStore {
   async backup(destination = `${this.path}.bak`) {
     await mkdir(dirname(destination), { recursive: true });
     await copyFile(this.path, destination);
+    await chmod(destination, 0o600);
     return destination;
   }
 
@@ -122,8 +135,9 @@ export class FileRecordStore {
       at: typeof record.at === "string" ? record.at : new Date().toISOString(),
       ...record
     };
-    await mkdir(dirname(this.path), { recursive: true });
+    await ensureSecureStateDirectory(dirname(this.path));
     await writeFile(this.path, `${JSON.stringify(normalized)}\n`, { flag: "a" });
+    await secureStoreFile(this.path);
     return normalized;
   }
 
@@ -139,8 +153,9 @@ export class FileRecordStore {
   }
 
   async backup(destination = `${this.path}.bak`) {
-    await mkdir(dirname(destination), { recursive: true });
+    await ensureSecureStateDirectory(dirname(destination));
     await copyFile(this.path, destination);
+    await chmod(destination, 0o600);
     return destination;
   }
 
@@ -224,7 +239,7 @@ export class FileJobStore {
       await copyFile(this.path, destination);
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
-      await writeFile(destination, `${JSON.stringify(emptyJobState(), null, 2)}\n`);
+      await writeFile(destination, `${JSON.stringify(emptyJobState(), null, 2)}\n`, { mode: 0o600 });
     }
     return destination;
   }
@@ -237,6 +252,7 @@ export class FileJobStore {
       if (error?.code === "ENOENT") return { recovered: false, reason: "missing" };
       throw error;
     }
+    await ensureSecureStateDirectory(dirname(this.path));
     await writeFile(this.path, `${JSON.stringify(emptyJobState(), null, 2)}\n`, { mode: 0o600 });
     return { recovered: true, backup, jobs: [] };
   }
@@ -254,6 +270,7 @@ export class FileJobStore {
       if (state.schemaVersion !== STORE_SCHEMA_VERSION || !state.jobs || typeof state.jobs !== "object") {
         throw new Error(`unsupported job store schema version: ${String(state.schemaVersion)}`);
       }
+      await secureStoreFile(this.path);
       return state;
     } catch (error) {
       throw new StoreCorruptionError(this.path, 1, error);
@@ -264,10 +281,11 @@ export class FileJobStore {
     const operation = this.writeChain.then(async () => {
       const state = await this.readState();
       const result = await fn(state);
-      await mkdir(dirname(this.path), { recursive: true });
+      await ensureSecureStateDirectory(dirname(this.path));
       const temporary = join(dirname(this.path), `.${this.path.split(/[\\/]/).pop()}.${process.pid}.${Date.now()}.tmp`);
       await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
       await rename(temporary, this.path);
+      await secureStoreFile(this.path);
       return result;
     });
     this.writeChain = operation.catch(() => undefined);
@@ -285,6 +303,7 @@ function normalizeJob(job) {
     id: String(job.id),
     status: String(job.status ?? "queued"),
     payload: job.payload && typeof job.payload === "object" ? job.payload : {},
+    requestHash: job.requestHash,
     createdAt: job.createdAt ?? new Date().toISOString(),
     updatedAt: job.updatedAt ?? new Date().toISOString(),
     startedAt: job.startedAt,

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { dirname, join, relative, resolve, sep } from "node:path";
 
 const EXTENSION_SCHEMA_VERSION = 1;
 const EXTENSION_TYPES = new Set(["tool", "skill", "mcp"]);
@@ -117,9 +117,15 @@ export class ExtensionExecutor {
     const requested = String(capability || extension.capabilities[0] || "").trim();
     if (!requested || !extension.grants.includes(requested)) throw new Error(`extension capability is not granted: ${requested || "unspecified"}`);
     if (!extension.entrypoint || extension.entrypoint.includes("\0")) throw new Error(`extension entrypoint is missing: ${id}`);
-    const entrypoint = resolve(this.workspaceRoot, extension.entrypoint);
-    const relativeEntrypoint = entrypoint === this.workspaceRoot ? "" : entrypoint.startsWith(`${this.workspaceRoot}/`) ? entrypoint.slice(this.workspaceRoot.length + 1) : null;
-    if (!relativeEntrypoint) throw new Error("extension entrypoint must remain inside the configured workspace root");
+    const realRoot = await realpath(this.workspaceRoot);
+    const lexicalEntrypoint = resolve(realRoot, extension.entrypoint);
+    const entrypoint = await realpath(lexicalEntrypoint);
+    const relativeEntrypoint = relative(realRoot, entrypoint);
+    if (!relativeEntrypoint || relativeEntrypoint.startsWith("..") || relativeEntrypoint.includes(`..${sep}`) || !entrypoint.startsWith(`${realRoot}${sep}`)) {
+      throw new Error("extension entrypoint must remain inside the configured workspace root");
+    }
+    const contentDigest = createHash("sha256").update(await readFile(entrypoint)).digest("hex");
+    if (extension.contentDigest && extension.contentDigest !== contentDigest) throw new Error(`extension entrypoint integrity check failed: ${id}`);
     const protocol = extension.type === "mcp" ? "mcp-jsonl" : "odinn-jsonl";
     const request = protocol === "mcp-jsonl"
       ? { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: input.name || extension.id, arguments: input.arguments ?? input } }
@@ -192,6 +198,8 @@ function normalizeManifest(input, { source, provenance }) {
     source: String(input.source ?? source).trim().slice(0, 500),
     provenance: String(input.provenance ?? provenance).trim().slice(0, 120),
     digest: String(input.digest ?? createHash("sha256").update(JSON.stringify({ id, version, type, capabilities, sandbox, entrypoint: input.entrypoint ?? "" })).digest("hex")).trim(),
+    contentDigest: String(input.contentDigest ?? "").trim(),
+    integrity: input.contentDigest ? "content-verified" : "metadata-only",
     permissions: input.permissions && typeof input.permissions === "object" ? input.permissions : {}
   };
   return normalized;

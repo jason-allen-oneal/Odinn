@@ -4,6 +4,14 @@ All notable changes to Odinn Forge will be documented in this file.
 
 The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
+## [0.2.1-beta](https://github.com/jason-allen-oneal/Odinn/compare/v0.2.0...v0.2.1-beta) (2026-07-16)
+
+
+### Bug Fixes
+
+* **release:** align security docs and enforcement ([#26](https://github.com/jason-allen-oneal/Odinn/issues/26)) ([1a6802f](https://github.com/jason-allen-oneal/Odinn/commit/1a6802f2570558b90e517fdee1e9740fb9f452f1))
+* **repo:** support user-owned branch protection ([#28](https://github.com/jason-allen-oneal/Odinn/issues/28)) ([6d42067](https://github.com/jason-allen-oneal/Odinn/commit/6d42067877bf3ac96db475a4db29f0b1ec70e110))
+
 ## [0.2.0](https://github.com/jason-allen-oneal/Odinn/compare/v0.1.0...v0.2.0) (2026-07-16)
 
 

@@ -18,13 +18,13 @@ Tasks is the operator view over durable runs, Proof results, audit-chain verific
 
 ## Agent SDK packages
 
-Agents manages declarative Agent SDK v0.3 manifests through `/agents`, `/agents/validate`, and `/agents/<id>/lifecycle`. Installation validates and records package metadata; lifecycle controls enable, disable, or quarantine a package. Package metadata is not executable trust, and registration does not bypass extension, sandbox, capability, network, secret, or policy controls.
+Agents manages declarative Agent SDK v0.3 manifests through `/agents`, `/agents/validate`, and `/agents/<id>/lifecycle`. Installation validates and records package metadata; lifecycle controls enable, disable, or quarantine a package. This beta surface is a package registry and inspector, not an Agent SDK execution engine. Package metadata is not executable trust, and registration does not bypass extension, sandbox, capability, network, secret, or policy controls.
 
 Agent package state is stored in `.odinn/agents.json`. Keep package instructions and integrity metadata reviewable before enablement.
 
 ## Skills and Skill Workshop
 
-Skills discovers `SKILL.md` files in the workspace and validated drafts under `.odinn/skill-workshop/`, plus registered skill extensions. Discovery does not grant execution authority.
+Skills discovers `SKILL.md` files in the workspace and validated drafts under `.odinn/skill-workshop/`, plus registered skill extensions. This beta surface is discovery and review only; it does not inject skills into model context, activate them, or grant execution authority.
 
 Skill Workshop validates a package name, trigger description, and workflow instructions, then stages a real `SKILL.md` draft through `/skills/workshop/validate` and `/skills/workshop/save`. Saved drafts remain reviewable files and appear in Skills with draft status. Workshop does not silently install, enable, or execute a skill.
 

@@ -222,7 +222,7 @@ Executable extensions use one of two explicit adapters. `container` is the defau
 
 Use `--allow-unsafe-sandbox` only when enabling a manifest that explicitly selects `unconfined-process`. The flag is not required for the default container adapter.
 
-The local console includes Sessions, Usage, Cron Jobs, proof/audit Tasks, Agent SDK package management, Skills discovery, and Skill Workshop. See [Operator console](docs/operator-console.md) for the API, persistence, and security boundaries behind those views.
+The local console includes Sessions, Usage, Cron Jobs, proof/audit Tasks, an Agent SDK package registry, Skills discovery, and Skill Workshop draft staging. Agent packages and skills are review surfaces in this beta; registration or discovery does not execute or activate them. See [Operator console](docs/operator-console.md) for the API, persistence, and security boundaries behind those views.
 
 ## Architecture
 

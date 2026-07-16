@@ -14,17 +14,19 @@ export class JobSupervisor {
     this.active = new Map();
     this.started = false;
     this.draining = false;
+    this.stopping = false;
   }
 
   async start() {
     if (this.started) return;
+    this.stopping = false;
     await this.store.recover({ maxAttempts: this.maxAttempts });
     this.started = true;
     await this.drain();
   }
 
-  async submit(payload, { id = `job_${randomUUID()}`, timeoutMs = this.defaultTimeoutMs } = {}) {
-    const job = await this.store.create({ id, payload, status: "queued", timeoutMs });
+  async submit(payload, { id = `job_${randomUUID()}`, timeoutMs = this.defaultTimeoutMs, requestHash } = {}) {
+    const job = await this.store.create({ id, payload, requestHash, status: "queued", timeoutMs });
     await this.drain();
     return job;
   }
@@ -47,7 +49,7 @@ export class JobSupervisor {
   async list() { return this.store.list(); }
 
   async drain() {
-    if (!this.started || this.draining) return;
+    if (!this.started || this.stopping || this.draining) return;
     this.draining = true;
     try {
       while (this.active.size < this.concurrency) {
@@ -61,9 +63,10 @@ export class JobSupervisor {
   }
 
   async shutdown() {
+    this.stopping = true;
+    this.started = false;
     for (const active of this.active.values()) active.controller.abort(new Error("supervisor shutting down"));
     await Promise.allSettled(Array.from(this.active.values(), (active) => active.promise));
-    this.started = false;
   }
 
   async run(job) {
@@ -85,13 +88,13 @@ export class JobSupervisor {
           completedAt: new Date().toISOString(),
           error: error.message
         });
-        if (!cancelled && current?.attempts < this.maxAttempts) {
+        if (!this.stopping && !cancelled && current?.attempts < this.maxAttempts) {
           await this.store.update(job.id, { status: "queued", completedAt: undefined, error: error.message });
         }
       } finally {
         clearTimeout(timeout);
         this.active.delete(job.id);
-        await this.drain();
+        if (!this.stopping) await this.drain();
       }
     })();
     active.promise = promise;

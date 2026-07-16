@@ -43,7 +43,7 @@ pnpm benchmark:ci
 pnpm build
 ```
 
-The inference command is currently a deterministic provider-protocol fixture. Do not describe it as production-model validation.
+The inference command launches the packaged gateway against a local OpenAI-compatible protocol provider and verifies persistence through the public API. Do not describe it as production-model or live cloud-provider validation.
 
 ## Design constraints
 

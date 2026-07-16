@@ -1,10 +1,14 @@
 import { hostname, platform, release } from "node:os";
+import { lookup as dnsLookup } from "node:dns/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
+import { isIP } from "node:net";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/policy";
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
@@ -568,7 +572,7 @@ export function listProviderPresets() {
   }));
 }
 
-export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore() } = {}) {
+export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir = ".odinn", config = {}, approvalStore = createApprovalStore(), auditStore } = {}) {
   const root = resolve(workspaceRoot);
   const recordStore = new FileRecordStore(join(resolve(stateDir), "records.jsonl"));
   const modelConfig = normalizeModelConfig(config);
@@ -594,9 +598,13 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       description: "Read a UTF-8 text file confined to the workspace root.",
       execute: async ({ path, maxBytes = 65_536 }) => {
         if (typeof path !== "string" || path.trim() === "") throw new Error("workspace.readText requires path");
-        const target = resolve(root, path);
-        const rel = relative(root, target);
-        if (rel === "" || rel.startsWith("..") || rel.includes("..\\")) {
+        const realRoot = await realpath(root);
+        const lexicalTarget = resolve(realRoot, path);
+        const lexicalRelative = relative(realRoot, lexicalTarget);
+        if (lexicalRelative === "" || lexicalRelative.startsWith("..") || lexicalRelative.includes("..\\")) throw new Error("workspace.readText path escapes workspace root");
+        const target = await realpath(lexicalTarget);
+        const rel = relative(realRoot, target);
+        if (rel === "" || rel.startsWith("..") || rel.includes("..\\") || target !== realRoot && !target.startsWith(`${realRoot}${sep}`)) {
           throw new Error("workspace.readText path escapes workspace root");
         }
         const content = await readFile(target, "utf8");
@@ -753,6 +761,11 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       description: "Record a self-improvement proposal without applying it.",
       execute: async (input) => proposeImprovement(recordStore, input)
     }],
+    ["improve.learn", {
+      capability: "improve.write",
+      description: "Mine repeated runtime failures into reviewable improvement proposals without applying changes.",
+      execute: async (input) => learnImprovements(recordStore, auditStore, input)
+    }],
     ["improve.list", {
       capability: "improve.read",
       description: "List self-improvement proposals.",
@@ -878,10 +891,10 @@ function normalizeSearchUrl(value) {
 async function fetchWebPage(input = {}, security = {}) {
   const url = assertPublicWebUrl(input.url, security);
   const response = await fetchPublicUrl(url, security);
-  const bytes = Buffer.from(await response.arrayBuffer());
+  const bytes = response.body;
   if (bytes.byteLength > WEB_MAX_BYTES) throw new Error(`web page exceeds ${WEB_MAX_BYTES} bytes`);
   const raw = bytes.toString("utf8");
-  const contentType = response.headers.get("content-type") || "";
+  const contentType = response.headers["content-type"] || "";
   const title = contentType.includes("html") ? decodeHtml(raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "") : "";
   const content = contentType.includes("html") ? htmlToText(raw) : raw;
   return {
@@ -897,13 +910,9 @@ async function fetchWebPage(input = {}, security = {}) {
 async function fetchPublicUrl(url, security) {
   let current = url;
   for (let redirects = 0; redirects <= 5; redirects += 1) {
-    const response = await fetch(current, {
-      redirect: "manual",
-      headers: { "user-agent": "Odinn/0.1 beta web-fetch" },
-      signal: AbortSignal.timeout(WEB_TIMEOUT_MS)
-    });
+    const response = await requestValidatedUrl(current, security);
     if (![301, 302, 303, 307, 308].includes(response.status)) return response;
-    const location = response.headers.get("location");
+    const location = response.headers.location;
     if (!location) return response;
     current = assertPublicWebUrl(new URL(location, current).href, security);
   }
@@ -914,12 +923,70 @@ function assertPublicWebUrl(value, security = {}) {
   let parsed;
   try { parsed = new URL(cleanRequired(value, "web.fetch requires url")); } catch { throw new Error("web.fetch requires a valid http(s) url"); }
   const host = parsed.hostname.toLowerCase();
-  const privateHost = host === "localhost" || host.endsWith(".local") || host === "127.0.0.1" || host === "::1" || /^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\./.test(host);
+  const privateHost = isPrivateAddress(host);
   if (!/^https?:$/.test(parsed.protocol) || (privateHost && security.allowPrivateNetwork !== true)) {
     throw new Error("web.fetch only allows public http(s) URLs");
   }
   assertDomainAllowed(host, security);
   return parsed.href;
+}
+
+async function requestValidatedUrl(value, security = {}) {
+  const parsed = new URL(assertPublicWebUrl(value, security));
+  const transport = parsed.protocol === "https:" ? httpsRequest : httpRequest;
+  const addresses = await dnsLookupAll(parsed.hostname);
+  if (security.allowPrivateNetwork !== true && addresses.some(isPrivateAddress)) {
+    throw new Error("web.fetch resolved to a private or link-local network address");
+  }
+  const address = addresses[0];
+  return new Promise((resolveResponse, rejectResponse) => {
+    const request = transport(parsed, {
+      headers: { "user-agent": "Odinn/0.1 beta web-fetch" },
+      timeout: WEB_TIMEOUT_MS,
+      lookup: (_hostname, _options, callback) => callback(null, address, isIP(address))
+    }, (response) => {
+      const chunks = [];
+      let bytes = 0;
+      response.on("data", (chunk) => {
+        bytes += chunk.length;
+        if (bytes <= WEB_MAX_BYTES + 1) chunks.push(chunk);
+      });
+      response.on("end", () => resolveResponse({
+        status: response.statusCode ?? 0,
+        headers: response.headers,
+        url: parsed.href,
+        body: Buffer.concat(chunks)
+      }));
+      response.on("error", rejectResponse);
+    });
+    request.on("timeout", () => request.destroy(new Error("web.fetch request timed out")));
+    request.on("error", rejectResponse);
+    request.end();
+  });
+}
+
+async function dnsLookupAll(hostnameValue) {
+  if (isIP(hostnameValue)) return [hostnameValue];
+  try {
+    const results = await dnsLookup(hostnameValue, { all: true, verbatim: true });
+    if (!results.length) throw new Error("hostname did not resolve");
+    return results.map((result) => result.address);
+  } catch (error) {
+    throw new Error(`web.fetch DNS validation failed for ${hostnameValue}: ${error.message}`);
+  }
+}
+
+function isPrivateAddress(value) {
+  const address = String(value || "").toLowerCase().replace(/^::ffff:/, "");
+  if (address === "localhost" || address.endsWith(".local")) return true;
+  if (isIP(address) === 4) {
+    const [a, b] = address.split(".").map(Number);
+    return a === 10 || a === 127 || a === 169 && b === 254 || a === 192 && b === 168 || a === 172 && b >= 16 && b <= 31 || a === 100 && b >= 64 && b <= 127;
+  }
+  if (isIP(address) === 6) {
+    return address === "::1" || address.startsWith("fc") || address.startsWith("fd") || address.startsWith("fe8") || address.startsWith("fe9") || address.startsWith("fea") || address.startsWith("feb");
+  }
+  return false;
 }
 
 function assertDomainAllowed(host, security = {}) {
@@ -2283,6 +2350,39 @@ async function proposeImprovement(store, input = {}) {
     evidence: normalizeEvidence(input.evidence),
     source: cleanString(input.source, "local")
   });
+}
+
+async function learnImprovements(store, auditStore, input = {}) {
+  if (!auditStore || typeof auditStore.readAll !== "function") return { generated: [], message: "audit observation source unavailable" };
+  const events = await auditStore.readAll();
+  const limit = normalizeLimit(input.limit, 1000);
+  const failures = events.filter((event) => ["task.failed", "task.policy", "task.cancelled"].includes(event.type)).slice(-limit);
+  const groups = new Map();
+  for (const event of failures) {
+    const key = `${event.type}:${event.tool ?? "unknown"}:${event.message ?? event.decision ?? ""}`;
+    const current = groups.get(key) ?? { key, count: 0, tool: event.tool ?? "unknown", reason: event.message ?? event.decision ?? "runtime failure", runs: [] };
+    current.count += 1;
+    if (event.runId && current.runs.length < 8 && !current.runs.includes(event.runId)) current.runs.push(event.runId);
+    groups.set(key, current);
+  }
+  const records = await store.readAll();
+  const existing = new Set(records.filter((record) => record.type === "improvement.proposed").map((record) => `${record.target}:${record.title}`));
+  const generated = [];
+  for (const group of groups.values()) {
+    if (group.count < 2) continue;
+    const title = `Investigate repeated ${group.tool} failures`;
+    const target = `runtime/${group.tool}`;
+    if (existing.has(`${target}:${title}`)) continue;
+    generated.push(await proposeImprovement(store, {
+      title,
+      rationale: `${group.count} audited events reported: ${group.reason}. Review the trace before changing runtime behavior.`,
+      target,
+      priority: group.count >= 5 ? "high" : "normal",
+      evidence: group.runs.map((runId) => ({ runId, type: "audit-event", count: group.count })),
+      source: "autonomous-observation"
+    }));
+  }
+  return { generated, observedEvents: failures.length, applied: false, requiresHumanDecision: true };
 }
 
 async function listImprovements(store, input = {}) {

@@ -22,7 +22,7 @@ The project is a clean-room implementation. It does not copy OpenClaw, Hermes, O
 
 It is not a hosted multi-user service. Do not expose the gateway to the public internet yet. The default posture is loopback-only, private-network blocking, and approval-required browser actions.
 
-The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval claims, provider retries and usage normalization, trusted process/MCP extension adapters, cross-platform package smoke, and nightly storage recovery drills. Native installers, application upgrade rollback, audit-journal key rotation, and the full browser restart/tab-loss recovery matrix remain open. See [the P0 beta ledger](docs/P0-BETA-GATES.md).
+The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval claims, provider retries and usage normalization, trusted process/MCP extension adapters, DNS-pinned public web fetches, symlink-safe workspace reads, owner-only state repair, cross-platform package smoke, and nightly storage recovery drills. Native installers, application upgrade rollback, audit-journal key rotation, complete external-adapter interposition, and full counterfactual/replay execution remain open. See [the P0 beta ledger](docs/P0-BETA-GATES.md).
 
 ## Quick start
 
@@ -76,10 +76,11 @@ Use `pnpm odinn config experimental show` to inspect the posture. Read the featu
 - **Capability Tokens** bind short-lived, one-use authority to a run, step, tool, and resource constraint.
 - **Rewind** snapshots selected local files and defaults to a dry-run restore preview.
 - **Capsules** export redacted ZIP-compatible run bundles with checksum verification and safe extraction.
-- **Counterfactual** creates physically isolated candidate workspaces and compares their durable run records.
+- **Counterfactual** creates physically isolated candidate workspaces and compares their durable run records; candidate execution and branch commit are still operator-driven.
 - **Darwin** scores models from recorded verification, reliability, speed, cost, and policy outcomes.
+- **Self-improvement** mines repeated audited failures into reviewable proposals. It does not rewrite code, change policy, install skills, or approve its own changes.
 
-These are initial local slices, not a claim that arbitrary remote effects can be reversed or perfectly replayed. Browser sessions, external mutations, nondeterministic models, and public hosting remain outside the safe beta boundary.
+These are initial local slices, not a claim that arbitrary remote effects can be reversed or perfectly replayed. Browser sessions, external mutations, nondeterministic models, automatic counterfactual execution, and public hosting remain outside the safe beta boundary.
 
 The authenticated gateway exposes the same experimental surfaces through `/runtime/runs`, `/proof`, `/policy/evaluate`, `/capabilities/*`, `/checkpoints`, `/rewind/*`, `/capsules/*`, `/counterfactual/*`, and `/routing/*`. Each surface remains disabled until its matching experimental flag is enabled in `.odinn/config.json`.
 

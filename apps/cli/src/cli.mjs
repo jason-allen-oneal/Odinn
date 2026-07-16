@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { access, copyFile, cp, lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract } from "@odinn/kernel";
@@ -184,6 +184,7 @@ function usage() {
   odinn goal update --goal <goal-id> --status active|completed|blocked|paused|cancelled [--note <text>] [--state .odinn]
   odinn goal list [--state .odinn]
   odinn improve propose --title <title> --rationale <text> [--target runtime] [--state .odinn]
+  odinn improve learn [--limit 1000] [--state .odinn]
   odinn improve decide --improvement <id> --decision approved|rejected|applied [--note <text>] [--state .odinn]
   odinn improve list [--state .odinn]
 
@@ -1100,11 +1101,12 @@ async function run(args) {
   const config = await readConfig(state);
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
   try {
+    const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
     const result = await runTask({
       task: { tool, input, actor: "cli" },
-      auditStore: createAuditStore(join(state, config.auditLog ?? "audit.jsonl")),
+      auditStore,
       policy: createDefaultPolicy(config.policy),
-      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config }),
+      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore }),
       runLedger
     });
     const contractPath = option(args, "--contract", "");
@@ -1286,16 +1288,37 @@ async function stateCommand(args) {
     if (!input) throw new Error("state restore requires --input <directory>");
     const source = resolveInvocationPath(input);
     await access(source);
-    const backup = `${state}.before-restore-${Date.now()}`;
-    await cp(state, backup, { recursive: true, force: false, errorOnExist: true }).catch((error) => {
-      if (error?.code !== "ENOENT") throw error;
-    });
-    await mkdir(state, { recursive: true });
-    await cp(source, state, { recursive: true, force: true });
-    await printJson({ ok: true, operation: "restore", source, destination: state, preRestoreBackup: backup });
+    const parent = resolve(state, "..");
+    const staging = join(parent, `.${state.split(/[\\/]/).pop()}-restore-${process.pid}-${Date.now()}`);
+    await cp(source, staging, { recursive: true, force: false, errorOnExist: true });
+    const configPath = join(staging, "config.json");
+    try { JSON.parse(await readFile(configPath, "utf8")); } catch (error) { await rm(staging, { recursive: true, force: true }); throw new Error(`state restore source is invalid: ${error.message}`); }
+    const currentBackup = `${state}.before-restore-${Date.now()}`;
+    try {
+      await rename(state, currentBackup);
+      await rename(staging, state);
+      await secureStateTree(state);
+    } catch (error) {
+      await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+      try { await access(state); } catch { await rename(currentBackup, state).catch(() => undefined); }
+      throw error;
+    }
+    await printJson({ ok: true, operation: "restore", source, destination: state, preRestoreBackup: currentBackup });
     return;
   }
   throw new Error("state requires subcommand: backup or restore");
+}
+
+async function secureStateTree(root) {
+  await chmod(root, 0o700);
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      await secureStateTree(path);
+    } else if (entry.isFile()) {
+      await chmod(path, 0o600);
+    }
+  }
 }
 
 async function session(args) {
@@ -1376,6 +1399,11 @@ async function goal(args) {
 async function improve(args) {
   const [subcommand, ...rest] = args;
   switch (subcommand ?? "list") {
+    case "learn":
+      await runRecordTool(rest, "improve.learn", {
+        limit: Number.parseInt(option(rest, "--limit", "1000"), 10)
+      });
+      break;
     case "propose":
       await runRecordTool(rest, "improve.propose", {
         title: option(rest, "--title"),
@@ -1400,7 +1428,7 @@ async function improve(args) {
       });
       break;
     default:
-      throw new Error("improve requires subcommand: propose, decide, or list");
+      throw new Error("improve requires subcommand: learn, propose, decide, or list");
   }
 }
 
@@ -1413,11 +1441,12 @@ async function runRecordTool(args, tool, input) {
   const config = await readConfig(state);
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
   try {
+    const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
     const result = await runTask({
       task: { tool, input, actor: "cli" },
-      auditStore: createAuditStore(join(state, config.auditLog ?? "audit.jsonl")),
+      auditStore,
       policy: createDefaultPolicy(config.policy),
-      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config }),
+      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore }),
       runLedger
     });
     await printJson(result.output);

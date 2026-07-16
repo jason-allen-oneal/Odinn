@@ -33,7 +33,7 @@ Before the first stable release:
 
 ### Secure defaults
 
-The default policy enables public web reading while blocking private-network URLs, leaves domain allowlists empty, uses a separate Chromium profile for browser work, and requires explicit approval before `browser.click`, `browser.type`, or `browser.press` can execute. Approval claims are persisted with atomic replacement, expire after five minutes, and use a stable run ID so duplicate approval requests do not execute the same action twice. Approval state is stored in the state directory with mode `0600`; the corresponding request and decision are written to the audit log. The gateway requires a per-state bearer token or same-site bootstrap cookie for control-plane access and rejects cross-origin mutations.
+The default policy enables public web reading while blocking private-network URLs, leaves domain allowlists empty, uses a separate Chromium profile for browser work, and requires explicit approval before `browser.click`, `browser.type`, or `browser.press` can execute. Approval claims are persisted with atomic replacement, expire after five minutes, and use a stable run ID so duplicate approval requests do not execute the same action twice. Approval state is stored in the state directory with mode `0600`; the corresponding request and decision are written to the audit log. The gateway validates `Host` before bootstrap and accepts only loopback hosts (`localhost`, `127.0.0.1`, and `[::1]`), then requires a per-state bearer token or same-site bootstrap cookie for control-plane access and rejects cross-origin mutations.
 
 The policy is configurable because local operators have different trust boundaries. The dangerous switches are intentionally explicit:
 
@@ -45,7 +45,7 @@ pnpm odinn config security set --surface browser --require-approval false
 
 Private-network access can expose local services and metadata endpoints. Disabling browser approval allows the model to drive external accounts without a human checkpoint. Those settings are operator decisions, not safe defaults.
 
-The web tools follow redirects through the same URL policy and enforce blocked/allowed domains at each hop. Browser navigation and post-action snapshots are checked against the same network and domain rules. The beta does not expose file upload or download tools.
+The web tools follow redirects through the same URL policy and enforce blocked/allowed domains at each hop. `web.fetch` resolves DNS, rejects private/link-local/metadata ranges, and pins the validated address into the request so validation and connection do not use separate DNS answers. Browser navigation and post-action snapshots are checked against the same network and domain rules. Workspace reads resolve real paths and reject escaping symlinks. The beta does not expose file upload or download tools.
 
 ### Experimental runtime controls
 
@@ -65,12 +65,13 @@ Proof is evidence-based: model text cannot set `verified`. Sentinel decisions ar
 - Model output and imported skills are untrusted input; they cannot bypass the kernel policy evaluator.
 - Extension and MCP manifests are metadata, not trust. They are disabled by default, require provenance review, and receive only explicit capability grants when enabled. The process adapter validates the entrypoint stays inside the configured workspace, launches without a shell, enforces a timeout, and rejects disabled, untrusted, ungranted, container, and unsandboxed execution.
 - Public web content is untrusted data and may contain prompt injection. Ódinn must not treat page instructions as operator authorization.
+- State directories are repaired to `0700` and sensitive JSON/JSONL records to `0600` when the gateway opens them. Idempotency keys are bound to a canonical request hash; reusing a key with different content returns `409`.
 - Browser read access is not action authorization. An external side effect requires the approval gate unless the operator explicitly disables it.
 - Loopback binding is the supported deployment. `ODINN_ALLOW_REMOTE=1` is an escape hatch for controlled experiments, not a security boundary.
 
 ### Known beta gaps
 
-The release ledger intentionally leaves these items open: full browser recovery after tab/process restart, audit-journal key rotation, native installers and application upgrade rollback, complete integration of experimental policy/capability checks into every external tool adapter, and remote or multi-user hosting. The source archives have cross-platform extraction/install smoke, but that is not proof of a native installer or rollback-safe upgrade. Keep Ódinn loopback-only and single-user until those boundaries are designed and tested.
+The release ledger intentionally leaves these items open: failed-action/tab-loss browser recovery, audit-journal key rotation, native installers and application upgrade rollback, immutable content-addressed extension versions, automatic counterfactual candidate execution, full capsule replay, complete integration of experimental policy/capability checks into every external tool adapter, and remote or multi-user hosting. The source archives have cross-platform extraction/install smoke, but that is not proof of a native installer or rollback-safe upgrade. Keep Ódinn loopback-only and single-user until those boundaries are designed and tested.
 
 ## CI security gates
 

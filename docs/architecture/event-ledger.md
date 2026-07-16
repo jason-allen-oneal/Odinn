@@ -1,4 +1,4 @@
-# Ódinn Phase 0 event ledger
+# Ódinn runtime event ledger
 
 Phase 0 adds the durable runtime spine used by the experimental Proof, Rewind, Sentinel, Capsule, Darwin, Capability, and Counterfactual features. It is deliberately local and single-user.
 
@@ -31,7 +31,7 @@ The ledger is an integrity journal, not a blockchain. It does not provide remote
 
 `runTask` remains the runtime interception boundary. When given a `RunLedger`, it creates a run and `tool-request` step before policy evaluation, records a `policy-check`, and records a `tool-result` after execution. Unknown tools receive the most restrictive descriptor: all effects, irreversible, capability-required, and approval-required.
 
-Built-in descriptors currently classify reads, local record writes, model/provider calls, and browser mutations. This is metadata and enforcement plumbing for later Sentinel and Capability work; it does not yet implement rollback or capability tokens.
+Built-in descriptors currently classify reads, local record writes, model/provider calls, and browser mutations. This is the shared interception boundary for Sentinel and Capability enforcement when those flags are enabled. Third-party adapters that bypass `runTask` are not covered by that guarantee.
 
 ## Feature flags
 
@@ -53,4 +53,4 @@ They are disabled by default and are not silently inferred from model output or 
 
 ## Current limitations
 
-Phase 0 does not claim to provide contract verification, snapshots, rollback, policy invariants, capability issuance, capsule replay, model routing, or counterfactual branches. The existing JSONL audit journal remains for compatibility and UI history; the SQLite ledger is the new run/step integrity layer. Key rotation, backup/restore integration for SQLite, and multi-process contention testing are later hardening work.
+The ledger now backs local Proof, Rewind, Sentinel, Capability, Capsule, Darwin, and Counterfactual slices. It does not make remote side effects reversible, make model output deterministic, or provide multi-user tamper resistance. Counterfactual creation currently prepares isolated candidates; execution and branch commit remain explicit follow-up operations. Capsule replay verifies and loads recorded boundaries but does not silently execute external tools. Key rotation, SQLite multi-process hardening, and complete adapter coverage remain release work.

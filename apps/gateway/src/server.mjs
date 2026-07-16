@@ -1,11 +1,11 @@
 import { createServer } from "node:http";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, oauthTokenPath, ProofVerifier, validateContract, validatePolicy } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
-import { FileJobStore } from "@odinn/store-file";
+import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
 const PUBLIC_DIR = fileURLToPath(new URL("../public/", import.meta.url));
@@ -23,13 +23,14 @@ export async function createGatewayServer({
   requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES
 } = {}) {
   const state = resolve(stateDir);
+  await ensureSecureStateDirectory(state);
   const config = await readConfig(state);
   const featureFlags = normalizeExperimentalFlags(config.experimental);
   const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot, featureFlags });
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
   const policy = createDefaultPolicy(config.policy);
   const approvalStore = createApprovalStore({ path: join(state, "approvals.json") });
-  const registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, approvalStore });
+  const registry = createBuiltInRegistry({ workspaceRoot, stateDir: state, config, approvalStore, auditStore });
   const gatewayToken = await loadGatewayToken(state);
   const isolatedTaskExecutor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy });
   const supervisor = new JobSupervisor({
@@ -42,6 +43,7 @@ export async function createGatewayServer({
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      if (!validHostHeader(request)) return json(response, 421, { ok: false, error: "invalid gateway Host header" });
       if (request.method === "GET" && url.pathname === "/odinn-logo.png") {
         return image(response, 200, await readFile(join(PUBLIC_DIR, "odinn-logo.png")), "image/png");
       }
@@ -201,12 +203,16 @@ export async function createGatewayServer({
       if (request.method === "POST" && url.pathname === "/jobs") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const id = body.id || request.headers["idempotency-key"] || undefined;
+        const requestHash = hashRequest(body);
         if (id) {
           const existing = await supervisor.get(String(id));
-          if (existing) return json(response, 200, { ok: true, replayed: true, job: existing });
+          if (existing) {
+            if (existing.requestHash && existing.requestHash !== requestHash) return json(response, 409, { ok: false, error: "idempotency key was already used for a different request" });
+            return json(response, 200, { ok: true, replayed: true, job: existing });
+          }
         }
         const task = body.task && typeof body.task === "object" ? body.task : body;
-        const job = await supervisor.submit({ task: { ...task, ...(id ? { id: String(id) } : {}) } }, { id: id ? String(id) : undefined, timeoutMs: body.timeoutMs });
+        const job = await supervisor.submit({ task: { ...task, ...(id ? { id: String(id) } : {}) } }, { id: id ? String(id) : undefined, requestHash, timeoutMs: body.timeoutMs });
         return json(response, 202, { ok: true, job });
       }
       if (request.method === "POST" && url.pathname.startsWith("/jobs/") && url.pathname.endsWith("/cancel")) {
@@ -400,6 +406,14 @@ export async function createGatewayServer({
           registry
         })).output);
       }
+      if (request.method === "POST" && url.pathname === "/improvements/learn") {
+        return json(response, 200, (await runTask({
+          task: { tool: "improve.learn", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
+          auditStore,
+          policy,
+          registry
+        })).output);
+      }
       if (request.method === "POST" && url.pathname.startsWith("/improvements/") && url.pathname.endsWith("/decisions")) {
         const id = decodeURIComponent(url.pathname.slice("/improvements/".length, -"/decisions".length));
         return json(response, 200, (await runTask({
@@ -477,10 +491,35 @@ function validOrigin(request) {
   const origin = request.headers.origin;
   if (!origin) return true;
   try {
-    return new URL(origin).origin === `http://${request.headers.host}`;
-  } catch {
-    return false;
-  }
+    const parsed = new URL(origin);
+    return parsed.protocol === "http:" && validLoopbackHost(parsed.host) && normalizeHost(parsed.host) === normalizeHost(request.headers.host);
+  } catch { return false; }
+}
+
+function validHostHeader(request) {
+  const host = request.headers.host;
+  return typeof host === "string" && validLoopbackHost(host);
+}
+
+function validLoopbackHost(value) {
+  const host = String(value || "").trim().toLowerCase();
+  const match = host.match(/^([^:]+)(?::\d{1,5})?$/) || host.match(/^(\[[0-9a-f:]+\])(?::\d{1,5})?$/);
+  if (!match) return false;
+  return new Set(["localhost", "127.0.0.1", "[::1]"]).has(match[1]);
+}
+
+function normalizeHost(value) {
+  return String(value || "").trim().toLowerCase().replace(/:\d+$/, "");
+}
+
+function hashRequest(value) {
+  return createHash("sha256").update(stableJson(value)).digest("hex");
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
 }
 
 function safeCapsulePath(state, candidate) {
@@ -519,14 +558,17 @@ async function streamAuditEvents(request, response, auditStore, url) {
 async function readConfig(state) {
   const path = join(state, "config.json");
   try {
-    return JSON.parse(await readFile(path, "utf8"));
+    const config = JSON.parse(await readFile(path, "utf8"));
+    await chmod(path, 0o600);
+    return config;
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
     await mkdir(state, { recursive: true });
     const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: false, counterfactual: false } };
-    await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx" }).catch((writeError) => {
+    await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 }).catch((writeError) => {
       if (writeError?.code !== "EEXIST") throw writeError;
     });
+    await chmod(path, 0o600);
     return config;
   }
 }
@@ -1626,6 +1668,15 @@ function renderConsoleHtml() {
     .nav-group-label {
       padding-top: 12px;
     }
+    .nav-more { margin: 4px 0 2px; }
+    .nav-more summary { display: flex; align-items: center; justify-content: space-between; padding: 10px 11px 5px; color: #66758b; cursor: pointer; list-style: none; text-transform: uppercase; }
+    .nav-more summary::-webkit-details-marker { display: none; }
+    .nav-more summary .nav-group-label { padding: 0; }
+    .nav-chevron { color: #8b98aa; font-size: 15px; transition: transform .15s ease; }
+    .nav-more:not([open]) .nav-chevron { transform: rotate(-90deg); }
+    .shell.sidebar-collapsed .nav-more summary { justify-content: center; padding: 10px 0 5px; }
+    .shell.sidebar-collapsed .nav-more summary .nav-group-label { display: none; }
+    .shell.sidebar-collapsed .nav-more summary .nav-chevron { display: none; }
     .menu-chat {
       grid-template-columns: minmax(0, 1fr) auto;
       gap: 2px 6px;
@@ -1785,8 +1836,14 @@ function renderConsoleHtml() {
     <symbol id="icon-trash" viewBox="0 0 24 24"><path d="M5 7h14M10 4h4l1 3H9l1-3zM8 10v7M12 10v7M16 10v7M7 7l1 13h8l1-13"></path></symbol>
     <symbol id="icon-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"></path></symbol>
     <symbol id="icon-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><path d="M4 12h16M12 4c2 2.2 3 4.9 3 8s-1 5.8-3 8c-2-2.2-3-4.9-3-8s1-5.8 3-8z"></path></symbol>
+    <symbol id="icon-activity" viewBox="0 0 24 24"><path d="M4 12h4l2-6 4 12 2-6h4"></path></symbol>
+    <symbol id="icon-servers" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="6" rx="1"></rect><rect x="4" y="14" width="16" height="6" rx="1"></rect><path d="M7 7h.01M7 17h.01M10 7h7M10 17h7"></path></symbol>
+    <symbol id="icon-usage" viewBox="0 0 24 24"><path d="M5 19V9M12 19V5M19 19v-7"></path><path d="M3 19h18"></path></symbol>
+    <symbol id="icon-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><path d="M12 7v5l3 2"></path></symbol>
+    <symbol id="icon-agent" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3"></circle><path d="M5 20c.6-3.5 2.9-5 7-5s6.4 1.5 7 5M12 3v2"></path></symbol>
+    <symbol id="icon-skill" viewBox="0 0 24 24"><path d="m12 3 2.2 5.6L20 11l-5.8 2.4L12 19l-2.2-5.6L4 11l5.8-2.4z"></path><path d="m18 16 .8 2.2L21 19l-2.2.8L18 22l-.8-2.2L15 19l2.2-.8z"></path></symbol>
   </svg>
-  <div class="shell sidebar-collapsed" id="shell">
+  <div class="shell" id="shell">
     <aside class="sidebar">
       <div class="brand">
         <div class="mark"><img src="/odinn-logo.png" alt="Ódinn logo"></div>
@@ -1798,21 +1855,26 @@ function renderConsoleHtml() {
       <nav class="nav" aria-label="Console views">
         <button class="active" data-view="overview" data-title="Chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-chat"></use></svg></span><span class="nav-label">Chat</span><span class="badge ok" id="nav-health">...</span></button>
         <div class="menu-chats">
-        <button class="secondary" id="new-chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-plus"></use></svg></span><span class="nav-label">New chat</span></button>
+        <button class="secondary" id="new-chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-plus"></use></svg></span><span class="nav-label">New session</span></button>
           <div class="session-rail-label"><span>Recent chats</span><span id="session-count">0 sessions</span></div>
           <div id="chat-session-list" class="session-list"></div>
         </div>
-        <div class="nav-group-label">Workspace</div>
-        <button data-view="capabilities" data-title="Capabilities" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-globe"></use></svg></span><span class="nav-label">Capabilities</span></button>
-        <button data-view="run" data-title="Run Tool" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span><span class="nav-label">Run Tool</span></button>
-        <button data-view="plans" data-title="Plans" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-plan"></use></svg></span><span class="nav-label">Plans</span></button>
+        <details class="nav-more" open>
+          <summary><span class="nav-group-label">More</span><span class="nav-chevron">⌄</span></summary>
+          <button data-view="audit" data-title="Activity" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-activity"></use></svg></span><span class="nav-label">Activity</span></button>
+          <button data-view="runtime" data-title="Instances" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-servers"></use></svg></span><span class="nav-label">Instances</span></button>
+          <button data-view="sessions" data-title="Sessions" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-session"></use></svg></span><span class="nav-label">Sessions</span></button>
+          <button data-view="runtime" data-title="Usage" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-usage"></use></svg></span><span class="nav-label">Usage</span></button>
+          <button data-view="plans" data-title="Cron Jobs" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-clock"></use></svg></span><span class="nav-label">Cron Jobs</span></button>
+          <button data-view="run" data-title="Tasks / Run Tool" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span><span class="nav-label">Tasks</span></button>
+          <button data-view="capabilities" data-title="Agents" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-agent"></use></svg></span><span class="nav-label">Agents</span></button>
+          <button data-view="capabilities" data-title="Skills" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-skill"></use></svg></span><span class="nav-label">Skills</span></button>
+          <button data-view="improvements" data-title="Skill Workshop" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Skill Workshop</span></button>
+        </details>
+        <div class="nav-group-label nav-advanced-label">Workspace</div>
         <button data-view="memory" data-title="Memory" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-memory"></use></svg></span><span class="nav-label">Memory</span></button>
-        <button data-view="sessions" data-title="Sessions" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-session"></use></svg></span><span class="nav-label">Sessions</span></button>
         <button data-view="goals" data-title="Goals" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-goal"></use></svg></span><span class="nav-label">Goals</span></button>
-        <button data-view="improvements" data-title="Improvements" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Improvements</span></button>
-        <div class="nav-group-label">Operations</div>
         <button data-view="audit" data-title="Audit" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-audit"></use></svg></span><span class="nav-label">Audit</span></button>
-        <button data-view="runtime" data-title="Runtime" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-runtime"></use></svg></span><span class="nav-label">Runtime</span></button>
       </nav>
       <div class="sidebar-footer">
         <button class="secondary" id="refresh" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-refresh"></use></svg></span>Refresh</button>
@@ -1820,7 +1882,7 @@ function renderConsoleHtml() {
     </aside>
 
     <header class="topbar">
-      <button class="sidebar-toggle" id="sidebar-toggle" type="button" title="Open navigation" aria-label="Open navigation"><svg class="icon-svg"><use href="#icon-menu"></use></svg></button>
+      <button class="sidebar-toggle" id="sidebar-toggle" type="button" title="Collapse navigation" aria-label="Collapse navigation"><svg class="icon-svg"><use href="#icon-menu"></use></svg></button>
       <div class="topbar-title">
         <div class="breadcrumb-line">
           <strong>Ódinn</strong>
@@ -2022,7 +2084,9 @@ function renderConsoleHtml() {
         <div class="page">
           <div class="page-head"><div><div class="section-kicker">Self-improvement queue</div><h1>Improvements</h1><p>Capture product friction, review proposals, and record the decision trail.</p></div><span class="chip">human decision required</span></div>
           <div class="split">
-            <div class="panel stack"><div class="panel-head"><h2>Propose an improvement</h2><button id="propose-improvement" type="button">Propose</button></div>
+            <div class="panel stack"><div class="panel-head"><div><h2>Evidence loop</h2><span class="muted">Mine repeated failures into reviewable proposals.</span></div><button id="learn-improvements" type="button">Analyze activity</button></div>
+            <div class="chip-row"><span class="chip ok">automatic observation</span><span class="chip warn">human approval required</span></div>
+            <div class="panel-head"><h2>Propose an improvement</h2><button id="propose-improvement" type="button">Propose</button></div>
             <div class="field">
               <label for="improvement-title">Title</label>
               <input id="improvement-title" value="Make gateway console testable">
@@ -3034,6 +3098,18 @@ function renderConsoleHtml() {
         });
         state.selectedImprovementId = improvement.id;
         showOutput(improvement);
+        await refreshImprovements();
+        await refreshRuns();
+      } catch (error) {
+        showOutput(error.message);
+      } finally {
+        setBusy(event.currentTarget, false);
+      }
+    });
+    $("learn-improvements").addEventListener("click", async (event) => {
+      try {
+        setBusy(event.currentTarget, true);
+        showOutput(await api("/improvements/learn", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: 1000 }) }));
         await refreshImprovements();
         await refreshRuns();
       } catch (error) {

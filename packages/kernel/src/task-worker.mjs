@@ -9,7 +9,7 @@ process.on("message", async (message) => {
     const { payload, stateDir, workspaceRoot, config, policy } = message;
     const auditStore = createAuditStore(join(stateDir, config.auditLog ?? "audit.jsonl"));
     const approvalStore = createApprovalStore({ path: join(stateDir, "approvals.json") });
-    const registry = createBuiltInRegistry({ workspaceRoot, stateDir, config, approvalStore });
+    const registry = createBuiltInRegistry({ workspaceRoot, stateDir, config, approvalStore, auditStore });
     runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
     const result = payload.plan
       ? await runPlan({ plan: payload.plan, auditStore, policy, registry, runLedger })

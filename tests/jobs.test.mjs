@@ -60,6 +60,29 @@ test("job supervisor supports cancellation and timeout recovery", async () => {
   await supervisor.shutdown();
 });
 
+test("job supervisor does not requeue or start work after shutdown begins", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-jobs-shutdown-"));
+  const store = new FileJobStore(join(root, "jobs.json"));
+  let executions = 0;
+  const supervisor = new JobSupervisor({
+    store,
+    maxAttempts: 3,
+    execute: async (_payload, { signal }) => {
+      executions += 1;
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, 100);
+        signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+      });
+    }
+  });
+  await supervisor.start();
+  await supervisor.submit({}, { id: "job_shutdown" });
+  await supervisor.shutdown();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(executions, 1);
+  assert.equal((await supervisor.get("job_shutdown")).status, "failed");
+});
+
 test("file stores expose explicit corruption recovery without hiding the damaged source", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-store-recovery-"));
   const path = join(root, "jobs.json");

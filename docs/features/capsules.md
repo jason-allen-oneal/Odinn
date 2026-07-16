@@ -9,6 +9,6 @@ odinn capsule verify run.odinn
 odinn capsule replay run.odinn --mode verification-only
 ```
 
-Extraction rejects absolute paths and parent traversal. Verification checks both the archive digest when the capsule is local to its source database and the internal content hashes when moved elsewhere.
+Extraction rejects absolute paths and parent traversal. Verification checks the internal content hashes when moved elsewhere. Verification-only replay validates the capsule and loads its recorded boundaries without executing model calls or external tools; full replay is intentionally not implemented yet.
 
 The gateway restricts capsule paths to its `.odinn/capsules` store. Direct runtime and CLI exports must remain inside the configured workspace or `.odinn/capsules`.

@@ -304,7 +304,6 @@ test("CLI exposes URL-free presets for hosted and local providers", async () => 
   });
   assert.equal(byName.get("ollama").baseUrl, "http://127.0.0.1:11434/v1");
   assert.deepEqual(byName.get("ollama").models, []);
-  assert.equal(byName.get("ollama").models.includes("llama3.2:1b"), false);
   assert.equal(byName.get("openai").auth, "oauth or api-key");
 });
 
@@ -622,4 +621,11 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   });
   assert.equal(listImprovements.status, 0, listImprovements.stderr || listImprovements.stdout);
   assert.equal(JSON.parse(listImprovements.stdout).improvements[0].status, "approved");
+
+  const learned = spawnSync("node", ["apps/cli/src/cli.mjs", "improve", "learn", "--state", state, "--limit", "100"], {
+    cwd: root,
+    encoding: "utf8"
+  });
+  assert.equal(learned.status, 0, learned.stderr || learned.stdout);
+  assert.equal(JSON.parse(learned.stdout).applied, false);
 });

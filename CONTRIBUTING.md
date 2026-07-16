@@ -65,4 +65,4 @@ When changing `.github/workflows/`, also run the pinned actionlint container des
 
 ## Releases
 
-Do not edit release tags manually. Release Please maintains the version and changelog pull request. Merging that pull request creates the tag consumed by the protected release workflow.
+Do not edit release tags manually. Release Please maintains the version and changelog pull request. Merging that pull request creates the tag and directly invokes the protected reusable release workflow. This explicit handoff is required because GitHub suppresses tag-push workflow events caused by the workflow token.

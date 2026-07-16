@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -7,6 +7,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const output = join(root, "dist", "release");
 const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 const base = `odinn-v${pkg.version}`;
+await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });
 
 function archive(format: any, extension: any) {

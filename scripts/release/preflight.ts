@@ -10,7 +10,9 @@ const required = [
   "README.md",
   "LICENSE",
   "SECURITY.md",
+  "docs/public-beta.md",
   "pnpm-lock.yaml",
+  ".github/ISSUE_TEMPLATE/bug-report.yml",
   ".github/workflows/ci.yml",
   ".github/workflows/security.yml",
   ".github/workflows/release.yml"

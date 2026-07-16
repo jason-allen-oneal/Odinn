@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a reproducible Odinn Forge public-beta defect.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, OAuth files, browser cookies, gateway tokens, private prompts, or client data. Suspected vulnerabilities belong in private vulnerability reporting, not this form.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets and private data from this report.
+          required: true
+        - label: This is not a suspected security vulnerability.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Odinn Forge version
+      description: Run `odinn status` or provide the release tag.
+      placeholder: v0.2.1-beta.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, architecture, Node.js version, and installation method.
+      placeholder: Ubuntu 24.04 x86_64, Node.js 24.4.0, release tarball
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider or subsystem
+      placeholder: OpenAI OAuth, Ollama, browser, memory, installer
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Give the smallest deterministic sequence that triggers the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Add redacted logs, audit verification output, screenshots, or a minimal fixture.
+

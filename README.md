@@ -17,6 +17,8 @@ The project is a clean-room implementation. It does not copy OpenClaw, Hermes, O
 
 Ódinn Forge is an initial local beta. The core loop is usable:
 
+Public beta participants should begin with the [public beta guide](docs/public-beta.md). It defines the supported local-first scope, verified release installation, privacy boundary, diagnostics, and bug-reporting path.
+
 - chat with configured models through API keys, OAuth, imported OAuth sessions, local servers, or CLI adapters;
 - recall durable user and project context across sessions;
 - search the public web and fetch pages;

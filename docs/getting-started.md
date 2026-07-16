@@ -2,6 +2,8 @@
 
 Ódinn Forge needs Node.js 24 or newer. Install the release for your platform, then run:
 
+For release downloads, checksum verification, privacy expectations, and beta support, start with the [public beta guide](public-beta.md).
+
 ```bash
 odinn onboard --provider openai
 odinn start

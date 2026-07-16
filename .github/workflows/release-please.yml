@@ -6,7 +6,10 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
+  attestations: write
   contents: write
+  id-token: write
   pull-requests: write
 
 concurrency:
@@ -14,10 +17,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release-please:
+  release_please:
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  publish_release:
+    needs: release_please
+    if: needs.release_please.outputs.release_created == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release_please.outputs.tag_name }}
+    secrets: inherit

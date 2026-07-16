@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a public-beta workflow or usability improvement.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: What should a user be able to accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: Current limitation
+      description: What happens today, and why does it block the workflow?
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Security and privacy boundaries
+      description: Note credentials, network access, external side effects, multi-user concerns, or sensitive data involved.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Examples or evidence
+      description: Include sanitized screenshots, comparable workflows, or concrete acceptance criteria.
+

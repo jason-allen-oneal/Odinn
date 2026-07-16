@@ -7,7 +7,7 @@ import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createGatewayServer } from "../apps/gateway/src/server.mjs";
+import { createGatewayServer } from "../apps/gateway/src/server.ts";
 
 const root = new URL("..", import.meta.url).pathname;
 const normalizedRoot = root.replace(/\/$/, "");
@@ -461,7 +461,7 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
 test("gateway entrypoint resolves filtered pnpm workspace root from the invocation root", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-entrypoint-"));
   const port = await openPort();
-  const child = spawn("node", ["src/server.mjs"], {
+  const child = spawn("node", ["src/server.ts"], {
     cwd: join(root, "apps/gateway"),
     env: {
       ...process.env,

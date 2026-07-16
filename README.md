@@ -288,7 +288,7 @@ Opt-in multi-user host:
 
 ```bash
 ODINN_HOST_STATE=/srv/odinn ODINN_USER_PASSWORD='use-a-password-manager' \
-  node apps/gateway/src/host.mjs user-add --id alice --workspace /srv/workspaces/alice
+  node apps/gateway/src/host.ts user-add --id alice --workspace /srv/workspaces/alice
 
 ODINN_HOST=0.0.0.0 ODINN_PORT=443 ODINN_HOST_STATE=/srv/odinn \
 ODINN_PUBLIC_ORIGIN=https://odinn.example.com \

@@ -38,7 +38,7 @@ The self-improvement loop defaults to review-gated proposals and can be explicit
 
 ## Required release proof
 
-The CI integration test launches `apps/gateway/src/server.mjs`, configures an OpenAI-compatible provider endpoint, calls the gateway, and verifies the response is present in the persisted run record. It exercises the packaged gateway/provider path with a local protocol provider; it does not call a cloud provider or pretend a direct fixture request is production-model validation.
+The CI integration test launches `apps/gateway/src/server.ts`, configures an OpenAI-compatible provider endpoint, calls the gateway, and verifies the response is present in the persisted run record. It exercises the packaged gateway/provider path with a local protocol provider; it does not call a cloud provider or pretend a direct fixture request is production-model validation.
 
 The cross-platform CI matrix runs the CLI onboarding smoke on Linux, macOS, and Windows. The smoke uses a fresh state directory and completes without credentials; provider-specific auth remains an explicit onboarding path.
 

@@ -4,10 +4,11 @@
   "private": true,
   "type": "module",
   "bin": {
-    "odinn": "./src/cli.mjs"
+    "odinn": "./src/cli.ts"
   },
   "scripts": {
-    "start": "node ./src/cli.mjs"
+    "start": "node ./src/cli.ts",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "@odinn/kernel": "workspace:*",

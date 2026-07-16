@@ -11,7 +11,8 @@ const DEFAULT_REQUEST_MAX_BYTES = 65_536;
 const PUBLIC_DIR = fileURLToPath(new URL("../public/", import.meta.url));
 
 class GatewayError extends Error {
-  constructor(status, message) {
+  status: number;
+  constructor(status: any, message: any) {
     super(message);
     this.status = status;
   }
@@ -21,7 +22,7 @@ export async function createGatewayServer({
   stateDir = ".odinn",
   workspaceRoot = process.cwd(),
   requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES
-} = {}) {
+}: any = {}) {
   const state = resolve(stateDir);
   await ensureSecureStateDirectory(state);
   const config = await readConfig(state);
@@ -37,7 +38,7 @@ export async function createGatewayServer({
     store: new FileJobStore(join(state, "jobs.json")),
     execute: isolatedTaskExecutor
   });
-  const runTask = ({ task }) => isolatedTaskExecutor({ task });
+  const runTask = (request: any): Promise<any> => isolatedTaskExecutor(request) as Promise<any>;
   await supervisor.start();
   const selfImprovement = normalizeSelfImprovementConfig(config.selfImprovement);
   const improvementTimer = selfImprovement.enabled && selfImprovement.mode === "auto"
@@ -45,7 +46,7 @@ export async function createGatewayServer({
     : undefined;
   improvementTimer?.unref?.();
 
-  const server = createServer(async (request, response) => {
+  const server: any = createServer(async (request: any, response: any) => {
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
       if (!validHostHeader(request)) return json(response, 421, { ok: false, error: "invalid gateway Host header" });
@@ -70,7 +71,7 @@ export async function createGatewayServer({
           state,
           workspaceRoot: resolve(workspaceRoot),
           tools: Array.from(registry.keys()),
-          toolDetails: Array.from(registry.entries()).map(([name, tool]) => ({
+          toolDetails: Array.from(registry.entries()).map(([name, tool]: any) => ({
             name,
             capability: tool.capability,
             description: tool.description
@@ -86,7 +87,7 @@ export async function createGatewayServer({
         });
       }
       if (request.method === "GET" && url.pathname === "/runtime/runs") {
-        return json(response, 200, runtime.ledger.listRuns({ limit: url.searchParams.get("limit") }));
+        return json(response, 200, runtime.ledger.listRuns({ limit: Number.parseInt(url.searchParams.get("limit") ?? "100", 10) }));
       }
       if (request.method === "GET" && url.pathname.startsWith("/runtime/runs/") && url.pathname.endsWith("/verify")) {
         const runId = decodeURIComponent(url.pathname.slice("/runtime/runs/".length, -"/verify".length));
@@ -172,7 +173,7 @@ export async function createGatewayServer({
           capabilities: runtime.capabilities,
           proof: runtime.proof,
           policy,
-          executor: (task, context) => isolatedTaskExecutor({ task, workspaceRoot: context.workspaceRoot })
+          executor: (task: any, context: any) => isolatedTaskExecutor({ task, workspaceRoot: context.workspaceRoot })
         }));
       }
       if (request.method === "POST" && url.pathname.startsWith("/counterfactual/") && url.pathname.endsWith("/select")) {
@@ -201,7 +202,7 @@ export async function createGatewayServer({
       if (request.method === "POST" && url.pathname.startsWith("/runs/") && url.pathname.endsWith("/replay")) {
         const id = decodeURIComponent(url.pathname.slice("/runs/".length, -"/replay".length));
         const original = await auditStore.readRun(id);
-        const started = original?.events?.find((event) => event.type === "task.started");
+        const started = original?.events?.find((event: any) => event.type === "task.started");
         if (!original || !started?.tool || !started.data?.input) return json(response, 409, { ok: false, error: "run has no replayable task input" });
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const replayId = body.id || request.headers["idempotency-key"] || `${id}:replay:${Date.now()}`;
@@ -465,17 +466,17 @@ export async function createGatewayServer({
         }));
       }
       return json(response, 404, { ok: false, error: "not found" });
-    } catch (error) {
+    } catch (error: any) {
       return json(response, error.status ?? 400, { ok: false, error: error.message });
     }
   });
 
   const close = server.close.bind(server);
-  server.close = (callback) => {
+  server.close = (callback: any) => {
     if (improvementTimer) clearInterval(improvementTimer);
     Promise.allSettled([supervisor.shutdown(), isolatedTaskExecutor.shutdown?.()])
       .then(() => close(callback))
-      .catch((error) => callback?.(error));
+      .catch((error: any) => callback?.(error));
     return server;
   };
   server.on("close", () => supervisor.shutdown().catch(() => undefined));
@@ -484,25 +485,25 @@ export async function createGatewayServer({
   return server;
 }
 
-async function loadGatewayToken(state) {
+async function loadGatewayToken(state: any) {
   const path = join(state, "gateway.token");
   try {
     return (await readFile(path, "utf8")).trim();
-  } catch (error) {
+  } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
   }
   await mkdir(state, { recursive: true });
   const token = randomBytes(32).toString("base64url");
-  await writeFile(path, `${token}\n`, { flag: "wx", mode: 0o600 }).catch(async (error) => {
+  await writeFile(path, `${token}\n`, { flag: "wx", mode: 0o600 }).catch(async (error: any) => {
     if (error?.code !== "EEXIST") throw error;
   });
   await chmod(path, 0o600);
   return (await readFile(path, "utf8")).trim();
 }
 
-function authorizedRequest(request, expectedToken) {
+function authorizedRequest(request: any, expectedToken: any) {
   const bearer = request.headers.authorization?.startsWith("Bearer ") ? request.headers.authorization.slice(7) : "";
-  const cookie = String(request.headers.cookie ?? "").split(";").map((item) => item.trim()).find((item) => item.startsWith("odinn_gateway_token="))?.slice("odinn_gateway_token=".length) ?? "";
+  const cookie = String(request.headers.cookie ?? "").split(";").map((item: any) => item.trim()).find((item: any) => item.startsWith("odinn_gateway_token="))?.slice("odinn_gateway_token=".length) ?? "";
   let decodedCookie = "";
   try { decodedCookie = decodeURIComponent(cookie); } catch { return false; }
   const presented = bearer || decodedCookie;
@@ -510,11 +511,11 @@ function authorizedRequest(request, expectedToken) {
   return timingSafeEqual(Buffer.from(presented), Buffer.from(expectedToken));
 }
 
-function isMutatingMethod(method) {
+function isMutatingMethod(method: any) {
   return ["POST", "PATCH", "PUT", "DELETE"].includes(method);
 }
 
-function validOrigin(request) {
+function validOrigin(request: any) {
   const origin = request.headers.origin;
   if (!origin) return true;
   try {
@@ -523,33 +524,33 @@ function validOrigin(request) {
   } catch { return false; }
 }
 
-function validHostHeader(request) {
+function validHostHeader(request: any) {
   const host = request.headers.host;
   return typeof host === "string" && validLoopbackHost(host);
 }
 
-function validLoopbackHost(value) {
+function validLoopbackHost(value: any) {
   const host = String(value || "").trim().toLowerCase();
   const match = host.match(/^([^:]+)(?::\d{1,5})?$/) || host.match(/^(\[[0-9a-f:]+\])(?::\d{1,5})?$/);
   if (!match) return false;
   return new Set(["localhost", "127.0.0.1", "[::1]"]).has(match[1]);
 }
 
-function normalizeHost(value) {
+function normalizeHost(value: any) {
   return String(value || "").trim().toLowerCase().replace(/:\d+$/, "");
 }
 
-function hashRequest(value) {
+function hashRequest(value: any) {
   return createHash("sha256").update(stableJson(value)).digest("hex");
 }
 
-function stableJson(value) {
+function stableJson(value: any): any {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key: any) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
   return JSON.stringify(value);
 }
 
-function safeCapsulePath(state, candidate) {
+function safeCapsulePath(state: any, candidate: any) {
   const capsulesRoot = resolve(join(state, "capsules"));
   const target = resolve(capsulesRoot, candidate);
   if (target !== capsulesRoot && !target.startsWith(`${capsulesRoot}${sep}`)) {
@@ -558,7 +559,7 @@ function safeCapsulePath(state, candidate) {
   return target;
 }
 
-async function streamAuditEvents(request, response, auditStore, url) {
+async function streamAuditEvents(request: any, response: any, auditStore: any, url: any) {
   const initial = Number.parseInt(request.headers["last-event-id"] ?? url.searchParams.get("since") ?? "-1", 10);
   let cursor = Number.isFinite(initial) ? Math.max(-1, initial) : -1;
   response.writeHead(200, {
@@ -575,24 +576,24 @@ async function streamAuditEvents(request, response, auditStore, url) {
         response.write(`id: ${index}\ndata: ${JSON.stringify(events[index])}\n\n`);
       }
       cursor = events.length - 1;
-    } catch (error) {
+    } catch (error: any) {
       response.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`);
     }
   }, 500);
   request.on("close", () => clearInterval(poll));
 }
 
-async function readConfig(state) {
+async function readConfig(state: any) {
   const path = join(state, "config.json");
   try {
     const config = JSON.parse(await readFile(path, "utf8"));
     await chmod(path, 0o600);
     return config;
-  } catch (error) {
+  } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
     await mkdir(state, { recursive: true });
     const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig() };
-    await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 }).catch((writeError) => {
+    await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 }).catch((writeError: any) => {
       if (writeError?.code !== "EEXIST") throw writeError;
     });
     await chmod(path, 0o600);
@@ -600,7 +601,7 @@ async function readConfig(state) {
   }
 }
 
-async function readJson(request, { maxBytes = DEFAULT_REQUEST_MAX_BYTES } = {}) {
+async function readJson(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES }: any = {}) {
   const chunks = [];
   let bytes = 0;
   for await (const chunk of request) {
@@ -616,7 +617,7 @@ async function readJson(request, { maxBytes = DEFAULT_REQUEST_MAX_BYTES } = {}) 
   }
 }
 
-function json(response, status, body) {
+function json(response: any, status: any, body: any) {
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
@@ -625,7 +626,7 @@ function json(response, status, body) {
   response.end(`${JSON.stringify(body, null, 2)}\n`);
 }
 
-function html(response, status, body, extraHeaders = {}) {
+function html(response: any, status: any, body: any, extraHeaders: any = {}) {
   response.writeHead(status, {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
@@ -635,7 +636,7 @@ function html(response, status, body, extraHeaders = {}) {
   response.end(body);
 }
 
-function image(response, status, body, contentType) {
+function image(response: any, status: any, body: any, contentType: any) {
   response.writeHead(status, {
     "content-type": contentType,
     "cache-control": "public, max-age=3600",
@@ -644,8 +645,8 @@ function image(response, status, body, contentType) {
   response.end(body);
 }
 
-async function summarizeProviders(config, state) {
-  return Promise.all(Object.entries(config.providers ?? {}).map(async ([name, provider]) => ({
+async function summarizeProviders(config: any, state: any) {
+  return Promise.all(Object.entries(config.providers ?? {}).map(async ([name, provider]: any) => ({
     name,
     type: provider.type ?? "openai-compatible",
     baseUrl: provider.baseUrl,
@@ -658,7 +659,7 @@ async function summarizeProviders(config, state) {
   })));
 }
 
-async function oauthTokenExists(provider, state) {
+async function oauthTokenExists(provider: any, state: any) {
   try {
     await access(oauthTokenPath(provider, state));
     return true;
@@ -2706,7 +2707,7 @@ function renderConsoleHtml() {
         if (!state.browserTabId && tabs[0]) state.browserTabId = tabs[0].id;
         if (state.browserTabId) await inspectBrowserTab(state.browserTabId);
         $("cap-browser-status").textContent = "READY";
-      } catch (error) {
+      } catch (error: any) {
         $("cap-browser-status").textContent = "OFFLINE";
         showOutput(error.message);
       }
@@ -2728,7 +2729,7 @@ function renderConsoleHtml() {
         const result = await api("/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "web.search", input: { query, limit: 6 } }) });
         $("web-search-results").innerHTML = (result.output?.results || []).map(renderWebResult).join("") || '<div class="empty-state"><strong>No results</strong><span>Try a broader query.</span></div>';
         showOutput(result);
-      } catch (error) { showOutput(error.message); }
+      } catch (error: any) { showOutput(error.message); }
       finally { setBusy($("web-search-run"), false); }
     }
 
@@ -2741,7 +2742,7 @@ function renderConsoleHtml() {
         state.browserTabId = result.output?.id || state.browserTabId;
         await refreshBrowser();
         showOutput(result);
-      } catch (error) { showOutput(error.message); }
+      } catch (error: any) { showOutput(error.message); }
       finally { setBusy($("browser-open"), false); }
     }
 
@@ -2797,7 +2798,7 @@ function renderConsoleHtml() {
         await refreshGoals();
         await refreshImprovements();
         await refreshApprovals();
-      } catch (error) {
+      } catch (error: any) {
         $("health").textContent = "Error";
         $("nav-health").textContent = "error";
         $("status-pill").textContent = "Error";
@@ -2958,7 +2959,7 @@ function renderConsoleHtml() {
       try {
         setBusy(event.currentTarget, true);
         await createChat("Gateway beta chat");
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -2987,7 +2988,7 @@ function renderConsoleHtml() {
       try {
         setBusy(event.currentTarget, true);
         await sendChatMessage($("chat-input").value);
-      } catch (error) {
+      } catch (error: any) {
         $("chat-status").textContent = "Error";
         showOutput(error.message);
       } finally {
@@ -3004,7 +3005,7 @@ function renderConsoleHtml() {
       try {
         setBusy(event.currentTarget, true);
         await sendChatMessage("Run a local healthcheck.", { tool: "job.healthcheck" });
-      } catch (error) {
+      } catch (error: any) {
         $("chat-status").textContent = "Error";
         showOutput(error.message);
       } finally {
@@ -3079,7 +3080,7 @@ function renderConsoleHtml() {
           body: JSON.stringify(planTemplates.smoke)
         }));
         await refreshRuns();
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3095,7 +3096,7 @@ function renderConsoleHtml() {
           body: JSON.stringify(body)
         }));
         await refreshRuns();
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3110,7 +3111,7 @@ function renderConsoleHtml() {
           body: $("plan").value
         }));
         await refreshRuns();
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3134,7 +3135,7 @@ function renderConsoleHtml() {
         }));
         await refreshMemory();
         await refreshRuns();
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3152,7 +3153,7 @@ function renderConsoleHtml() {
         showOutput(session);
         await refreshSessions();
         await refreshRuns();
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3169,7 +3170,7 @@ function renderConsoleHtml() {
         }));
         await refreshSessions();
         await refreshRuns();
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3187,7 +3188,7 @@ function renderConsoleHtml() {
         showOutput(goal);
         await refreshGoals();
         await refreshRuns();
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3204,7 +3205,7 @@ function renderConsoleHtml() {
         }));
         await refreshGoals();
         await refreshRuns();
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3226,7 +3227,7 @@ function renderConsoleHtml() {
         showOutput(improvement);
         await refreshImprovements();
         await refreshRuns();
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3238,7 +3239,7 @@ function renderConsoleHtml() {
         showOutput(await api("/improvements/learn", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: 1000 }) }));
         await refreshImprovements();
         await refreshRuns();
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3255,7 +3256,7 @@ function renderConsoleHtml() {
         }));
         await refreshImprovements();
         await refreshRuns();
-      } catch (error) {
+      } catch (error: any) {
         showOutput(error.message);
       } finally {
         setBusy(event.currentTarget, false);
@@ -3289,7 +3290,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    server.close((error) => {
+    server.close((error: any) => {
       if (error) console.error(error);
       process.exitCode = error ? 1 : 0;
     });
@@ -3297,11 +3298,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
   server.listen(port, host, () => {
-    console.log(JSON.stringify({ ok: true, host, port: server.address().port, stateDir }, null, 2));
+    console.log(JSON.stringify({ ok: true, host, port: (server.address() as any).port, stateDir }, null, 2));
   });
 }
 
-function assertLoopbackHost(host) {
+function assertLoopbackHost(host: any) {
   const loopback = new Set(["127.0.0.1", "localhost", "::1"]);
   if (loopback.has(host) || process.env.ODINN_ALLOW_REMOTE === "1") return;
   throw new Error(`refusing non-loopback gateway host ${host}; set ODINN_ALLOW_REMOTE=1 to override`);

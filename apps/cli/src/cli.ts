@@ -216,13 +216,13 @@ Built-in tools:
   improve.decide`);
 }
 
-function option(args, name, fallback) {
+function option(args: any, name: any, fallback: any = undefined) {
   const index = args.indexOf(name);
   if (index === -1) return fallback;
   return args[index + 1] ?? fallback;
 }
 
-function hasFlag(args, name) {
+function hasFlag(args: any, name: any) {
   return args.includes(name);
 }
 
@@ -230,21 +230,21 @@ function invocationRoot() {
   return resolve(process.env.INIT_CWD ?? process.cwd());
 }
 
-function resolveInvocationPath(path) {
+function resolveInvocationPath(path: any) {
   return resolve(invocationRoot(), path);
 }
 
-function stateDir(args) {
+function stateDir(args: any) {
   return resolveInvocationPath(option(args, "--state", ".odinn"));
 }
 
-async function init(args) {
+async function init(args: any) {
   const state = stateDir(args);
   const configPath = await ensureConfig(state);
   await printJson({ ok: true, state, configPath });
 }
 
-async function onboard(args) {
+async function onboard(args: any) {
   const state = stateDir(args);
   const configPath = await ensureConfig(state);
   const provider = option(args, "--provider", "");
@@ -261,7 +261,7 @@ async function onboard(args) {
   console.log(renderOnboarding({ ...current, configPath, runs }));
 }
 
-async function status(args) {
+async function status(args: any) {
   const state = stateDir(args);
   const config = await readConfig(state);
   const models = listConfiguredModels(normalizeModelConfig(config));
@@ -283,7 +283,7 @@ async function status(args) {
   };
 }
 
-async function configCommand(args) {
+async function configCommand(args: any) {
   const [section, subcommand, ...rest] = args;
   if (!["provider", "model", "security", "experimental", "self-improvement"].includes(section)) {
     throw new Error("config requires provider, model, security, experimental, or self-improvement");
@@ -355,7 +355,7 @@ async function configCommand(args) {
     const model = rest[0];
     if (!model) throw new Error("config model default requires provider:model");
     const normalized = normalizeModelConfig(config);
-    if (!listConfiguredModels(normalized).some((entry) => entry.id === model)) throw new Error(`model is not configured: ${model}`);
+    if (!listConfiguredModels(normalized).some((entry: any) => entry.id === model)) throw new Error(`model is not configured: ${model}`);
     config.defaultModel = model;
     await saveConfig(state, config);
     await printJson({ ok: true, defaultModel: model });
@@ -368,7 +368,7 @@ async function configCommand(args) {
   throw new Error("config model requires default or list");
 }
 
-async function configSecurityCommand(state, config, subcommand, args) {
+async function configSecurityCommand(state: any, config: any, subcommand: any, args: any) {
   const policy = createDefaultPolicy(config.policy);
   if (subcommand === "show" || !subcommand) {
     await printJson(policy.security);
@@ -377,7 +377,7 @@ async function configSecurityCommand(state, config, subcommand, args) {
   if (subcommand !== "set") throw new Error("config security requires show or set");
   const surface = option(args, "--surface", "");
   if (!['web', 'browser'].includes(surface)) throw new Error("config security set requires --surface web|browser");
-  const current = { ...policy.security[surface] };
+  const current: any = { ...(policy.security as any)[surface] };
   for (const field of ["enabled", "allowPrivateNetwork", "requireApproval"]) {
     if (field === "requireApproval" && surface !== "browser") continue;
     const value = option(args, `--${kebabCase(field)}`, "");
@@ -398,17 +398,17 @@ async function configSecurityCommand(state, config, subcommand, args) {
   await printJson({ ok: true, surface, security: createDefaultPolicy(config.policy).security });
 }
 
-function kebabCase(value) {
-  return value.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+function kebabCase(value: any) {
+  return value.replace(/[A-Z]/g, (letter: any) => `-${letter.toLowerCase()}`);
 }
 
-function parseBoolean(value, flag) {
+function parseBoolean(value: any, flag: any) {
   if (["true", "1", "yes", "on"].includes(String(value).toLowerCase())) return true;
   if (["false", "0", "no", "off"].includes(String(value).toLowerCase())) return false;
   throw new Error(`${flag} requires true or false`);
 }
 
-async function authCommand(args) {
+async function authCommand(args: any) {
   const [operation, source, ...rest] = args;
   if (operation !== "import" || source !== "openclaw") {
     throw new Error("auth requires import openclaw");
@@ -416,7 +416,7 @@ async function authCommand(args) {
   await importOpenClawOAuth(rest);
 }
 
-async function importOpenClawOAuth(args) {
+async function importOpenClawOAuth(args: any) {
   const state = stateDir(args);
   await ensureConfig(state);
   const providerName = option(args, "--provider", "openai");
@@ -451,7 +451,7 @@ async function importOpenClawOAuth(args) {
   });
 }
 
-async function readOpenClawAuthSource(args) {
+async function readOpenClawAuthSource(args: any) {
   const explicit = option(args, "--source", "");
   const candidates = explicit
     ? [resolveInvocationPath(explicit)]
@@ -461,28 +461,28 @@ async function readOpenClawAuthSource(args) {
         process.env.OPENCLAW_STATE_DIR ? join(process.env.OPENCLAW_STATE_DIR, "agents", "main", "agent", "auth-profiles.json") : "",
         join(homedir(), ".openclaw", "agents", "main", "agent", "openclaw-agent.sqlite"),
         join(homedir(), ".openclaw", "agents", "main", "agent", "auth-profiles.json")
-      ].filter(Boolean).map((candidate) => resolve(candidate));
+      ].filter(Boolean).map((candidate: any) => resolve(candidate));
   const uniqueCandidates = Array.from(new Set(candidates));
   for (const path of uniqueCandidates) {
     try {
       await access(path);
       if (/\.sqlite(?:3)?$/i.test(path)) return readOpenClawSqliteSource(path);
       return readOpenClawJsonSource(path);
-    } catch (error) {
+    } catch (error: any) {
       if (explicit || error?.code !== "ENOENT") throw error;
     }
   }
   throw new Error("OpenClaw auth store not found; pass --source <auth-profiles.json|openclaw-agent.sqlite>");
 }
 
-async function readOpenClawJsonSource(path) {
+async function readOpenClawJsonSource(path: any) {
   const value = JSON.parse(await readFile(path, "utf8"));
   const auth = value?.profiles ? value : value?.auth;
   if (!auth?.profiles || typeof auth.profiles !== "object") throw new Error(`OpenClaw auth source has no profiles: ${path}`);
   return { path, profiles: auth.profiles, state: {} };
 }
 
-async function readOpenClawSqliteSource(path) {
+async function readOpenClawSqliteSource(path: any) {
   let DatabaseSync;
   try {
     ({ DatabaseSync } = await import("node:sqlite"));
@@ -491,9 +491,9 @@ async function readOpenClawSqliteSource(path) {
   }
   const database = new DatabaseSync(path, { readOnly: true });
   try {
-    const store = database.prepare("SELECT store_json FROM auth_profile_store WHERE store_key = ?").get("primary");
+    const store: any = database.prepare("SELECT store_json FROM auth_profile_store WHERE store_key = ?").get("primary");
     if (!store?.store_json) throw new Error(`OpenClaw auth SQLite store has no primary profile store: ${path}`);
-    const state = database.prepare("SELECT state_json FROM auth_profile_state WHERE state_key = ?").get("primary");
+    const state: any = database.prepare("SELECT state_json FROM auth_profile_state WHERE state_key = ?").get("primary");
     const parsedStore = JSON.parse(store.store_json);
     return {
       path,
@@ -505,14 +505,14 @@ async function readOpenClawSqliteSource(path) {
   }
 }
 
-function selectOpenClawProfile(profiles, state, providerName, requestedProfile) {
+function selectOpenClawProfile(profiles: any, state: any, providerName: any, requestedProfile: any) {
   const entries = Object.entries(profiles ?? {})
-    .map(([id, profile]) => ({ id, ...(profile ?? {}) }))
-    .filter((profile) => (profile.provider ?? profile.id.split(":", 1)[0]) === providerName)
-    .filter((profile) => profile.type === "oauth" && (profile.access || profile.refresh));
+    .map(([id, profile]: any) => ({ id, ...(profile ?? {}) }))
+    .filter((profile: any) => (profile.provider ?? profile.id.split(":", 1)[0]) === providerName)
+    .filter((profile: any) => profile.type === "oauth" && (profile.access || profile.refresh));
   if (!entries.length) throw new Error(`OpenClaw has no usable OAuth profile for ${providerName}`);
   if (requestedProfile) {
-    const match = entries.find((profile) => profile.id === requestedProfile || profile.email === requestedProfile || profile.id.endsWith(`:${requestedProfile}`));
+    const match = entries.find((profile: any) => profile.id === requestedProfile || profile.email === requestedProfile || profile.id.endsWith(`:${requestedProfile}`));
     if (!match) throw new Error(`OpenClaw OAuth profile not found: ${requestedProfile}`);
     return match;
   }
@@ -520,13 +520,13 @@ function selectOpenClawProfile(profiles, state, providerName, requestedProfile) 
     state?.lastGood?.[providerName],
     ...(Array.isArray(state?.order?.[providerName]) ? state.order[providerName] : []),
     `${providerName}:default`
-  ].find((id) => entries.some((profile) => profile.id === id));
-  if (preferred) return entries.find((profile) => profile.id === preferred);
+  ].find((id: any) => entries.some((profile: any) => profile.id === id));
+  if (preferred) return entries.find((profile: any) => profile.id === preferred);
   if (entries.length === 1) return entries[0];
-  throw new Error(`OpenClaw has multiple ${providerName} OAuth profiles; pass --profile ${entries.map((profile) => profile.id).join(" or ")}`);
+  throw new Error(`OpenClaw has multiple ${providerName} OAuth profiles; pass --profile ${entries.map((profile: any) => profile.id).join(" or ")}`);
 }
 
-async function importCommand(args) {
+async function importCommand(args: any) {
   const [framework, ...rest] = args;
   if (!["openclaw", "hermes"].includes(framework)) throw new Error("import requires openclaw or hermes");
   const state = stateDir(rest);
@@ -561,7 +561,7 @@ async function importCommand(args) {
   await printJson(result);
 }
 
-async function importFrameworkAuth(framework, root, state, args, dryRun) {
+async function importFrameworkAuth(framework: any, root: any, state: any, args: any, dryRun: any) {
   const source = await readFrameworkAuth(framework, root);
   if (framework === "hermes") {
     const tokens = source.value?.providers?.["openai-codex"]?.tokens;
@@ -590,7 +590,7 @@ async function importFrameworkAuth(framework, root, state, args, dryRun) {
     let profile;
     try {
       profile = selectOpenClawProfile(profiles, sourceState, providerMap.source, "");
-    } catch (error) {
+    } catch (error: any) {
       skipped.push(`${providerMap.source}: ${error.message}`);
       continue;
     }
@@ -615,7 +615,7 @@ async function importFrameworkAuth(framework, root, state, args, dryRun) {
   return { source: source.path, imported, skipped };
 }
 
-async function readFrameworkAuth(framework, root) {
+async function readFrameworkAuth(framework: any, root: any): Promise<any> {
   if (framework === "hermes") {
     const path = root.endsWith("auth.json") ? root : join(root, "auth.json");
     return { path, value: JSON.parse(await readFile(path, "utf8")) };
@@ -627,14 +627,14 @@ async function readFrameworkAuth(framework, root) {
     try {
       await access(path);
       return /\.sqlite(?:3)?$/i.test(path) ? readOpenClawSqliteSource(path) : readOpenClawJsonSource(path);
-    } catch (error) {
+    } catch (error: any) {
       if (error?.code !== "ENOENT") throw error;
     }
   }
   throw new Error(`OpenClaw auth store not found under ${root}`);
 }
 
-async function importFrameworkSkills(framework, root, state, dryRun) {
+async function importFrameworkSkills(framework: any, root: any, state: any, dryRun: any) {
   const directories = framework === "hermes"
     ? [{ label: "global", path: join(root, "skills") }]
     : [
@@ -657,17 +657,17 @@ async function importFrameworkSkills(framework, root, state, dryRun) {
     }
   }
   return {
-    directories: directories.map((directory) => directory.path),
-    skillCount: copied.filter((file) => file.source.endsWith("/SKILL.md")).length,
+    directories: directories.map((directory: any) => directory.path),
+    skillCount: copied.filter((file: any) => file.source.endsWith("/SKILL.md")).length,
     fileCount: copied.length
   };
 }
 
-async function listImportFiles(directory) {
+async function listImportFiles(directory: any): Promise<any[]> {
   try {
     const info = await lstat(directory);
     if (!info.isDirectory()) return [];
-  } catch (error) {
+  } catch (error: any) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
@@ -683,7 +683,7 @@ async function listImportFiles(directory) {
   return files;
 }
 
-async function importFrameworkSupportFiles(framework, root, state, dryRun) {
+async function importFrameworkSupportFiles(framework: any, root: any, state: any, dryRun: any) {
   const candidates = framework === "hermes"
     ? ["SOUL.md", "memories/MEMORY.md", "memories/USER.md"]
     : ["workspace/SOUL.md", "workspace/USER.md", "workspace/AGENTS.md"];
@@ -693,7 +693,7 @@ async function importFrameworkSupportFiles(framework, root, state, dryRun) {
     try {
       const info = await lstat(source);
       if (!info.isFile()) continue;
-    } catch (error) {
+    } catch (error: any) {
       if (error?.code === "ENOENT") continue;
       throw error;
     }
@@ -708,9 +708,9 @@ async function importFrameworkSupportFiles(framework, root, state, dryRun) {
   return copied;
 }
 
-async function addProvider(state, args, name, existingConfig) {
+async function addProvider(state: any, args: any, name: any, existingConfig: any = undefined) {
   const config = existingConfig ?? await readConfig(state);
-  const preset = PROVIDER_PRESETS[name] ?? { type: "openai-compatible", baseUrl: "", apiKeyEnv: "", models: [] };
+  const preset: any = (PROVIDER_PRESETS as any)[name] ?? { type: "openai-compatible", baseUrl: "", apiKeyEnv: "", models: [] };
   const existing = config.providers?.[name];
   const authMode = option(args, "--auth", existing?.auth?.mode ?? preset.defaultAuth ?? preset.auth?.mode ?? "api-key");
   const authPreset = ["oauth", "device", "cli"].includes(authMode)
@@ -724,7 +724,7 @@ async function addProvider(state, args, name, existingConfig) {
   if (!models.length) throw new Error("provider requires at least one --model");
   const apiKeyEnv = authMode === "api-key" ? option(args, "--api-key-env", existing?.apiKeyEnv ?? preset.apiKeyEnv) : "";
   config.providers ??= {};
-  const provider = { type: preset.type, baseUrl, apiKeyEnv, models };
+  const provider: any = { type: preset.type, baseUrl, apiKeyEnv, models };
   if (authPreset.transport ?? preset.transport ?? (sameAuthMode ? existing?.transport : undefined)) provider.transport = authPreset.transport ?? preset.transport ?? existing?.transport;
   if (["oauth", "device", "cli"].includes(authMode)) {
     const previous = sameAuthMode ? existing?.auth ?? {} : authDefaults;
@@ -751,14 +751,14 @@ async function addProvider(state, args, name, existingConfig) {
   config.providers[name] = provider;
   config.policy ??= createDefaultPolicy();
   config.policy.allowedCapabilities = Array.from(new Set([...(config.policy.allowedCapabilities ?? []), "model.chat"]));
-  if (!config.defaultModel || !listConfiguredModels(normalizeModelConfig(config)).some((entry) => entry.id === config.defaultModel)) {
+  if (!config.defaultModel || !listConfiguredModels(normalizeModelConfig(config)).some((entry: any) => entry.id === config.defaultModel)) {
     config.defaultModel = `${name}:${models[0]}`;
   }
   await saveConfig(state, config);
 }
 
-async function summarizeProviders(config, state) {
-  return Promise.all(Object.entries(config.providers ?? {}).map(async ([name, provider]) => ({
+async function summarizeProviders(config: any, state: any) {
+  return Promise.all(Object.entries(config.providers ?? {}).map(async ([name, provider]: any) => ({
     name,
     type: provider.type ?? "openai-compatible",
     baseUrl: provider.baseUrl,
@@ -773,7 +773,7 @@ async function summarizeProviders(config, state) {
   })));
 }
 
-async function oauthTokenExists(provider, state) {
+async function oauthTokenExists(provider: any, state: any) {
   try {
     await access(oauthTokenPath(provider, state));
     return true;
@@ -782,7 +782,7 @@ async function oauthTokenExists(provider, state) {
   }
 }
 
-async function connectOAuth(state, name, args) {
+async function connectOAuth(state: any, name: any, args: any) {
   const config = await readConfig(state);
   const provider = normalizeModelConfig(config).providers[name];
   if (!provider || provider.auth.mode !== "oauth") throw new Error(`OAuth provider not found: ${name}`);
@@ -792,8 +792,8 @@ async function connectOAuth(state, name, args) {
   }
   const configuredRedirect = provider.auth.redirectUri ? new URL(provider.auth.redirectUri) : null;
   const server = createServer();
-  const callback = new Promise((resolveCallback, rejectCallback) => {
-    server.on("request", (request, response) => {
+  const callback = new Promise((resolveCallback: any, rejectCallback: any) => {
+    server.on("request", (request: any, response: any) => {
       try {
         const url = new URL(request.url ?? "/", "http://127.0.0.1");
         const expectedPath = configuredRedirect?.pathname || "/oauth/callback";
@@ -819,7 +819,7 @@ async function connectOAuth(state, name, args) {
         response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
         response.end("<h1>Odinn Forge connected</h1><p>You can close this tab.</p>");
         resolveCallback({ code });
-      } catch (error) {
+      } catch (error: any) {
         rejectCallback(error);
         response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
         response.end(error.message);
@@ -829,11 +829,11 @@ async function connectOAuth(state, name, args) {
   const requestedPort = configuredRedirect?.port
     ? Number.parseInt(configuredRedirect.port, 10)
     : Number.parseInt(option(args, "--oauth-port", "0"), 10);
-  await new Promise((resolveListen, rejectListen) => {
+  await new Promise((resolveListen: any, rejectListen: any) => {
     server.once("error", rejectListen);
     server.listen(Number.isFinite(requestedPort) ? requestedPort : 0, "127.0.0.1", resolveListen);
   });
-  const { port } = server.address();
+  const { port } = server.address() as any;
   const redirectUri = provider.auth.redirectUri || `http://127.0.0.1:${port}/oauth/callback`;
   const authRequest = createOAuthAuthorizationRequest(provider, { redirectUri });
   const timeoutMs = Number.parseInt(option(args, "--oauth-timeout-ms", "120000"), 10);
@@ -849,11 +849,11 @@ async function connectOAuth(state, name, args) {
     const saved = await saveOAuthToken(provider, state, token);
     console.log(`OAuth connected for ${name}. Token stored at ${saved.path}.`);
   } finally {
-    await new Promise((resolveClose) => server.close(() => resolveClose()));
+    await new Promise((resolveClose: any) => server.close(() => resolveClose()));
   }
 }
 
-async function connectOpenRouterOAuth(state, name, provider, args) {
+async function connectOpenRouterOAuth(state: any, name: any, provider: any, args: any) {
   const port = Number.parseInt(option(args, "--oauth-port", "3000"), 10);
   const callbackPort = Number.isFinite(port) && port > 0 ? port : 3000;
   const callbackPath = "/openrouter-oauth/callback";
@@ -868,8 +868,8 @@ async function connectOpenRouterOAuth(state, name, provider, args) {
   authorizationUrl.searchParams.set("code_challenge", codeChallenge);
   authorizationUrl.searchParams.set("code_challenge_method", "S256");
   const server = createServer();
-  const callback = new Promise((resolveCallback, rejectCallback) => {
-    server.on("request", (request, response) => {
+  const callback = new Promise((resolveCallback: any, rejectCallback: any) => {
+    server.on("request", (request: any, response: any) => {
       try {
         const url = new URL(request.url ?? "/", `http://127.0.0.1:${callbackPort}`);
         if (url.pathname !== callbackPath) {
@@ -877,21 +877,21 @@ async function connectOpenRouterOAuth(state, name, provider, args) {
           response.end("Not found");
           return;
         }
-        if (url.searchParams.get("error")) throw new Error(url.searchParams.get("error_description") || url.searchParams.get("error"));
+        if (url.searchParams.get("error")) throw new Error(url.searchParams.get("error_description") || url.searchParams.get("error") || "OAuth error");
         if (url.searchParams.get("state") !== stateValue) throw new Error("OpenRouter OAuth state did not match");
         const code = url.searchParams.get("code");
         if (!code) throw new Error("OpenRouter OAuth callback did not contain a code");
         response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
         response.end("<h1>Odinn Forge connected</h1><p>You can close this tab.</p>");
         resolveCallback(code);
-      } catch (error) {
+      } catch (error: any) {
         rejectCallback(error);
         response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
         response.end(error.message);
       }
     });
   });
-  await new Promise((resolveListen, rejectListen) => {
+  await new Promise((resolveListen: any, rejectListen: any) => {
     server.once("error", rejectListen);
     server.listen(callbackPort, "localhost", resolveListen);
   });
@@ -909,11 +909,11 @@ async function connectOpenRouterOAuth(state, name, provider, args) {
     const saved = await saveOAuthToken(provider, state, { access_token: payload.key });
     console.log(`OAuth connected for ${name}. Token stored at ${saved.path}.`);
   } finally {
-    await new Promise((resolveClose) => server.close(() => resolveClose()));
+    await new Promise((resolveClose: any) => server.close(() => resolveClose()));
   }
 }
 
-async function connectDeviceAuth(state, name, args) {
+async function connectDeviceAuth(state: any, name: any, args: any) {
   const config = await readConfig(state);
   const provider = normalizeModelConfig(config).providers[name];
   if (!provider || provider.auth.mode !== "device") throw new Error(`device provider not found: ${name}`);
@@ -928,7 +928,7 @@ async function connectDeviceAuth(state, name, args) {
   throw new Error(`unsupported device auth flow for ${name}`);
 }
 
-async function connectGitHubCopilot(state, provider, args) {
+async function connectGitHubCopilot(state: any, provider: any, args: any) {
   const clientId = "Iv1.b507a08c87ecfe98";
   const response = await fetch("https://github.com/login/device/code", {
     method: "POST",
@@ -964,7 +964,7 @@ async function connectGitHubCopilot(state, provider, args) {
   console.log(`GitHub Copilot connected. Token stored at ${saved.path}.`);
 }
 
-async function pollGitHubDeviceToken(device, clientId, args) {
+async function pollGitHubDeviceToken(device: any, clientId: any, args: any) {
   const deadline = Date.now() + (Number.parseInt(option(args, "--oauth-timeout-ms", "300000"), 10) || 300000);
   let interval = Math.max(1000, Number(device.interval || 5) * 1000);
   while (Date.now() < deadline) {
@@ -986,7 +986,7 @@ async function pollGitHubDeviceToken(device, clientId, args) {
   throw new Error("GitHub device authorization timed out");
 }
 
-async function connectXaiDevice(state, provider, args) {
+async function connectXaiDevice(state: any, provider: any, args: any) {
   const discoveryResponse = await fetch("https://auth.x.ai/.well-known/openid-configuration", { headers: { accept: "application/json" } });
   const discovery = await readJsonResponse(discoveryResponse);
   if (!discoveryResponse.ok || !isTrustedXaiUrl(discovery.device_authorization_endpoint) || !isTrustedXaiUrl(discovery.token_endpoint)) {
@@ -1008,7 +1008,7 @@ async function connectXaiDevice(state, provider, args) {
   console.log(`xAI OAuth connected. Token stored at ${saved.path}.`);
 }
 
-async function pollXaiDeviceToken(device, tokenEndpoint, clientId, args) {
+async function pollXaiDeviceToken(device: any, tokenEndpoint: any, clientId: any, args: any) {
   const deadline = Date.now() + (Number.parseInt(option(args, "--oauth-timeout-ms", "300000"), 10) || 300000);
   let interval = Math.max(1000, Number(device.interval || 5) * 1000);
   while (Date.now() < deadline) {
@@ -1030,17 +1030,17 @@ async function pollXaiDeviceToken(device, tokenEndpoint, clientId, args) {
   throw new Error("xAI device authorization timed out");
 }
 
-async function connectCliAuth(provider) {
+async function connectCliAuth(provider: any) {
   const command = process.env[provider.auth.commandEnv || "ODINN_ANTIGRAVITY_CLI"] || "agy";
   console.log(`Starting ${command}. Complete sign-in in the CLI, then exit it to finish onboarding.`);
-  await new Promise((resolveExit, rejectExit) => {
+  await new Promise((resolveExit: any, rejectExit: any) => {
     const child = spawn(command, [], { stdio: "inherit" });
     child.once("error", rejectExit);
-    child.once("exit", (code, signal) => code === 0 ? resolveExit() : rejectExit(new Error(`${command} exited with ${code ?? signal}`)));
+    child.once("exit", (code: any, signal: any) => code === 0 ? resolveExit() : rejectExit(new Error(`${command} exited with ${code ?? signal}`)));
   });
 }
 
-async function readJsonResponse(response) {
+async function readJsonResponse(response: any) {
   const raw = await response.text();
   try {
     return raw ? JSON.parse(raw) : {};
@@ -1049,11 +1049,11 @@ async function readJsonResponse(response) {
   }
 }
 
-function oauthErrorMessage(payload) {
+function oauthErrorMessage(payload: any) {
   return payload?.error_description || payload?.message || payload?.error || "request failed";
 }
 
-function isTrustedXaiUrl(value) {
+function isTrustedXaiUrl(value: any) {
   try {
     const url = new URL(value);
     return url.protocol === "https:" && (url.hostname === "x.ai" || url.hostname.endsWith(".x.ai"));
@@ -1062,24 +1062,24 @@ function isTrustedXaiUrl(value) {
   }
 }
 
-function oauthTimeout(args) {
+function oauthTimeout(args: any) {
   const timeout = Number.parseInt(option(args, "--oauth-timeout-ms", "300000"), 10);
   return Number.isFinite(timeout) && timeout > 0 ? timeout : 300000;
 }
 
-function delay(ms) {
-  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+function delay(ms: any) {
+  return new Promise((resolveDelay: any) => setTimeout(resolveDelay, ms));
 }
 
-function withTimeout(promise, timeoutMs, message) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
+function withTimeout(promise: any, timeoutMs: any, message: any) {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise((_: any, reject: any) => {
     timer = setTimeout(() => reject(new Error(message)), timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-function openAuthorizationUrl(url) {
+function openAuthorizationUrl(url: any) {
   const parsed = new URL(url);
   if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("OAuth authorization URL must use http or https");
   const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
@@ -1089,7 +1089,7 @@ function openAuthorizationUrl(url) {
   child.unref();
 }
 
-async function tui(args) {
+async function tui(args: any) {
   const render = async () => {
     const current = await status(args);
     const store = createAuditStore(join(current.state, current.auditLog ?? "audit.jsonl"));
@@ -1104,11 +1104,11 @@ async function tui(args) {
   while (true) {
     process.stdout.write("\x1b[2J\x1b[H");
     console.log(await render());
-    await new Promise((resolve) => setTimeout(resolve, delay));
+    await new Promise((resolve: any) => setTimeout(resolve, delay));
   }
 }
 
-async function run(args) {
+async function run(args: any) {
   if (["show", "events", "verify"].includes(args[0])) {
     await inspectRun(args);
     return;
@@ -1123,7 +1123,7 @@ async function run(args) {
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
   try {
     const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
-    const result = await runTask({
+    const result: any = await runTask({
       task: { tool, input, actor: "cli" },
       auditStore,
       policy: createDefaultPolicy(config.policy),
@@ -1143,7 +1143,7 @@ async function run(args) {
   }
 }
 
-async function plan(args) {
+async function plan(args: any) {
   const state = stateDir(args);
   const file = option(args, "--file");
   if (!file) throw new Error("plan requires --file");
@@ -1164,10 +1164,10 @@ async function plan(args) {
   }
 }
 
-async function inspectRun(args) {
+async function inspectRun(args: any) {
   const operation = args[0];
   const rest = args.slice(1);
-  const runId = option(rest, "--run", rest.find((value) => !value.startsWith("--")));
+  const runId = option(rest, "--run", rest.find((value: any) => !value.startsWith("--")));
   if (!runId) throw new Error(`run ${operation} requires <run-id>`);
   const state = stateDir(rest);
   const config = await readConfig(state);
@@ -1183,7 +1183,7 @@ async function inspectRun(args) {
   }
 }
 
-async function memory(args) {
+async function memory(args: any) {
   const [subcommand, ...rest] = args;
   switch (subcommand) {
     case "remember":
@@ -1249,7 +1249,7 @@ async function memory(args) {
   }
 }
 
-async function extensionCommand(args) {
+async function extensionCommand(args: any) {
   const [subcommand, ...rest] = args;
   const registry = new ExtensionRegistry(join(stateDir(rest), "extensions.json"));
   switch (subcommand ?? "list") {
@@ -1300,7 +1300,7 @@ async function extensionCommand(args) {
   }
 }
 
-async function stateCommand(args) {
+async function stateCommand(args: any) {
   const [subcommand, ...rest] = args;
   const state = stateDir(rest);
   if (subcommand === "backup" || subcommand === "export") {
@@ -1325,13 +1325,13 @@ async function stateCommand(args) {
     const staging = join(parent, `.${state.split(/[\\/]/).pop()}-restore-${process.pid}-${Date.now()}`);
     await cp(source, staging, { recursive: true, force: false, errorOnExist: true });
     const configPath = join(staging, "config.json");
-    try { JSON.parse(await readFile(configPath, "utf8")); } catch (error) { await rm(staging, { recursive: true, force: true }); throw new Error(`state restore source is invalid: ${error.message}`); }
+    try { JSON.parse(await readFile(configPath, "utf8")); } catch (error: any) { await rm(staging, { recursive: true, force: true }); throw new Error(`state restore source is invalid: ${error.message}`); }
     const currentBackup = `${state}.before-restore-${Date.now()}`;
     try {
       await rename(state, currentBackup);
       await rename(staging, state);
       await secureStateTree(state);
-    } catch (error) {
+    } catch (error: any) {
       await rm(staging, { recursive: true, force: true }).catch(() => undefined);
       try { await access(state); } catch { await rename(currentBackup, state).catch(() => undefined); }
       throw error;
@@ -1342,7 +1342,7 @@ async function stateCommand(args) {
   throw new Error("state requires subcommand: backup or restore");
 }
 
-async function secureStateTree(root) {
+async function secureStateTree(root: any) {
   await chmod(root, 0o700);
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const path = join(root, entry.name);
@@ -1354,7 +1354,7 @@ async function secureStateTree(root) {
   }
 }
 
-async function session(args) {
+async function session(args: any) {
   const [subcommand, ...rest] = args;
   switch (subcommand ?? "list") {
     case "create":
@@ -1400,7 +1400,7 @@ async function session(args) {
   }
 }
 
-async function goal(args) {
+async function goal(args: any) {
   const [subcommand, ...rest] = args;
   switch (subcommand ?? "list") {
     case "create":
@@ -1429,7 +1429,7 @@ async function goal(args) {
   }
 }
 
-async function improve(args) {
+async function improve(args: any) {
   const [subcommand, ...rest] = args;
   switch (subcommand ?? "list") {
     case "learn":
@@ -1471,11 +1471,11 @@ async function improve(args) {
   }
 }
 
-async function runMemoryTool(args, tool, input) {
+async function runMemoryTool(args: any, tool: any, input: any) {
   await runRecordTool(args, tool, input);
 }
 
-async function runRecordTool(args, tool, input) {
+async function runRecordTool(args: any, tool: any, input: any) {
   const state = stateDir(args);
   const config = await readConfig(state);
   const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
@@ -1494,17 +1494,17 @@ async function runRecordTool(args, tool, input) {
   }
 }
 
-function runtimeFor(args) {
+function runtimeFor(args: any) {
   const state = stateDir(args);
   return { state, runtime: createDifferentiatedRuntime({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(readConfigSync(state).experimental) }) };
 }
 
-function readConfigSync(state) {
+function readConfigSync(state: any) {
   try { return JSON.parse(readFileSync(join(state, "config.json"), "utf8")); }
   catch { return { experimental: normalizeExperimentalFlags() }; }
 }
 
-async function proof(args) {
+async function proof(args: any) {
   const [subcommand, ...rest] = args;
   if (subcommand === "contract" && rest[0] === "validate") {
     const path = rest[1]; if (!path) throw new Error("proof contract validate requires a contract path");
@@ -1513,7 +1513,7 @@ async function proof(args) {
   const { runtime } = runtimeFor(rest);
   try {
     if (subcommand === "run") {
-      const runId = rest.find((value) => !value.startsWith("--")); const path = option(rest, "--contract"); if (!runId || !path) throw new Error("proof run requires <run-id> and --contract");
+      const runId = rest.find((value: any) => !value.startsWith("--")); const path = option(rest, "--contract"); if (!runId || !path) throw new Error("proof run requires <run-id> and --contract");
       const contract = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path);
       if (contract.schemaVersion === 1) {
         if (contract.runId !== runId) throw new Error("proof contract runId must match the requested run");
@@ -1523,33 +1523,33 @@ async function proof(args) {
       }
       return;
     }
-    if (subcommand === "show") { const runId = rest.find((value) => !value.startsWith("--")); if (!runId) throw new Error("proof show requires <run-id>"); await printJson(runtime.proof.show(runId)); return; }
+    if (subcommand === "show") { const runId = rest.find((value: any) => !value.startsWith("--")); if (!runId) throw new Error("proof show requires <run-id>"); await printJson(runtime.proof.show(runId)); return; }
     throw new Error("proof requires run, show, or contract validate");
   } finally { runtime.ledger.close(); }
 }
 
-async function policyCommand(args) {
-  const [subcommand, ...rest] = args; const path = rest.find((value) => !value.startsWith("--")); if (!path) throw new Error("policy requires a policy path");
+async function policyCommand(args: any) {
+  const [subcommand, ...rest] = args; const path = rest.find((value: any) => !value.startsWith("--")); if (!path) throw new Error("policy requires a policy path");
   const policy = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path); validatePolicy(policy);
   if (subcommand === "validate") { await printJson({ valid: true, policy }); return; }
   if (subcommand !== "test") throw new Error("policy requires validate or test");
   const { runtime } = runtimeFor(rest); try { const runId = `policy-test-${randomUUID()}`; runtime.ledger.ensureRun({ runId, objective: "policy test" }); const result = runtime.sentinel.evaluate({ runId, toolName: option(rest, "--tool"), input: JSON.parse(option(rest, "--input-json", "{}")), policy }); await printJson(result); } finally { runtime.ledger.close(); }
 }
 
-async function capabilityCommand(args) {
+async function capabilityCommand(args: any) {
   const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest);
   try {
     if (subcommand === "issue") { const result = runtime.capabilities.issue({ runId: option(rest, "--run"), stepId: option(rest, "--step"), toolName: option(rest, "--tool"), scopes: splitCsv(option(rest, "--scope", "")), resourceConstraints: JSON.parse(option(rest, "--constraints", "{}")), expiresInMs: Number(option(rest, "--expires-ms", "60000")), maxUses: Number(option(rest, "--max-uses", "1")) }); await printJson(hasFlag(rest, "--show-token") ? result : { claims: result.claims, token: "[hidden; use --show-token only for a one-time local test]" }); return; }
     if (subcommand === "use") { await printJson(runtime.capabilities.consume(option(rest, "--token"), { runId: option(rest, "--run"), toolName: option(rest, "--tool"), resource: JSON.parse(option(rest, "--resource", "{}")) })); return; }
-    if (subcommand === "list") { await printJson(runtime.capabilities.list(rest.find((value) => !value.startsWith("--")))); return; }
-    if (subcommand === "revoke") { await printJson(runtime.capabilities.revoke(rest.find((value) => !value.startsWith("--")))); return; }
+    if (subcommand === "list") { await printJson(runtime.capabilities.list(rest.find((value: any) => !value.startsWith("--")))); return; }
+    if (subcommand === "revoke") { await printJson(runtime.capabilities.revoke(rest.find((value: any) => !value.startsWith("--")))); return; }
     throw new Error("capability requires issue, use, list, or revoke");
   } finally { runtime.ledger.close(); }
 }
 
-async function timeline(args) {
+async function timeline(args: any) {
   const { runtime } = runtimeFor(args); try {
-    const runId = args.find((value) => !value.startsWith("--"));
+    const runId = args.find((value: any) => !value.startsWith("--"));
     const run = runtime.ledger.getRun(runId);
     if (!run) throw new Error(`run not found: ${runId}`);
     const { steps, events, ...metadata } = run;
@@ -1557,23 +1557,23 @@ async function timeline(args) {
   } finally { runtime.ledger.close(); }
 }
 
-async function rewindCommand(command, args) {
+async function rewindCommand(command: any, args: any) {
   const { runtime } = runtimeFor(args); try {
     if (command === "checkpoint") { if (args[0] !== "create") throw new Error("checkpoint requires create"); const runId = args[1] && !args[1].startsWith("--") ? args[1] : option(args, "--run"); await printJson(runtime.snapshots.create({ runId, paths: splitCsv(option(args, "--path", "")), label: option(args, "--label", "checkpoint"), workspaceRoot: invocationRoot() })); return; }
-    const snapshotId = args.find((value) => !value.startsWith("--")); if (!snapshotId) throw new Error("rewind requires <snapshot-id>"); await printJson(runtime.snapshots.restore(snapshotId, { apply: hasFlag(args, "--apply") }));
+    const snapshotId = args.find((value: any) => !value.startsWith("--")); if (!snapshotId) throw new Error("rewind requires <snapshot-id>"); await printJson(runtime.snapshots.restore(snapshotId, { apply: hasFlag(args, "--apply") }));
   } finally { runtime.ledger.close(); }
 }
 
-async function branchCommand(command, args) {
+async function branchCommand(command: any, args: any) {
   const { runtime } = runtimeFor(args); try {
     if (command === "branch") { const path = option(args, "--plan-file"); const plan = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path); await printJson(await runtime.counterfactual.create({ sourceRunId: args[0], sourceStepId: option(args, "--from"), plans: [plan], workspaceRoot: invocationRoot() })); return; }
     await printJson(runtime.counterfactual.compare(args[0]));
   } finally { runtime.ledger.close(); }
 }
 
-async function capsuleCommand(args) {
+async function capsuleCommand(args: any) {
   const [subcommand, ...rest] = args; const { state, runtime } = runtimeFor(rest); try {
-    const path = rest.find((value) => !value.startsWith("--"));
+    const path = rest.find((value: any) => !value.startsWith("--"));
     if (subcommand === "export") await printJson(await runtime.capsules.export(path, { output: option(rest, "--output") }));
     else if (subcommand === "inspect" || subcommand === "verify") await printJson(await runtime.capsules.verify(path));
     else if (subcommand === "replay") {
@@ -1584,7 +1584,7 @@ async function capsuleCommand(args) {
         mode,
         workspace: option(rest, "--workspace", ""),
         approveExternal: hasFlag(rest, "--approve-external"),
-        executor: mode === "full" ? async ({ tool, input, replayRunId, stepIndex, workspaceRoot }) => {
+        executor: mode === "full" ? async ({ tool, input, replayRunId, stepIndex, workspaceRoot }: any) => {
           const taskId = `${replayRunId}-step-${stepIndex}`;
           if (runtime.ledger.featureFlags.capabilities === true) {
             const issued = runtime.capabilities.issue({ runId: taskId, stepId: `replay-step-${stepIndex}`, toolName: tool, scopes: [tool], resourceConstraints: input.resource ?? {} });
@@ -1604,11 +1604,11 @@ async function capsuleCommand(args) {
   } finally { runtime.ledger.close(); }
 }
 
-async function counterfactualCommand(args) {
+async function counterfactualCommand(args: any) {
   const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); try {
     if (subcommand === "run") {
       const files = []; for (let i = 0; i < rest.length; i += 1) if (rest[i] === "--plan-file") files.push(rest[i + 1]);
-      const created = await runtime.counterfactual.create({ sourceRunId: option(rest, "--source-run"), sourceStepId: option(rest, "--from"), plans: await Promise.all(files.map(async (file) => parseStructuredDocument(await readFile(resolveInvocationPath(file), "utf8"), file))), workspaceRoot: invocationRoot() });
+      const created = await runtime.counterfactual.create({ sourceRunId: option(rest, "--source-run"), sourceStepId: option(rest, "--from"), plans: await Promise.all(files.map(async (file: any) => parseStructuredDocument(await readFile(resolveInvocationPath(file), "utf8"), file))), workspaceRoot: invocationRoot() });
       if (!hasFlag(rest, "--execute")) { await printJson(created); return; }
       const config = await readConfig(stateDir(rest));
       const auditStore = createAuditStore(join(stateDir(rest), config.auditLog ?? "audit.jsonl"));
@@ -1618,7 +1618,7 @@ async function counterfactualCommand(args) {
         capabilities: runtime.capabilities,
         policy: createDefaultPolicy(config.policy),
         workspaceRoot: invocationRoot(),
-        executor: async (task, context) => runTask({ task, auditStore, policy: context.policy, registry: createBuiltInRegistry({ workspaceRoot: context.workspaceRoot, stateDir: stateDir(rest), config, auditStore }), runLedger: runtime.ledger })
+        executor: async (task: any, context: any) => runTask({ task, auditStore, policy: context.policy, registry: createBuiltInRegistry({ workspaceRoot: context.workspaceRoot, stateDir: stateDir(rest), config, auditStore }), runLedger: runtime.ledger })
       });
       await printJson({ ...created, execution: result });
       return;
@@ -1629,7 +1629,7 @@ async function counterfactualCommand(args) {
   } finally { runtime.ledger.close(); }
 }
 
-async function routingCommand(args) {
+async function routingCommand(args: any) {
   const [subcommand, ...rest] = args; const { runtime } = runtimeFor(rest); try {
     if (subcommand === "observe") { await printJson(runtime.darwin.observe({ runId: option(rest, "--run"), providerId: option(rest, "--provider"), modelId: option(rest, "--model"), taskClass: option(rest, "--task-class", "general"), verified: option(rest, "--verified") === "true", partiallyVerified: option(rest, "--partial") === "true", durationMs: Number(option(rest, "--duration-ms", "0")), costUsd: Number(option(rest, "--cost-usd", "0")), toolCalls: Number(option(rest, "--tool-calls", "0")), toolErrors: Number(option(rest, "--tool-errors", "0")), retries: Number(option(rest, "--retries", "0")), policyViolations: Number(option(rest, "--policy-violations", "0")), rolledBack: hasFlag(rest, "--rolled-back") })); return; }
     if (subcommand === "stats") { await printJson(runtime.darwin.stats(option(rest, "--task-class", "general"))); return; }
@@ -1638,11 +1638,11 @@ async function routingCommand(args) {
   } finally { runtime.ledger.close(); }
 }
 
-async function audit(args) {
+async function audit(args: any) {
   const state = stateDir(args);
   const config = await readConfig(state);
   const store = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
-  const subcommand = args.find((value) => !value.startsWith("--"));
+  const subcommand = args.find((value: any) => !value.startsWith("--"));
   if (subcommand === "verify") {
     await printJson(await store.verifyIntegrity({ allowUnsigned: hasFlag(args, "--allow-unsigned") }));
     return;
@@ -1654,7 +1654,7 @@ async function audit(args) {
   await printJson(await store.readAll());
 }
 
-async function runs(args) {
+async function runs(args: any) {
   const state = stateDir(args);
   const config = await readConfig(state);
   const limit = Number.parseInt(option(args, "--limit", "20"), 10);
@@ -1662,7 +1662,7 @@ async function runs(args) {
   await printJson((await store.readRuns()).slice(0, Number.isFinite(limit) ? limit : 20));
 }
 
-async function show(args) {
+async function show(args: any) {
   const state = stateDir(args);
   const runId = option(args, "--run");
   if (!runId) throw new Error("show requires --run");
@@ -1673,17 +1673,17 @@ async function show(args) {
   await printJson(run);
 }
 
-async function readConfig(state) {
+async function readConfig(state: any) {
   const path = join(state, "config.json");
   try {
     return JSON.parse(await readFile(path, "utf8"));
-  } catch (error) {
+  } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
     return { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: normalizeExperimentalFlags(), selfImprovement: normalizeSelfImprovementConfig() };
   }
 }
 
-async function ensureConfig(state) {
+async function ensureConfig(state: any) {
   const configPath = join(state, "config.json");
   await mkdir(state, { recursive: true });
   await writeFile(configPath, `${JSON.stringify({
@@ -1694,13 +1694,13 @@ async function ensureConfig(state) {
     defaultModel: "",
     experimental: normalizeExperimentalFlags(),
     selfImprovement: normalizeSelfImprovementConfig()
-  }, null, 2)}\n`, { flag: "wx" }).catch((error) => {
+  }, null, 2)}\n`, { flag: "wx" }).catch((error: any) => {
     if (error?.code !== "EEXIST") throw error;
   });
   return configPath;
 }
 
-async function saveConfig(state, config) {
+async function saveConfig(state: any, config: any) {
   await mkdir(state, { recursive: true });
   await writeFile(join(state, "config.json"), `${JSON.stringify({
     version: config.version ?? 1,
@@ -1714,9 +1714,9 @@ async function saveConfig(state, config) {
   }, null, 2)}\n`);
 }
 
-function renderOnboarding({ state, workspaceRoot, configPath, tools, allowedCapabilities, providers, defaultModel, runs }) {
+function renderOnboarding({ state, workspaceRoot, configPath, tools, allowedCapabilities, providers, defaultModel, runs }: any) {
   const providerLines = providers.length
-    ? providers.map((provider) => `  - ${provider.name} [${provider.authMode}]: ${provider.models.join(", ")} (${provider.baseUrl})${provider.configured ? "" : provider.authMode === "oauth" ? " [not connected]" : provider.apiKeyEnv ? " [credential missing]" : ""}`)
+    ? providers.map((provider: any) => `  - ${provider.name} [${provider.authMode}]: ${provider.models.join(", ")} (${provider.baseUrl})${provider.configured ? "" : provider.authMode === "oauth" ? " [not connected]" : provider.apiKeyEnv ? " [credential missing]" : ""}`)
     : ["  - none"];
   return [
     "Odinn Forge local onboarding",
@@ -1726,16 +1726,16 @@ function renderOnboarding({ state, workspaceRoot, configPath, tools, allowedCapa
     `Workspace: ${workspaceRoot}`,
     "",
     "Available tools:",
-    ...tools.map((tool) => `  - ${tool}`),
+    ...tools.map((tool: any) => `  - ${tool}`),
     "",
     "Allowed capabilities:",
-    ...allowedCapabilities.map((capability) => `  - ${capability}`),
+    ...allowedCapabilities.map((capability: any) => `  - ${capability}`),
     "",
     "Configured providers:",
     ...providerLines,
     `Default model: ${defaultModel || "(none)"}`,
     "",
-    `Provider presets: ${listProviderPresets().map((provider) => provider.name).join(", ")}`,
+    `Provider presets: ${listProviderPresets().map((provider: any) => provider.name).join(", ")}`,
     "Use a preset without passing URLs:",
     "  pnpm odinn onboard --provider <preset> --state .odinn",
     "  pnpm odinn config provider catalog",
@@ -1758,7 +1758,7 @@ function renderOnboarding({ state, workspaceRoot, configPath, tools, allowedCapa
   ].join("\n");
 }
 
-function renderTui({ state, workspaceRoot, tools, allowedCapabilities, runs }) {
+function renderTui({ state, workspaceRoot, tools, allowedCapabilities, runs }: any) {
   const recent = runs.slice(0, 8);
   return [
     "Odinn Forge TUI",
@@ -1771,7 +1771,7 @@ function renderTui({ state, workspaceRoot, tools, allowedCapabilities, runs }) {
     "Recent runs",
     "-----------",
     recent.length
-      ? recent.map((run) => `${run.status.padEnd(9)} ${run.id} ${run.tool ?? ""} ${run.message ?? ""}`.trimEnd()).join("\n")
+      ? recent.map((run: any) => `${run.status.padEnd(9)} ${run.id} ${run.tool ?? ""} ${run.message ?? ""}`.trimEnd()).join("\n")
       : "No runs recorded yet.",
     "",
     "Commands",
@@ -1783,21 +1783,21 @@ function renderTui({ state, workspaceRoot, tools, allowedCapabilities, runs }) {
   ].join("\n");
 }
 
-function splitCsv(value) {
+function splitCsv(value: any) {
   return String(value ?? "")
     .split(",")
-    .map((item) => item.trim())
+    .map((item: any) => item.trim())
     .filter(Boolean);
 }
 
-async function printJson(value) {
+async function printJson(value: any) {
   console.log(JSON.stringify(redactOutput(value), null, 2));
 }
 
-function redactOutput(value) {
-  if (Array.isArray(value)) return value.map((item) => redactOutput(item));
+function redactOutput(value: any): any {
+  if (Array.isArray(value)) return value.map((item: any) => redactOutput(item));
   if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+  return Object.fromEntries(Object.entries(value).map(([key, item]: any) => [
     key,
     /(?:api.?key(?!env)|access.?token|refresh.?token|client.?secret(?!env)|password|authorization)/i.test(key)
       ? "[redacted]"
@@ -1805,7 +1805,7 @@ function redactOutput(value) {
   ]));
 }
 
-main().catch((error) => {
+main().catch((error: any) => {
   console.error(error.message);
   process.exitCode = 1;
 });

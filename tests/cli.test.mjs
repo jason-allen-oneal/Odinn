@@ -10,14 +10,14 @@ const root = new URL("..", import.meta.url).pathname;
 
 test("CLI runs a deterministic tool through the audited kernel path", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-"));
-  const init = spawnSync("node", ["apps/cli/src/cli.mjs", "init", "--state", state], {
+  const init = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], {
     cwd: root,
     encoding: "utf8"
   });
   assert.equal(init.status, 0, init.stderr || init.stdout);
 
   const run = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "run",
     "--state",
     state,
@@ -36,7 +36,7 @@ test("CLI runs a deterministic tool through the audited kernel path", async () =
   const audit = (await readFile(join(state, "audit.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(audit.map((event) => event.type), ["task.policy", "task.started", "task.completed"]);
 
-  const runs = spawnSync("node", ["apps/cli/src/cli.mjs", "runs", "--state", state], {
+  const runs = spawnSync("node", ["apps/cli/src/cli.ts", "runs", "--state", state], {
     cwd: root,
     encoding: "utf8"
   });
@@ -45,7 +45,7 @@ test("CLI runs a deterministic tool through the audited kernel path", async () =
   assert.equal(summary.status, "completed");
   assert.equal(summary.tool, "text.echo");
 
-  const show = spawnSync("node", ["apps/cli/src/cli.mjs", "show", "--state", state, "--run", result.id], {
+  const show = spawnSync("node", ["apps/cli/src/cli.ts", "show", "--state", state, "--run", result.id], {
     cwd: root,
     encoding: "utf8"
   });
@@ -67,7 +67,7 @@ test("CLI runs a deterministic JSON plan", async () => {
     ]
   })}\n`);
 
-  const run = spawnSync("node", ["apps/cli/src/cli.mjs", "plan", "--state", state, "--file", planPath], {
+  const run = spawnSync("node", ["apps/cli/src/cli.ts", "plan", "--state", state, "--file", planPath], {
     cwd: root,
     encoding: "utf8"
   });
@@ -76,7 +76,7 @@ test("CLI runs a deterministic JSON plan", async () => {
   assert.equal(result.id, "plan_cli");
   assert.equal(result.steps[1].result.output.text, "ODINN_PLAN_CLI_OK");
 
-  const runs = spawnSync("node", ["apps/cli/src/cli.mjs", "runs", "--state", state], {
+  const runs = spawnSync("node", ["apps/cli/src/cli.ts", "runs", "--state", state], {
     cwd: root,
     encoding: "utf8"
   });
@@ -89,7 +89,7 @@ test("CLI runs a deterministic JSON plan", async () => {
 test("CLI run creates and inspects a durable Phase 0 ledger record", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-ledger-"));
   const executed = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "run",
     "--tool",
     "text.echo",
@@ -102,13 +102,13 @@ test("CLI run creates and inspects a durable Phase 0 ledger record", async () =>
   const result = JSON.parse(executed.stdout);
   assert.equal(result.output.text, "ODINN_CLI_LEDGER_OK");
 
-  const shown = spawnSync("node", ["apps/cli/src/cli.mjs", "run", "show", result.id, "--state", state], { cwd: root, encoding: "utf8" });
+  const shown = spawnSync("node", ["apps/cli/src/cli.ts", "run", "show", result.id, "--state", state], { cwd: root, encoding: "utf8" });
   assert.equal(shown.status, 0, shown.stderr || shown.stdout);
   const run = JSON.parse(shown.stdout);
   assert.equal(run.status, "completed-unverified");
   assert.equal(run.steps[0].type, "tool-request");
 
-  const verified = spawnSync("node", ["apps/cli/src/cli.mjs", "run", "verify", result.id, "--state", state], { cwd: root, encoding: "utf8" });
+  const verified = spawnSync("node", ["apps/cli/src/cli.ts", "run", "verify", result.id, "--state", state], { cwd: root, encoding: "utf8" });
   assert.equal(verified.status, 0, verified.stderr || verified.stdout);
   assert.equal(JSON.parse(verified.stdout).valid, true);
 });
@@ -116,7 +116,7 @@ test("CLI run creates and inspects a durable Phase 0 ledger record", async () =>
 test("CLI resolves filtered pnpm relative paths from the invocation root", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-filtered-"));
   const run = spawnSync("node", [
-    "src/cli.mjs",
+    "src/cli.ts",
     "plan",
     "--state",
     state,
@@ -135,7 +135,7 @@ test("CLI resolves filtered pnpm relative paths from the invocation root", async
 
 test("CLI onboarding and TUI expose a local beta entrypoint", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-onboard-"));
-  const onboard = spawnSync("node", ["apps/cli/src/cli.mjs", "onboard", "--state", state], {
+  const onboard = spawnSync("node", ["apps/cli/src/cli.ts", "onboard", "--state", state], {
     cwd: root,
     encoding: "utf8"
   });
@@ -143,7 +143,7 @@ test("CLI onboarding and TUI expose a local beta entrypoint", async () => {
   assert.match(onboard.stdout, /Odinn Forge local onboarding/);
   assert.match(onboard.stdout, /pnpm --filter @odinn\/cli start -- tui/);
 
-  const tui = spawnSync("node", ["apps/cli/src/cli.mjs", "tui", "--state", state], {
+  const tui = spawnSync("node", ["apps/cli/src/cli.ts", "tui", "--state", state], {
     cwd: root,
     encoding: "utf8"
   });
@@ -155,7 +155,7 @@ test("CLI onboarding and TUI expose a local beta entrypoint", async () => {
 test("CLI onboarding configures a provider without storing a secret", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-provider-"));
   const onboard = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "onboard",
     "--state",
     state,
@@ -177,17 +177,17 @@ test("CLI onboarding configures a provider without storing a secret", async () =
 
 test("CLI exposes explicit security posture controls", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-security-"));
-  const init = spawnSync("node", ["apps/cli/src/cli.mjs", "init", "--state", state], { cwd: root, encoding: "utf8" });
+  const init = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], { cwd: root, encoding: "utf8" });
   assert.equal(init.status, 0, init.stderr || init.stdout);
   const set = spawnSync("node", [
-    "apps/cli/src/cli.mjs", "config", "security", "set", "--state", state,
+    "apps/cli/src/cli.ts", "config", "security", "set", "--state", state,
     "--surface", "browser", "--require-approval", "false", "--allowed-domains", "example.com"
   ], { cwd: root, encoding: "utf8" });
   assert.equal(set.status, 0, set.stderr || set.stdout);
   const config = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
   assert.equal(config.policy.security.browser.requireApproval, false);
   assert.deepEqual(config.policy.security.browser.allowedDomains, ["example.com"]);
-  const show = spawnSync("node", ["apps/cli/src/cli.mjs", "config", "security", "show", "--state", state], { cwd: root, encoding: "utf8" });
+  const show = spawnSync("node", ["apps/cli/src/cli.ts", "config", "security", "show", "--state", state], { cwd: root, encoding: "utf8" });
   assert.equal(show.status, 0, show.stderr || show.stdout);
   assert.match(show.stdout, /allowPrivateNetwork/);
 });
@@ -212,7 +212,7 @@ test("CLI onboarding completes an OAuth PKCE callback locally", async () => {
   const { port } = oauth.address();
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-oauth-"));
   const child = spawn("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "onboard",
     "--state",
     state,
@@ -265,7 +265,7 @@ test("CLI onboarding completes an OAuth PKCE callback locally", async () => {
 test("CLI has a built-in OpenAI OAuth preset", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-openai-oauth-preset-"));
   const configured = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "config",
     "provider",
     "add",
@@ -285,7 +285,7 @@ test("CLI has a built-in OpenAI OAuth preset", async () => {
 
 test("CLI exposes URL-free presets for hosted and local providers", async () => {
   const catalog = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "config",
     "provider",
     "catalog"
@@ -311,7 +311,7 @@ test("CLI wires provider-specific OAuth and Antigravity auth modes", async () =>
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-provider-auth-"));
   for (const provider of ["openrouter", "chutes", "github-copilot", "xai-oauth", "antigravity"]) {
     const configured = spawnSync("node", [
-      "apps/cli/src/cli.mjs",
+      "apps/cli/src/cli.ts",
       "config",
       "provider",
       "add",
@@ -355,7 +355,7 @@ test("CLI imports an OpenClaw OAuth profile without putting tokens in config", a
     }
   })}\n`);
   const imported = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "auth",
     "import",
     "openclaw",
@@ -390,7 +390,7 @@ test("CLI imports Hermes auth, skills, and support files into isolated state", a
   await writeFile(join(source, "SOUL.md"), "Imported Hermes persona.\n");
 
   const imported = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "import",
     "hermes",
     "--source",
@@ -414,7 +414,7 @@ test("CLI imports Hermes auth, skills, and support files into isolated state", a
 test("CLI stores and searches typed memory records", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-memory-"));
   const remember = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "memory",
     "remember",
     "--state",
@@ -436,7 +436,7 @@ test("CLI stores and searches typed memory records", async () => {
   assert.equal(stored.kind, "preference");
 
   const search = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "memory",
     "search",
     "--state",
@@ -451,7 +451,7 @@ test("CLI stores and searches typed memory records", async () => {
   const found = JSON.parse(search.stdout);
   assert.equal(found.memories[0].id, stored.id);
 
-  const curated = spawnSync("node", ["apps/cli/src/cli.mjs", "memory", "curate", "--state", state], {
+  const curated = spawnSync("node", ["apps/cli/src/cli.ts", "memory", "curate", "--state", state], {
     cwd: root,
     encoding: "utf8"
   });
@@ -464,7 +464,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-records-"));
 
   const createSession = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "session",
     "create",
     "--state",
@@ -480,7 +480,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   assert.equal(session.type, "session.created");
 
   const message = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "session",
     "message",
     "--state",
@@ -498,7 +498,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   assert.equal(message.status, 0, message.stderr || message.stdout);
 
   const readSession = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "session",
     "read",
     "--state",
@@ -515,7 +515,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   assert.equal(sessionDetail.messages[0].content, "Build the memory spine.");
 
   const renameSession = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "session",
     "rename",
     "--state",
@@ -529,7 +529,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   assert.equal(JSON.parse(renameSession.stdout).type, "session.renamed");
 
   const deleteSession = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "session",
     "delete",
     "--state",
@@ -541,7 +541,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   assert.equal(JSON.parse(deleteSession.stdout).type, "session.deleted");
 
   const createGoal = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "goal",
     "create",
     "--state",
@@ -556,7 +556,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   const goal = JSON.parse(createGoal.stdout);
 
   const updateGoal = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "goal",
     "update",
     "--state",
@@ -573,7 +573,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   });
   assert.equal(updateGoal.status, 0, updateGoal.stderr || updateGoal.stdout);
 
-  const listGoals = spawnSync("node", ["apps/cli/src/cli.mjs", "goal", "list", "--state", state], {
+  const listGoals = spawnSync("node", ["apps/cli/src/cli.ts", "goal", "list", "--state", state], {
     cwd: root,
     encoding: "utf8"
   });
@@ -581,7 +581,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   assert.equal(JSON.parse(listGoals.stdout).goals[0].status, "blocked");
 
   const propose = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "improve",
     "propose",
     "--state",
@@ -598,7 +598,7 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   const improvement = JSON.parse(propose.stdout);
 
   const decide = spawnSync("node", [
-    "apps/cli/src/cli.mjs",
+    "apps/cli/src/cli.ts",
     "improve",
     "decide",
     "--state",
@@ -615,14 +615,14 @@ test("CLI records sessions, goals, and self-improvement proposals", async () => 
   });
   assert.equal(decide.status, 0, decide.stderr || decide.stdout);
 
-  const listImprovements = spawnSync("node", ["apps/cli/src/cli.mjs", "improve", "list", "--state", state], {
+  const listImprovements = spawnSync("node", ["apps/cli/src/cli.ts", "improve", "list", "--state", state], {
     cwd: root,
     encoding: "utf8"
   });
   assert.equal(listImprovements.status, 0, listImprovements.stderr || listImprovements.stdout);
   assert.equal(JSON.parse(listImprovements.stdout).improvements[0].status, "approved");
 
-  const learned = spawnSync("node", ["apps/cli/src/cli.mjs", "improve", "learn", "--state", state, "--limit", "100"], {
+  const learned = spawnSync("node", ["apps/cli/src/cli.ts", "improve", "learn", "--state", state, "--limit", "100"], {
     cwd: root,
     encoding: "utf8"
   });

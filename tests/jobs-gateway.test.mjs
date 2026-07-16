@@ -5,7 +5,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createGatewayServer } from "../apps/gateway/src/server.mjs";
+import { createGatewayServer } from "../apps/gateway/src/server.ts";
 
 test("gateway exposes durable jobs with idempotent submission", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-jobs-"));

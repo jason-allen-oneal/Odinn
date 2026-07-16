@@ -4,10 +4,11 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/server.mjs"
+    ".": "./src/server.ts"
   },
   "scripts": {
-    "start": "node ./src/server.mjs"
+    "start": "node ./src/server.ts",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "@odinn/kernel": "workspace:*",

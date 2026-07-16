@@ -53,7 +53,7 @@ export async function runInferenceProtocolSmoke() {
     }
   }, null, 2)}\n`);
 
-  const child = spawn(process.execPath, ["apps/gateway/src/server.mjs"], {
+  const child = spawn(process.execPath, ["apps/gateway/src/server.ts"], {
     cwd: root,
     env: { ...process.env, INIT_CWD: root, ODINN_PORT: "0", ODINN_STATE_DIR: stateDir, ODINN_CI_PROVIDER_KEY: "ci-provider-key" },
     stdio: ["ignore", "pipe", "pipe"]

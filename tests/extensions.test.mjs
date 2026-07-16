@@ -24,7 +24,7 @@ test("extension manifests are disabled, grant-scoped, provenance-aware, and roll
     id: "example-tool",
     version: "1.0.0",
     type: "mcp",
-    entrypoint: "node server.mjs",
+    entrypoint: "node server.ts",
     capabilities: ["web.read"],
     sandbox: "process"
   });

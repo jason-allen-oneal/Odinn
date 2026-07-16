@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const state = await mkdtemp(join(tmpdir(), "odinn-onboarding-") );
 const result = await new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, ["apps/cli/src/cli.mjs", "onboard", "--state", state], {
+  const child = spawn(process.execPath, ["apps/cli/src/cli.ts", "onboard", "--state", state], {
     cwd: root,
     env: { ...process.env, ODINN_GATEWAY_AUTH: "off" },
     stdio: ["ignore", "pipe", "pipe"]

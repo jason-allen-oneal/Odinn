@@ -9,7 +9,7 @@ Passwords are read from the environment and stored only as scrypt hashes in an o
 ```bash
 ODINN_HOST_STATE=/srv/odinn-host \
 ODINN_USER_PASSWORD='use-a-password-manager-generated-secret' \
-node apps/gateway/src/host.mjs user-add \
+node apps/gateway/src/host.ts user-add \
   --id alice \
   --workspace /srv/odinn-workspaces/alice
 ```

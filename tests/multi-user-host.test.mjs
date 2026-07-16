@@ -3,7 +3,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createMultiUserHost, hashPassword } from "../apps/gateway/src/host.mjs";
+import { createMultiUserHost, hashPassword } from "../apps/gateway/src/host.ts";
 
 test("multi-user host authenticates and isolates each tenant gateway state", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-host-"));

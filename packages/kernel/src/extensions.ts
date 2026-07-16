@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { CapabilityBroker, Sentinel } from "./differentiated-runtime.ts";
 import { redact } from "./run-ledger.ts";
@@ -17,6 +17,7 @@ interface ExtensionManifest extends JsonObject {
   schemaVersion: number; installId: string; id: string; version: string; name: string;
   type: ExtensionType; entrypoint: string; capabilities: string[]; sandbox: ExtensionSandbox;
   source: string; provenance: string; digest: string; contentDigest: string;
+  bundleRoot: string; bundleDigest: string; containerImage: string;
   integrity: string; permissions: JsonObject; installedAt?: string; enabled?: boolean;
   trusted?: boolean; grants?: string[]; rollbackId?: string; enabledAt?: string;
   disabledAt?: string; disabledReason?: string; rolledBackAt?: string;
@@ -80,7 +81,8 @@ export class ExtensionRegistry {
       const extension = state.extensions[id];
       if (!extension) throw new Error(`extension not found: ${id}`);
       if (!extension.trusted && trust !== true) throw new Error(`extension is untrusted: ${id}; review provenance before enabling`);
-      if (!/^[a-f0-9]{64}$/.test(extension.contentDigest ?? "")) throw new Error(`extension requires a full SHA-256 contentDigest before enabling: ${id}`);
+      const integrityDigest = extension.sandbox === "container" ? extension.bundleDigest : extension.contentDigest;
+      if (!/^[a-f0-9]{64}$/.test(integrityDigest ?? "")) throw new Error(`extension requires a full SHA-256 ${extension.sandbox === "container" ? "bundleDigest" : "contentDigest"} before enabling: ${id}`);
       if (["none", "unconfined-process"].includes(extension.sandbox) && allowUnsafeSandbox !== true) throw new Error(`extension requests unconfined execution: ${id}; pass the explicit unsafe-sandbox acknowledgement after review`);
       const requested = new Set(extension.capabilities);
       const selected = [...new Set(grants)].filter((grant) => requested.has(grant));
@@ -152,7 +154,7 @@ export class ExtensionExecutor {
     const extension = await this.registry.get(id);
     if (!extension) throw new Error(`extension not found: ${id}`);
     if (!extension.enabled || !extension.trusted) throw new Error(`extension is not enabled and trusted: ${id}`);
-    if (extension.sandbox !== "unconfined-process") throw new Error(`extension sandbox is not executable by this adapter: ${extension.sandbox}`);
+    if (!["unconfined-process", "container"].includes(extension.sandbox)) throw new Error(`extension sandbox is not executable by this adapter: ${extension.sandbox}`);
     const requested = String(capability || extension.capabilities[0] || "").trim();
     if (!requested || !(extension.grants ?? []).includes(requested)) throw new Error(`extension capability is not granted: ${requested || "unspecified"}`);
     if (!extension.entrypoint || extension.entrypoint.includes("\0")) throw new Error(`extension entrypoint is missing: ${id}`);
@@ -164,18 +166,24 @@ export class ExtensionExecutor {
       throw new Error("extension entrypoint must remain inside the configured workspace root");
     }
     const contentDigest = createHash("sha256").update(await readFile(entrypoint)).digest("hex");
-    if (!/^[a-f0-9]{64}$/.test(extension.contentDigest) || extension.contentDigest !== contentDigest) throw new Error(`extension entrypoint integrity check failed: ${id}`);
+    if (extension.sandbox === "unconfined-process" && (!/^[a-f0-9]{64}$/.test(extension.contentDigest) || extension.contentDigest !== contentDigest)) throw new Error(`extension entrypoint integrity check failed: ${id}`);
+    const bundleRoot = await realpath(resolve(realRoot, extension.bundleRoot || dirname(extension.entrypoint)));
+    if (bundleRoot !== realRoot && !bundleRoot.startsWith(`${realRoot}${sep}`)) throw new Error("extension bundle must remain inside the configured workspace root");
+    if (extension.sandbox === "container") {
+      const bundleDigest = await digestExtensionBundle(bundleRoot);
+      if (!/^[a-f0-9]{64}$/.test(extension.bundleDigest) || extension.bundleDigest !== bundleDigest) throw new Error(`extension bundle integrity check failed: ${id}`);
+    }
     const protocol = extension.type === "mcp" ? "mcp-jsonl" : "odinn-jsonl";
     const request = protocol === "mcp-jsonl"
       ? { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: input.name || extension.id, arguments: input.arguments ?? input } }
       : { type: "odinn.call", id: `call_${randomUUID()}`, input, capability: requested };
     if (!runtime) throw new Error("extension execution requires the audited runtime boundary");
-    return invokeThroughRuntime({ id, input, requested, extension, entrypoint, request, protocol, timeoutMs, runtime: { ...runtime, capabilityToken } });
+    return invokeThroughRuntime({ id, input, requested, extension, entrypoint, bundleRoot, request, protocol, timeoutMs, runtime: { ...runtime, capabilityToken } });
   }
 }
 
-interface RuntimeInvocation { id: string; input: JsonObject; requested: string; extension: ExtensionManifest; entrypoint: string; request: ExtensionRequest; protocol: "mcp-jsonl" | "odinn-jsonl"; timeoutMs: number; runtime: ExtensionRuntime }
-async function invokeThroughRuntime({ id, input, requested, extension, entrypoint, request, protocol, timeoutMs, runtime }: RuntimeInvocation) {
+interface RuntimeInvocation { id: string; input: JsonObject; requested: string; extension: ExtensionManifest; entrypoint: string; bundleRoot: string; request: ExtensionRequest; protocol: "mcp-jsonl" | "odinn-jsonl"; timeoutMs: number; runtime: ExtensionRuntime }
+async function invokeThroughRuntime({ id, input, requested, extension, entrypoint, bundleRoot, request, protocol, timeoutMs, runtime }: RuntimeInvocation) {
   const ledger = runtime.runLedger;
   const auditStore = runtime.auditStore;
   if (!ledger || !auditStore) throw new Error("extension runtime enforcement requires runLedger and auditStore");
@@ -202,7 +210,9 @@ async function invokeThroughRuntime({ id, input, requested, extension, entrypoin
       claims = new CapabilityBroker(brokerOptions).consume(runtime.capabilityToken ?? "", consumeOptions);
     }
     await append({ type: "task.started", decision: "allow", data: { input: safeInput, capabilityId: claims?.id } });
-    const output = await runExtensionProcess(process.execPath, [entrypoint], request, { cwd: dirname(entrypoint), timeoutMs, protocol });
+    const output = extension.sandbox === "container"
+      ? await runContainerExtension(extension, entrypoint, bundleRoot, request, { timeoutMs, protocol })
+      : await runExtensionProcess(process.execPath, [entrypoint], request, { cwd: dirname(entrypoint), timeoutMs, protocol });
     await append({ type: "task.completed", decision: "allow", data: { output: redact(output) } });
     ledger.finishTool({ runId, stepId: ledgerStep.stepId, output, status: "succeeded" });
     return output;
@@ -280,6 +290,42 @@ function runExtensionProcess(command: string, args: string[], request: Extension
   });
 }
 
+async function runContainerExtension(extension: ExtensionManifest, entrypoint: string, bundleRoot: string, request: ExtensionRequest, { timeoutMs, protocol }: Pick<ProcessOptions, "timeoutMs" | "protocol">) {
+  const runtime = process.env.ODINN_EXTENSION_CONTAINER_RUNTIME || "docker";
+  const relativeEntrypoint = relative(bundleRoot, entrypoint).replaceAll("\\", "/");
+  if (!relativeEntrypoint || relativeEntrypoint.startsWith("..")) throw new Error("extension entrypoint must remain inside its immutable bundle");
+  const args = [
+    "run", "--rm", "-i", "--network", "none", "--read-only", "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges", "--pids-limit", "64", "--memory", "256m", "--cpus", "0.5",
+    "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--mount", `type=bind,src=${bundleRoot},dst=/extension,readonly`,
+    "--workdir", "/extension", extension.containerImage || "node:24-alpine", "node", `/extension/${relativeEntrypoint}`
+  ];
+  try {
+    return await runExtensionProcess(runtime, args, request, { cwd: bundleRoot, timeoutMs, protocol });
+  } catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    if ((failure as NodeError).code === "ENOENT") throw new Error(`extension container runtime not found: ${runtime}; install Docker/Podman or set ODINN_EXTENSION_CONTAINER_RUNTIME`);
+    throw error;
+  }
+}
+
+export async function digestExtensionBundle(root: string) {
+  const base = await realpath(root);
+  const entries: Array<{ path: string; digest: string }> = [];
+  const walk = async (directory: string) => {
+    for (const item of (await readdir(directory, { withFileTypes: true })).sort((left, right) => left.name.localeCompare(right.name))) {
+      const absolute = join(directory, item.name);
+      const metadata = await lstat(absolute);
+      if (metadata.isSymbolicLink()) throw new Error(`extension bundle contains a symbolic link: ${relative(base, absolute)}`);
+      if (metadata.isDirectory()) await walk(absolute);
+      else if (metadata.isFile()) entries.push({ path: relative(base, absolute).replaceAll("\\", "/"), digest: createHash("sha256").update(await readFile(absolute)).digest("hex") });
+      else throw new Error(`extension bundle contains an unsupported file type: ${relative(base, absolute)}`);
+    }
+  };
+  await walk(base);
+  return createHash("sha256").update(entries.map((entry) => `${entry.path}\0${entry.digest}\n`).join(""), "utf8").digest("hex");
+}
+
 function normalizeManifest(input: unknown, { source, provenance }: Required<InstallOptions>): ExtensionManifest {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("extension manifest must be an object");
   const value = input as JsonObject;
@@ -306,7 +352,10 @@ function normalizeManifest(input: unknown, { source, provenance }: Required<Inst
     provenance: String(value.provenance ?? provenance).trim().slice(0, 120),
     digest: String(value.digest ?? createHash("sha256").update(JSON.stringify({ id, version, type, capabilities, sandbox, entrypoint: value.entrypoint ?? "" })).digest("hex")).trim(),
     contentDigest: String(value.contentDigest ?? "").trim().toLowerCase(),
-    integrity: value.contentDigest ? "content-verified" : "metadata-only",
+    bundleRoot: String(value.bundleRoot ?? "").trim(),
+    bundleDigest: String(value.bundleDigest ?? "").trim().toLowerCase(),
+    containerImage: String(value.containerImage ?? "node:24-alpine").trim(),
+    integrity: value.bundleDigest ? "bundle-verified" : value.contentDigest ? "content-verified" : "metadata-only",
     permissions: value.permissions && typeof value.permissions === "object" && !Array.isArray(value.permissions) ? value.permissions as JsonObject : {}
   };
   return normalized;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp } from "node:fs/promises";
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -77,5 +77,56 @@ test("provider transport retries transient failures and normalizes streaming out
     if (previous === undefined) delete process.env.ODINN_PROVIDER_TEST_KEY;
     else process.env.ODINN_PROVIDER_TEST_KEY = previous;
     await new Promise((resolve: any) => server.close(resolve));
+  }
+});
+
+test("provider responses are terminated at the model body limit", async () => {
+  const server = await listen((_request: any, response: any) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ choices: [{ message: { content: "A".repeat(8 * 1024 * 1024 + 1) } }] }));
+  });
+  const root = await mkdtemp(join(tmpdir(), "odinn-provider-limit-"));
+  const auditStore = createAuditStore(join(root, "audit.jsonl"));
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn"), config: { defaultModel: "test:limited", providers: { test: { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, models: ["limited"] } } } });
+  try {
+    await assert.rejects(() => runTask({ task: { tool: "model.chat", input: { messages: [{ role: "user", content: "ping" }] } }, auditStore, registry }), /response exceeded 8388608 bytes/);
+  } finally { await new Promise((resolve: any) => server.close(resolve)); }
+});
+
+test("Antigravity receives prompts over stdin instead of process arguments", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-antigravity-"));
+  const command = join(root, "agy-fixture.mjs");
+  await writeFile(command, `#!/usr/bin/env node
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => input += chunk);
+process.stdin.on("end", () => process.stdout.write(JSON.stringify({ args: process.argv.slice(2), input })));
+`, "utf8");
+  await chmod(command, 0o700);
+  const previous = process.env.ODINN_ANTIGRAVITY_CLI;
+  process.env.ODINN_ANTIGRAVITY_CLI = command;
+  const auditStore = createAuditStore(join(root, "audit.jsonl"));
+  const registry = createBuiltInRegistry({
+    workspaceRoot: root,
+    stateDir: join(root, ".odinn"),
+    config: {
+      defaultModel: "antigravity:test-model",
+      providers: {
+        antigravity: {
+          transport: "cli-antigravity",
+          models: ["test-model"],
+          auth: { mode: "cli", commandEnv: "ODINN_ANTIGRAVITY_CLI" }
+        }
+      }
+    }
+  });
+  try {
+    const result = await runTask({ task: { tool: "model.chat", input: { messages: [{ role: "user", content: "secret prompt" }] } }, auditStore, registry });
+    const captured = JSON.parse(result.output.content);
+    assert.deepEqual(captured.args, ["--print", "--model", "test-model"]);
+    assert.equal(captured.input, "user: secret prompt");
+  } finally {
+    if (previous === undefined) delete process.env.ODINN_ANTIGRAVITY_CLI;
+    else process.env.ODINN_ANTIGRAVITY_CLI = previous;
   }
 });

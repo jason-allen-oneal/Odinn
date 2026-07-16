@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -84,4 +84,36 @@ test("multi-user host preserves authentication throttles across restart", async 
   } finally {
     await new Promise((resolve: any) => second.close(() => resolve()));
   }
+});
+
+test("multi-user host rejects overlapping tenant workspaces", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-overlap-"));
+  const workspace = await mkdtemp(join(tmpdir(), "odinn-overlap-workspace-"));
+  const nested = join(workspace, "nested");
+  await mkdir(nested);
+  const alice = await hashPassword("alice-password-long");
+  const bob = await hashPassword("bob-password-longer");
+  await assert.rejects(() => createMultiUserHost({ stateDir: root, users: { schemaVersion: 1, users: [
+    { id: "alice", workspaceRoot: workspace, salt: alice.salt, passwordHash: alice.hash },
+    { id: "bob", workspaceRoot: nested, salt: bob.salt, passwordHash: bob.hash }
+  ] } }), /workspaces overlap/);
+});
+
+test("multi-user host reloads disabled users without restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-reload-"));
+  const workspace = await mkdtemp(join(tmpdir(), "odinn-reload-workspace-"));
+  const password = await hashPassword("correct-password-long");
+  const record = { id: "alice", workspaceRoot: workspace, salt: password.salt, passwordHash: password.hash, disabled: false };
+  await writeFile(join(root, "users.json"), JSON.stringify({ schemaVersion: 1, users: [record] }));
+  const publicOrigin = "https://odinn.test";
+  const server = await createMultiUserHost({ stateDir: root, publicOrigin });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const login = await fetch(`${base}/auth/login`, { method: "POST", headers: { "content-type": "application/json", origin: publicOrigin }, body: JSON.stringify({ userId: "alice", password: "correct-password-long" }) });
+    const cookie = login.headers.get("set-cookie").split(";")[0];
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie } })).status, 200);
+    await writeFile(join(root, "users.json"), JSON.stringify({ schemaVersion: 1, users: [{ ...record, disabled: true }] }));
+    assert.equal((await fetch(`${base}/status`, { headers: { cookie } })).status, 403);
+  } finally { await new Promise((resolve: any) => server.close(() => resolve())); }
 });

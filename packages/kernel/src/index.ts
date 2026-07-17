@@ -12,6 +12,7 @@ import { createDefaultPolicy, evaluateTaskPolicy, assertAllowed } from "@odinn/p
 import { createRunId, normalizeTaskRequest } from "@odinn/protocol";
 import { FileAuditStore, FileRecordStore } from "@odinn/store-file";
 import { chromium } from "playwright-core";
+export { SkillPackageStore, validateSkillPackage } from "./skill-packages.ts";
 import { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
 import { toolSafetyDescriptor } from "./tool-safety.ts";
 import { CapabilityBroker, Sentinel } from "./differentiated-runtime.ts";
@@ -401,6 +402,20 @@ export function normalizeUsage(value: any) {
   };
 }
 
+function mergeUsage(current: any, next: any) {
+  if (!next) return current;
+  if (!current) return { ...next };
+  const inputTokens = (current.inputTokens ?? 0) + (next.inputTokens ?? 0);
+  const outputTokens = (current.outputTokens ?? 0) + (next.outputTokens ?? 0);
+  const totalTokens = (current.totalTokens ?? 0) + (next.totalTokens ?? 0);
+  return {
+    ...((current.inputTokens !== undefined || next.inputTokens !== undefined) ? { inputTokens, prompt_tokens: inputTokens } : {}),
+    ...((current.outputTokens !== undefined || next.outputTokens !== undefined) ? { outputTokens, completion_tokens: outputTokens } : {}),
+    ...((current.totalTokens !== undefined || next.totalTokens !== undefined) ? { totalTokens, total_tokens: totalTokens } : {}),
+    source: "provider"
+  };
+}
+
 function integerOrUndefined(value: any) {
   const number = Number(value);
   return Number.isInteger(number) && number >= 0 ? number : undefined;
@@ -704,6 +719,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
         registry: context.registry,
         runTool: context.runTool,
         runLedger: context.runLedger,
+        policy: context.policy,
         signal: context.signal,
         onModelDelta: context.onModelDelta
       })
@@ -773,6 +789,16 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       description: "Rename a local conversation/session record.",
       execute: async (input: any) => renameSession(recordStore, input)
     }],
+    ["session.assign", {
+      capability: "session.write",
+      description: "Assign a local session to a project.",
+      execute: async (input: any) => assignSessionProject(recordStore, input)
+    }],
+    ["session.update", {
+      capability: "session.write",
+      description: "Atomically rename and/or assign a local session.",
+      execute: async (input: any) => updateSession(recordStore, input)
+    }],
     ["session.delete", {
       capability: "session.write",
       description: "Soft-delete a local conversation/session record.",
@@ -787,6 +813,21 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
       capability: "session.read",
       description: "Read a local session and its messages.",
       execute: async (input: any) => readSession(recordStore, input)
+    }],
+    ["project.create", {
+      capability: "session.write",
+      description: "Create a project that groups sessions and goals.",
+      execute: async (input: any) => createProject(recordStore, input)
+    }],
+    ["project.update", {
+      capability: "session.write",
+      description: "Rename, describe, or archive a project.",
+      execute: async (input: any) => updateProject(recordStore, input)
+    }],
+    ["project.list", {
+      capability: "session.read",
+      description: "List projects with session and goal counts.",
+      execute: async (input: any) => listProjects(recordStore, input)
     }],
     ["goal.create", {
       capability: "goal.write",
@@ -1548,8 +1589,10 @@ async function browserAction(stateDir: any, approvalStore: any, tool: any, input
       await page.keyboard.press(cleanRequired(input.key, "browser.press requires key"));
     } else {
       if (!locator) throw new Error(`${tool} requires selector, role/name, or text`);
-      if (tool === "browser.click") await locator.click();
-      else await locator.fill(String(input.value ?? ""));
+      const configuredTimeout = Number.parseInt(String(input.timeoutMs ?? process.env.ODINN_BROWSER_ACTION_TIMEOUT_MS ?? "10000"), 10);
+      const timeout = Number.isFinite(configuredTimeout) ? Math.max(100, Math.min(30_000, configuredTimeout)) : 10_000;
+      if (tool === "browser.click") await locator.click({ timeout });
+      else await locator.fill(String(input.value ?? ""), { timeout });
     }
   } catch (error) {
     const failure = (error instanceof Error ? error : new Error(String(error))) as NodeError;
@@ -1606,18 +1649,30 @@ const AGENT_TOOL_SCHEMAS = [
   ,{ type: "function", function: { name: "browser.recovery.status", description: "Inspect an uncertain browser mutation after a crash or failed action.", parameters: { type: "object", properties: {} } } }
 ];
 
-async function runAgent(modelConfig: any, input: any = {}, { stateDir, memoryStore, runTool, runLedger, signal, onModelDelta }: any = {}) {
+async function runAgent(modelConfig: any, input: any = {}, { stateDir, memoryStore, registry, runTool, runLedger, policy, signal, onModelDelta }: any = {}) {
   const messages = Array.isArray(input.messages) ? input.messages.map((message: any) => ({ ...message })) : [{ role: "user", content: cleanRequired(input.prompt, "agent.run requires prompt") }];
   const memoryOptions = normalizeMemoryOptions(input.memory);
-  const learned = memoryStore && memoryOptions.autoLearn
-    ? await learnFromConversation(memoryStore, messages, { sessionId: input.sessionId })
+  const policyAllows = (toolName: string, toolInput: any = {}) => evaluateTaskPolicy({
+    policy,
+    request: { tool: toolName, input: toolInput },
+    tool: registry?.get?.(toolName)
+  }).allowed;
+  const canRecallMemory = policyAllows("memory.recall");
+  const canRememberMemory = policyAllows("memory.remember");
+  const canCompactMemory = policyAllows("memory.compact");
+  const memoryRecords = memoryStore && input.sessionId && (canRecallMemory || canRememberMemory || canCompactMemory) ? await memoryStore.readAll() : [];
+  const currentSession = input.sessionId ? reduceSessions(memoryRecords).find((session: any) => session.id === input.sessionId) : undefined;
+  const memoryScope = { sessionId: cleanString(input.sessionId, ""), projectId: cleanString(input.projectId, currentSession?.projectId ?? "") };
+  const runMemoryTool = async (tool: string, toolInput: any, reason: string) => (await runTool({ tool, input: toolInput, actor: "agent-memory", reason })).output;
+  const learned = memoryStore && canRememberMemory && memoryOptions.autoLearn
+    ? await learnFromConversation(memoryStore, messages, memoryScope, (toolInput: any) => runMemoryTool("memory.remember", toolInput, "automatic memory learning"))
     : { learned: [], skipped: [] };
-  const compacted = memoryStore && input.sessionId && memoryOptions.autoCompact && messages.length >= memoryOptions.compactAfter
-    ? await compactMemory(memoryStore, { sessionId: input.sessionId, messages })
+  const compacted = memoryStore && canCompactMemory && input.sessionId && memoryOptions.autoCompact && messages.length >= memoryOptions.compactAfter
+    ? await runMemoryTool("memory.compact", { sessionId: input.sessionId, messages }, "automatic session memory compaction")
     : undefined;
   const latestUserMessage = [...messages].reverse().find((message: any) => message.role === "user");
-  const recalled = memoryStore && memoryOptions.autoRecall && latestUserMessage?.content
-    ? await recallMemory(memoryStore, { query: latestUserMessage.content, limit: memoryOptions.maxRecall })
+  const recalled = memoryStore && canRecallMemory && memoryOptions.autoRecall && latestUserMessage?.content
+    ? await runMemoryTool("memory.recall", { query: latestUserMessage.content, limit: memoryOptions.maxRecall, ...memoryScope }, "automatic memory recall")
     : { memories: [] };
   const systemMessage = "You are Ódinn Forge. Use web tools for current public information. Use browser tools for private accounts only after the user has logged in. Never claim an external action completed until its tool result says so. Actions that change external state require approval. Use memory.recall when durable context is relevant. Only use memory.remember for explicit user-approved facts, preferences, or decisions.";
   const existingSystem = messages.find((message: any) => message.role === "system");
@@ -1625,10 +1680,15 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, memorySto
   else messages.unshift({ role: "system", content: systemMessage });
   if (recalled.memories.length) messages.splice(1, 0, { role: "system", content: formatMemoryContext(recalled.memories) });
   const maxTurns = Math.min(Math.max(Number(input.maxTurns) || 6, 1), 8);
+  const availableTools = AGENT_TOOL_SCHEMAS.filter((schema: any) => {
+    return policyAllows(schema.function.name);
+  });
+  let aggregateUsage;
   for (let turn = 0; turn < maxTurns; turn += 1) {
     throwIfAborted(signal);
-    const result: any = await chatWithModel(modelConfig, { model: input.model, messages, tools: AGENT_TOOL_SCHEMAS, stream: true }, { stateDir, signal, onDelta: onModelDelta });
-    if (!result.toolCalls?.length) return { ...result, memory: { recalled: recalled.memories.length, learned: learned.learned.length, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 } };
+    const result: any = await chatWithModel(modelConfig, { model: input.model, messages, tools: availableTools, stream: true }, { stateDir, signal, onDelta: onModelDelta });
+    aggregateUsage = mergeUsage(aggregateUsage, result.usage);
+    if (!result.toolCalls?.length) return { ...result, ...(aggregateUsage ? { usage: aggregateUsage } : {}), memory: { recalled: recalled.memories.length, learned: learned.learned.length, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 } };
     messages.push({ role: "assistant", content: result.content || "", tool_calls: result.toolCalls });
     for (const call of result.toolCalls) {
       let args;
@@ -1636,7 +1696,13 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, memorySto
       const nested = await runTool({ tool: call.name, input: args, actor: "agent", reason: "agent tool call", runLedger });
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(nested.output) });
       if (nested.output?.type === "approval.required") {
-        return { ...result, content: `I need your approval before I ${nested.output.summary.toLowerCase()}.`, pendingApproval: nested.output };
+        return {
+          ...result,
+          ...(aggregateUsage ? { usage: aggregateUsage } : {}),
+          content: `I need your approval before I ${nested.output.summary.toLowerCase()}.`,
+          pendingApproval: nested.output,
+          memory: { recalled: recalled.memories.length, learned: learned.learned.length, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 }
+        };
       }
     }
   }
@@ -2373,6 +2439,8 @@ const MEMORY_KINDS = new Set(["project", "person", "artifact", "correction", "pr
 const MEMORY_TIERS = new Set(["l0", "l1", "l2"]);
 const SESSION_ROLES = new Set(["system", "user", "assistant", "tool", "note"]);
 const GOAL_STATUSES = new Set(["active", "completed", "blocked", "paused", "cancelled"]);
+const PROJECT_STATUSES = new Set(["active", "archived"]);
+const DEFAULT_PROJECT_ID = "project_default";
 const IMPROVEMENT_DECISIONS = new Set(["approved", "rejected", "applied"]);
 
 async function remember(store: any, input: any = {}) {
@@ -2383,9 +2451,16 @@ async function remember(store: any, input: any = {}) {
   const subject = cleanString(input.subject, "general");
   const namespace = normalizeMemoryNamespace(input.namespace ?? input.path, kind, subject);
   const tier = normalizeMemoryTier(input.tier);
+  const scope = resolveMemoryScope(records, input);
   const summary = cleanString(input.summary, text.slice(0, 280));
   const duplicate = activeMemoryRecords(records).find((record: any) =>
-    record.kind === kind && record.subject === subject && record.namespace === namespace && record.tier === tier && record.text.toLowerCase() === text.toLowerCase()
+    record.kind === kind
+    && record.subject === subject
+    && record.namespace === namespace
+    && record.tier === tier
+    && record.text.toLowerCase() === text.toLowerCase()
+    && cleanString(record.scopeType, "global") === scope.scopeType
+    && cleanString(record.scopeId, "") === cleanString(scope.scopeId, "")
   );
   if (duplicate) return { ...duplicate, duplicate: true };
   return store.append({
@@ -2405,7 +2480,7 @@ async function remember(store: any, input: any = {}) {
     safeToAct: cleanString(input.safeToAct, ""),
     avoid: cleanString(input.avoid, ""),
     expiresAt: normalizeMemoryExpiry(input.expiresAt),
-    sessionId: cleanString(input.sessionId, ""),
+    ...scope,
     origin: input.origin && typeof input.origin === "object" ? input.origin : undefined,
     supersedes: cleanString(input.supersedes, "") || undefined
   });
@@ -2459,6 +2534,8 @@ async function openMemory(store: any, input: any = {}) {
 async function compactMemory(store: any, input: any = {}) {
   const sessionId = cleanRequired(input.sessionId, "memory.compact requires sessionId");
   const records = await store.readAll();
+  const session = reduceSessions(records).find((entry: any) => entry.id === sessionId && entry.status !== "deleted");
+  if (!session) throw new Error(`session not found: ${sessionId}`);
   const messages = Array.isArray(input.messages)
     ? input.messages
     : records.filter((record: any) => record.type === "message.appended" && record.sessionId === sessionId);
@@ -2478,7 +2555,10 @@ async function compactMemory(store: any, input: any = {}) {
     source: "session.compaction",
     authority: "agent-derived",
     confidence: 0.7,
+    scopeType: "session",
+    scopeId: sessionId,
     sessionId,
+    projectId: session?.projectId,
     supersedes: previous?.id,
     origin: { messageCount: messages.length }
   });
@@ -2505,6 +2585,10 @@ function memorySummary(record: any) {
     tags: record.tags ?? [],
     confidence: record.confidence,
     source: record.source,
+    scopeType: record.scopeType ?? "global",
+    scopeId: record.scopeId,
+    projectId: record.projectId,
+    sessionId: record.sessionId,
     at: record.at
   };
 }
@@ -2572,10 +2656,24 @@ function rankMemoryRecords(records: any, input: any = {}) {
   const kind = cleanString(input.kind, "");
   const subject = cleanString(input.subject, "").toLowerCase();
   const namespace = normalizeMemoryPrefix(input.namespace ?? input.path);
+  const requestedScopeType = cleanString(input.scopeType, "");
+  const requestedScopeId = cleanString(input.scopeId, "");
+  const requestedProjectId = cleanString(input.projectId, "");
+  const requestedSessionId = cleanString(input.sessionId, "");
   const scored = records
     .filter((record: any) => !kind || record.kind === kind)
     .filter((record: any) => !subject || String(record.subject ?? "").toLowerCase().includes(subject))
     .filter((record: any) => !namespace || record.namespace === namespace || record.namespace.startsWith(`${namespace}/`))
+    .filter((record: any) => {
+      const scopeType = cleanString(record.scopeType, "global");
+      const scopeId = cleanString(record.scopeId, "");
+      if (requestedScopeType) return scopeType === requestedScopeType && (!requestedScopeId || scopeId === requestedScopeId);
+      if (!requestedProjectId && !requestedSessionId) return true;
+      if (scopeType === "global") return true;
+      if (scopeType === "project") return Boolean(requestedProjectId) && scopeId === requestedProjectId;
+      if (scopeType === "session") return Boolean(requestedSessionId) && scopeId === requestedSessionId;
+      return false;
+    })
     .map((record: any) => {
       const text = String(record.text || "").toLowerCase();
       const summary = String(record.summary || "").toLowerCase();
@@ -2639,17 +2737,19 @@ function extractMemoryStatements(messages: any = []) {
   return statements;
 }
 
-async function learnFromConversation(store: any, messages: any, { sessionId }: any = {}) {
+async function learnFromConversation(store: any, messages: any, { sessionId, projectId }: any = {}, executeRemember?: (input: any) => Promise<any>) {
   const statements = extractMemoryStatements(messages);
   const learned = [];
   const skipped = [];
   for (const statement of statements) {
-    const result = await remember(store, {
+    const rememberInput = {
       ...statement,
       source: "agent.auto",
       sessionId,
+      projectId,
       tags: ["auto-extracted"]
-    });
+    };
+    const result = executeRemember ? await executeRemember(rememberInput) : await remember(store, rememberInput);
     if (result.duplicate) skipped.push(result.id);
     else learned.push(result.id);
   }
@@ -2684,6 +2784,10 @@ async function correctMemory(store: any, input: any = {}) {
     source: cleanString(input.source, "local"),
     authority: cleanString(input.authority, "user-correction"),
     confidence: normalizeConfidence(input.confidence ?? target.confidence ?? 1),
+    scopeType: target.scopeType ?? "global",
+    ...(target.scopeId ? { scopeId: target.scopeId } : {}),
+    ...(target.projectId ? { projectId: target.projectId } : {}),
+    ...(target.sessionId ? { sessionId: target.sessionId } : {}),
     supersedes: targetId,
     reason: cleanString(input.reason, "correction")
   });
@@ -2704,7 +2808,13 @@ async function curateMemory(store: any, input: any = {}) {
       text: record.text,
       tags: record.tags ?? [],
       confidence: record.confidence,
-      source: record.source
+      source: record.source,
+      authority: record.authority,
+      scopeType: record.scopeType ?? "global",
+      scopeId: record.scopeId,
+      projectId: record.projectId,
+      sessionId: record.sessionId,
+      at: record.at
     });
   }
   return {
@@ -2730,7 +2840,49 @@ function activeMemoryRecords(records: any) {
     }));
 }
 
+function normalizeMemoryScope(input: any = {}) {
+  const sessionId = cleanString(input.sessionId, "");
+  const projectId = cleanString(input.projectId, "");
+  const requestedType = cleanString(input.scopeType, "");
+  const requestedId = cleanString(input.scopeId, "");
+  const scopeType = requestedType || (sessionId ? "session" : projectId ? "project" : "global");
+  if (!new Set(["global", "project", "session"]).has(scopeType)) throw new Error("memory scopeType must be global, project, or session");
+  const scopeId = requestedId || (scopeType === "session" ? sessionId : scopeType === "project" ? projectId : "");
+  if (scopeType !== "global" && !scopeId) throw new Error(`${scopeType} memory requires a scopeId`);
+  return {
+    scopeType,
+    ...(scopeId ? { scopeId } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    ...(projectId ? { projectId } : {})
+  };
+}
+
+function resolveMemoryScope(records: any[], input: any = {}) {
+  const scope = normalizeMemoryScope(input);
+  if (scope.scopeType === "global") {
+    if (scope.projectId || scope.sessionId) throw new Error("global memory cannot include a projectId or sessionId");
+    return scope;
+  }
+  if (scope.scopeType === "project") {
+    if (scope.sessionId) throw new Error("project memory cannot include a sessionId");
+    if (scope.projectId && scope.projectId !== scope.scopeId) throw new Error("memory projectId must match its scopeId");
+    const project = reduceProjects(records).find((entry: any) => entry.id === scope.scopeId);
+    if (!project) throw new Error(`memory project not found: ${scope.scopeId}`);
+    return { ...scope, projectId: scope.scopeId };
+  }
+  if (scope.sessionId && scope.sessionId !== scope.scopeId) throw new Error("memory sessionId must match its scopeId");
+  const session = reduceSessions(records).find((entry: any) => entry.id === scope.scopeId && entry.status !== "deleted");
+  if (!session) throw new Error(`memory session not found: ${scope.scopeId}`);
+  if (scope.projectId && scope.projectId !== session.projectId) throw new Error("memory projectId must match the selected session's project");
+  return { ...scope, sessionId: scope.scopeId, projectId: session.projectId };
+}
+
 async function createSession(store: any, input: any = {}) {
+  const records = await store.readAll();
+  const projectId = cleanString(input.projectId, DEFAULT_PROJECT_ID);
+  if (!reduceProjects(records).some((project: any) => project.id === projectId && project.status !== "archived")) {
+    throw new Error(`project not found or archived: ${projectId}`);
+  }
   return store.append({
     id: prefixedId("sess"),
     type: "session.created",
@@ -2738,7 +2890,8 @@ async function createSession(store: any, input: any = {}) {
     title: cleanString(input.title, "Untitled session"),
     actor: cleanString(input.actor, "local"),
     source: cleanString(input.source, "local"),
-    tags: normalizeTags(input.tags)
+    tags: normalizeTags(input.tags),
+    projectId
   });
 }
 
@@ -2779,6 +2932,51 @@ async function renameSession(store: any, input: any = {}) {
   });
 }
 
+async function assignSessionProject(store: any, input: any = {}) {
+  const sessionId = cleanRequired(input.sessionId, "session.assign requires sessionId");
+  const projectId = cleanRequired(input.projectId, "session.assign requires projectId");
+  const records = await store.readAll();
+  const session = reduceSessions(records).find((entry: any) => entry.id === sessionId);
+  if (!session || session.status === "deleted") throw new Error(`session not found: ${sessionId}`);
+  const project = reduceProjects(records).find((entry: any) => entry.id === projectId);
+  if (!project || project.status === "archived") throw new Error(`project not found or archived: ${projectId}`);
+  return store.append({
+    id: prefixedId("sess_evt"),
+    type: "session.assigned",
+    sessionId,
+    projectId,
+    actor: cleanString(input.actor, "local"),
+    source: cleanString(input.source, "local")
+  });
+}
+
+async function updateSession(store: any, input: any = {}) {
+  const sessionId = cleanRequired(input.sessionId, "session.update requires sessionId");
+  const records = await store.readAll();
+  const session = reduceSessions(records).find((entry: any) => entry.id === sessionId && entry.status !== "deleted");
+  if (!session) throw new Error(`session not found: ${sessionId}`);
+  const hasTitle = input.title !== undefined;
+  const hasProject = input.projectId !== undefined;
+  if (!hasTitle && !hasProject) throw new Error("session.update requires a title or projectId");
+  const title = hasTitle ? cleanRequired(input.title, "session.update requires a non-empty title") : undefined;
+  if (hasTitle && session.status !== "open") throw new Error(`session is not open: ${sessionId}`);
+  const projectId = hasProject ? cleanRequired(input.projectId, "session.update requires projectId") : undefined;
+  if (projectId) {
+    const project = reduceProjects(records).find((entry: any) => entry.id === projectId && entry.status !== "archived");
+    if (!project) throw new Error(`project not found or archived: ${projectId}`);
+  }
+  const event = await store.append({
+    id: prefixedId("sess_evt"),
+    type: "session.updated",
+    sessionId,
+    ...(title === undefined ? {} : { title }),
+    ...(projectId === undefined ? {} : { projectId }),
+    actor: cleanString(input.actor, "local"),
+    source: cleanString(input.source, "local")
+  });
+  return { ...event, session: { ...session, ...(title === undefined ? {} : { title }), ...(projectId === undefined ? {} : { projectId }), updatedAt: event.at, lastEventAt: event.at } };
+}
+
 async function deleteSession(store: any, input: any = {}) {
   const sessionId = cleanRequired(input.sessionId, "session.delete requires sessionId");
   const session = reduceSessions(await store.readAll()).find((entry: any) => entry.id === sessionId);
@@ -2795,7 +2993,13 @@ async function deleteSession(store: any, input: any = {}) {
 
 async function listSessions(store: any, input: any = {}) {
   const limit = normalizeLimit(input.limit, 20);
-  return { sessions: reduceSessions(await store.readAll()).filter((session: any) => session.status !== "deleted").slice(0, limit) };
+  const projectId = cleanString(input.projectId, "");
+  return {
+    sessions: reduceSessions(await store.readAll())
+      .filter((session: any) => session.status !== "deleted")
+      .filter((session: any) => !projectId || session.projectId === projectId)
+      .slice(0, limit)
+  };
 }
 
 async function readSession(store: any, input: any = {}) {
@@ -2819,37 +3023,149 @@ function reduceSessions(records: any) {
         title: record.title,
         status: record.status ?? "open",
         createdAt: record.at,
+        updatedAt: record.at,
         lastEventAt: record.at,
         messageCount: 0,
-        tags: record.tags ?? []
+        tags: record.tags ?? [],
+        actor: record.actor ?? "local",
+        source: record.source ?? "local",
+        projectId: record.projectId ?? DEFAULT_PROJECT_ID
       });
     } else if (record.type === "message.appended") {
       const current = sessions.get(record.sessionId);
       if (!current) continue;
       current.messageCount += 1;
       current.lastEventAt = record.at;
+      current.updatedAt = record.at;
       current.lastMessageRole = record.role;
     } else if (record.type === "session.renamed") {
       const current = sessions.get(record.sessionId);
       if (!current) continue;
       current.title = record.title;
       current.lastEventAt = record.at;
+      current.updatedAt = record.at;
+    } else if (record.type === "session.assigned") {
+      const current = sessions.get(record.sessionId);
+      if (!current) continue;
+      current.projectId = record.projectId ?? DEFAULT_PROJECT_ID;
+      current.lastEventAt = record.at;
+      current.updatedAt = record.at;
+    } else if (record.type === "session.updated") {
+      const current = sessions.get(record.sessionId);
+      if (!current) continue;
+      if (record.title !== undefined) current.title = record.title;
+      if (record.projectId !== undefined) current.projectId = record.projectId;
+      current.lastEventAt = record.at;
+      current.updatedAt = record.at;
     } else if (record.type === "session.closed") {
       const current = sessions.get(record.sessionId);
       if (!current) continue;
       current.status = "closed";
       current.lastEventAt = record.at;
+      current.updatedAt = record.at;
     } else if (record.type === "session.deleted") {
       const current = sessions.get(record.sessionId);
       if (!current) continue;
       current.status = "deleted";
       current.lastEventAt = record.at;
+      current.updatedAt = record.at;
     }
   }
   return Array.from(sessions.values()).sort((left: any, right: any) => right.lastEventAt.localeCompare(left.lastEventAt));
 }
 
+async function createProject(store: any, input: any = {}) {
+  const name = cleanRequired(input.name, "project.create requires name");
+  const records = await store.readAll();
+  const id = cleanString(input.id, prefixedId("project"));
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,119}$/u.test(id)) throw new Error("project id must be 2-120 letters, digits, dots, underscores, or hyphens");
+  if (reduceProjects(records).some((project: any) => project.id === id)) throw new Error(`project already exists: ${id}`);
+  return store.append({
+    id,
+    type: "project.created",
+    status: "active",
+    name,
+    description: cleanString(input.description, ""),
+    tags: normalizeTags(input.tags),
+    source: cleanString(input.source, "local")
+  });
+}
+
+async function updateProject(store: any, input: any = {}) {
+  const projectId = cleanRequired(input.projectId, "project.update requires projectId");
+  const records = await store.readAll();
+  const project = reduceProjects(records).find((entry: any) => entry.id === projectId);
+  if (!project) throw new Error(`project not found: ${projectId}`);
+  const status = cleanString(input.status, project.status);
+  if (!PROJECT_STATUSES.has(status)) throw new Error(`project status must be one of: ${Array.from(PROJECT_STATUSES).join(", ")}`);
+  if (projectId === DEFAULT_PROJECT_ID && status === "archived") throw new Error("the default Workspace project cannot be archived");
+  return store.append({
+    id: prefixedId("project_evt"),
+    type: "project.updated",
+    projectId,
+    status,
+    ...(input.name !== undefined ? { name: cleanRequired(input.name, "project name cannot be empty") } : {}),
+    ...(input.description !== undefined ? { description: cleanString(input.description, "") } : {}),
+    source: cleanString(input.source, "local")
+  });
+}
+
+async function listProjects(store: any, input: any = {}) {
+  const records = await store.readAll();
+  const sessions = reduceSessions(records).filter((session: any) => session.status !== "deleted");
+  const goals = reduceGoals(records);
+  const includeArchived = input.includeArchived === true;
+  const projects = reduceProjects(records)
+    .filter((project: any) => includeArchived || project.status !== "archived")
+    .map((project: any) => ({
+      ...project,
+      sessionCount: sessions.filter((session: any) => session.projectId === project.id).length,
+      goalCount: goals.filter((goal: any) => goal.projectId === project.id).length,
+      activeGoalCount: goals.filter((goal: any) => goal.projectId === project.id && goal.status === "active").length
+    }));
+  return { projects: projects.slice(0, normalizeLimit(input.limit, 100)), defaultProjectId: DEFAULT_PROJECT_ID };
+}
+
+function reduceProjects(records: any) {
+  const projects = new Map([[DEFAULT_PROJECT_ID, {
+    id: DEFAULT_PROJECT_ID,
+    name: "Workspace",
+    description: "Sessions and goals that have not been moved into another project.",
+    status: "active",
+    tags: [],
+    createdAt: "",
+    updatedAt: ""
+  }]]);
+  for (const record of records) {
+    if (record.type === "project.created") {
+      projects.set(record.id, {
+        id: record.id,
+        name: record.name,
+        description: record.description ?? "",
+        status: record.status ?? "active",
+        tags: record.tags ?? [],
+        createdAt: record.at,
+        updatedAt: record.at
+      });
+    } else if (record.type === "project.updated") {
+      const current = projects.get(record.projectId);
+      if (!current) continue;
+      if (record.name !== undefined) current.name = record.name;
+      if (record.description !== undefined) current.description = record.description;
+      if (record.status !== undefined) current.status = record.status;
+      current.updatedAt = record.at;
+    }
+  }
+  return Array.from(projects.values()).sort((left: any, right: any) => {
+    if (left.id === DEFAULT_PROJECT_ID) return -1;
+    if (right.id === DEFAULT_PROJECT_ID) return 1;
+    return String(right.updatedAt).localeCompare(String(left.updatedAt));
+  });
+}
+
 async function createGoal(store: any, input: any = {}) {
+  const records = await store.readAll();
+  const scope = resolveGoalScope(records, input);
   return store.append({
     id: prefixedId("goal"),
     type: "goal.created",
@@ -2857,21 +3173,24 @@ async function createGoal(store: any, input: any = {}) {
     title: cleanRequired(input.title, "goal.create requires title"),
     description: cleanString(input.description, ""),
     tags: normalizeTags(input.tags),
-    source: cleanString(input.source, "local")
+    source: cleanString(input.source, "local"),
+    ...scope
   });
 }
 
 async function updateGoal(store: any, input: any = {}) {
   const goalId = cleanRequired(input.goalId, "goal.update requires goalId");
-  const status = cleanString(input.status, "active");
-  if (!GOAL_STATUSES.has(status)) throw new Error(`goal status must be one of: ${Array.from(GOAL_STATUSES).join(", ")}`);
   const current = reduceGoals(await store.readAll()).find((goal: any) => goal.id === goalId);
   if (!current) throw new Error(`goal not found: ${goalId}`);
+  const status = cleanString(input.status, current.status);
+  if (!GOAL_STATUSES.has(status)) throw new Error(`goal status must be one of: ${Array.from(GOAL_STATUSES).join(", ")}`);
   return store.append({
     id: prefixedId("goal_evt"),
     type: "goal.updated",
     goalId,
     status,
+    ...(input.title === undefined ? {} : { title: cleanRequired(input.title, "goal title cannot be empty") }),
+    ...(input.description === undefined ? {} : { description: cleanString(input.description, "") }),
     note: cleanString(input.note, ""),
     source: cleanString(input.source, "local")
   });
@@ -2879,7 +3198,31 @@ async function updateGoal(store: any, input: any = {}) {
 
 async function listGoals(store: any, input: any = {}) {
   const limit = normalizeLimit(input.limit, 20);
-  return { goals: reduceGoals(await store.readAll()).slice(0, limit) };
+  const projectId = cleanString(input.projectId, "");
+  const sessionId = cleanString(input.sessionId, "");
+  const status = cleanString(input.status, "");
+  return {
+    goals: reduceGoals(await store.readAll())
+      .filter((goal: any) => !projectId || goal.projectId === projectId)
+      .filter((goal: any) => !sessionId || goal.sessionId === sessionId)
+      .filter((goal: any) => !status || goal.status === status)
+      .slice(0, limit)
+  };
+}
+
+function resolveGoalScope(records: any, input: any) {
+  const sessionId = cleanString(input.sessionId, "");
+  const requestedProjectId = cleanString(input.projectId, "");
+  if (sessionId) {
+    const session = reduceSessions(records).find((entry: any) => entry.id === sessionId && entry.status !== "deleted");
+    if (!session) throw new Error(`session not found: ${sessionId}`);
+    if (requestedProjectId && requestedProjectId !== session.projectId) throw new Error("goal projectId must match the selected session's project");
+    return { scopeType: "session", scopeId: sessionId, sessionId, projectId: session.projectId };
+  }
+  const projectId = requestedProjectId || DEFAULT_PROJECT_ID;
+  const project = reduceProjects(records).find((entry: any) => entry.id === projectId && entry.status !== "archived");
+  if (!project) throw new Error(`project not found or archived: ${projectId}`);
+  return { scopeType: "project", scopeId: projectId, projectId };
 }
 
 function reduceGoals(records: any) {
@@ -2892,6 +3235,10 @@ function reduceGoals(records: any) {
         description: record.description ?? "",
         status: record.status ?? "active",
         tags: record.tags ?? [],
+        scopeType: record.scopeType ?? (record.sessionId ? "session" : "project"),
+        scopeId: record.scopeId ?? record.sessionId ?? record.projectId ?? DEFAULT_PROJECT_ID,
+        projectId: record.projectId ?? DEFAULT_PROJECT_ID,
+        ...(record.sessionId ? { sessionId: record.sessionId } : {}),
         createdAt: record.at,
         updatedAt: record.at,
         notes: []
@@ -2900,9 +3247,17 @@ function reduceGoals(records: any) {
       const current = goals.get(record.goalId);
       if (!current) continue;
       current.status = record.status ?? current.status;
+      current.title = record.title ?? current.title;
+      current.description = record.description ?? current.description;
       current.updatedAt = record.at;
       if (record.note) current.notes.push({ at: record.at, note: record.note, status: record.status });
     }
+  }
+  const sessions = new Map(reduceSessions(records).map((session: any) => [session.id, session]));
+  for (const goal of goals.values()) {
+    if (!goal.sessionId) continue;
+    const session: any = sessions.get(goal.sessionId);
+    if (session) goal.projectId = session.projectId;
   }
   return Array.from(goals.values()).sort((left: any, right: any) => right.updatedAt.localeCompare(left.updatedAt));
 }

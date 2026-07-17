@@ -300,7 +300,7 @@ export class SqliteStore {
     this.path = resolve(path);
     mkdirSync(dirname(this.path), { recursive: true });
     this.db = new DatabaseSync(this.path);
-    this.db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
     this.migrate();
   }

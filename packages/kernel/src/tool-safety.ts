@@ -1,6 +1,6 @@
-const READ_TOOLS = new Set(["job.healthcheck", "text.echo", "workspace.readText", "web.search", "web.fetch", "browser.tabs", "browser.open", "browser.snapshot", "memory.search", "memory.recall", "memory.browse", "memory.open", "memory.curate", "session.list", "session.read", "goal.list", "improve.list"]);
-const WRITE_TOOLS = new Set(["memory.remember", "memory.compact", "memory.correct", "session.create", "session.message", "session.rename", "session.delete", "goal.create", "goal.update", "improve.propose", "improve.decide"]);
-const RETRY_SAFE_TOOLS = new Set(["job.healthcheck", "text.echo", "workspace.readText", "web.search", "web.fetch", "memory.search", "memory.recall", "memory.browse", "memory.open", "memory.curate", "session.list", "session.read", "goal.list", "improve.list"]);
+const READ_TOOLS = new Set(["job.healthcheck", "text.echo", "workspace.readText", "web.search", "web.fetch", "browser.tabs", "browser.open", "browser.snapshot", "memory.search", "memory.recall", "memory.browse", "memory.open", "memory.curate", "session.list", "session.read", "project.list", "goal.list", "improve.list"]);
+const WRITE_TOOLS = new Set(["memory.remember", "memory.compact", "memory.correct", "session.create", "session.message", "session.rename", "session.assign", "session.update", "session.delete", "project.create", "project.update", "goal.create", "goal.update", "improve.propose", "improve.decide"]);
+const RETRY_SAFE_TOOLS = new Set(["job.healthcheck", "text.echo", "workspace.readText", "web.search", "web.fetch", "memory.search", "memory.recall", "memory.browse", "memory.open", "memory.curate", "session.list", "session.read", "project.list", "goal.list", "improve.list"]);
 
 export type ToolEffect = "read" | "filesystem-write" | "process" | "network" | "credential" | "external-state";
 export type Reversibility = "pure" | "snapshot-reversible" | "compensatable" | "irreversible";

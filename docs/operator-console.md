@@ -2,9 +2,11 @@
 
 The local console at `http://127.0.0.1:18790/` is an authenticated view over the single-user gateway. Loading `/` sets the HttpOnly bootstrap cookie. Scripts should read the owner-only `.odinn/gateway.token` and use bearer authentication instead. Cookie-authenticated mutations require an exact scheme, host, and port Origin.
 
-## Sessions and usage
+## Projects, sessions, goals, and usage
 
-Sessions are durable conversation records exposed through `/sessions` and `/sessions/<id>`. The Sessions view creates, filters, inspects, updates, and deletes those records. Usage is derived from persisted audit and run events; it reports model calls, recorded token counts, failures, routes, and recent runs. It is operational telemetry, not a provider invoice.
+Projects group related sessions and goals through `/projects`. Sessions default to the built-in Workspace project and can be reassigned. Goals must belong to a project or a specific session; session-scoped goals also inherit that session's project. Sessions remain durable conversation records exposed through `/sessions` and `/sessions/<id>`.
+
+Usage and Audit share one accounting function over the signed audit journal. Both report distinct run IDs, completed `model.chat`/`agent.run` executions, recorded token counts, and semantic failed-or-denied outcomes. Usage is operational telemetry, not a provider invoice.
 
 ## Cron Jobs
 
@@ -12,9 +14,11 @@ Cron Jobs are stored in `.odinn/cron-jobs.json` and evaluated by the running gat
 
 Cron expressions contain five fields. Each job has an explicit IANA timezone, tool, and JSON input. Treat creation or editing as a privileged control-plane mutation.
 
-## Tasks, Proof, and audit
+## Tasks, Proof, and Audit
 
-Tasks is the operator view over durable runs, Proof results, audit-chain verification, uncertain outcomes, and replayable evidence. It is not a general-purpose arbitrary tool runner. Proof remains disabled by default and command assertions require exact operator-owned argument-vector allowlisting. The audit view verifies integrity; it does not make a local journal tamper-proof against an attacker who controls the state directory.
+Tasks is the operator view over meaningful user, agent, and automation runs. Routine console reads are hidden unless **System activity** is enabled. Each task shows its actual audit timeline, duration, outcome, evidence count, and whether recorded input is declared safe to replay. The replay endpoint enforces the same retry-safe classification server-side.
+
+Audit provides server-side search, type/tool/actor/outcome/date filtering, pagination, JSON export, and integrity verification. Proof remains disabled by default and command assertions require exact operator-owned argument-vector allowlisting. Chain verification detects journal damage; it does not make a local journal tamper-proof against an attacker who controls the state directory.
 
 ## Agent SDK packages
 
@@ -22,11 +26,15 @@ Agents manages declarative Agent SDK v0.3 manifests through `/agents`, `/agents/
 
 Agent package state is stored in `.odinn/agents.json`. Keep package instructions and integrity metadata reviewable before enablement.
 
-## Skills and Skill Workshop
+## Skill SDK packages
 
-Skills discovers `SKILL.md` files in the workspace and validated drafts under `.odinn/skill-workshop/`, plus registered skill extensions. This beta surface is discovery and review only; it does not inject skills into model context, activate them, or grant execution authority.
+Skills is one Skill SDK v0.1 package registry and builder. `/skills/validate` validates the manifest and rendered `SKILL.md`; `/skills` installs it into managed storage; `/skills/<id>/verify` checks persisted integrity; and `/skills/<id>/lifecycle` enables, disables, or quarantines the package. New packages are disabled and untrusted. Enabling requires a clean integrity check.
 
-Skill Workshop validates a package name, trigger description, and workflow instructions, then stages a real `SKILL.md` draft through `/skills/workshop/validate` and `/skills/workshop/save`. Saved drafts remain reviewable files and appear in Skills with draft status. Workshop does not silently install, enable, or execute a skill.
+The registry also discovers existing workspace and imported `SKILL.md` files as unmanaged packages. Discovery does not silently install, trust, enable, inject, or execute them. Managed package state lives under `.odinn/skills/`; legacy workshop endpoints remain compatibility-only and are not shown in the console.
+
+## Memory
+
+Memory shows persisted records, namespaces, scope, provenance, authority, confidence, and the runtime's actual read/write integration state. Records may be global, project-scoped, or session-scoped. Corrections supersede prior records rather than rewriting history. Automatic agent recall and learning are independently gated by `memory.read` and `memory.write` plus each concrete tool denial; `agent.run` routes those operations through the normal audited policy boundary.
 
 ## Remote hosting
 

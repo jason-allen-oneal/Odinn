@@ -8,6 +8,9 @@ import test from "node:test";
 import { closeBrowserManagers, createAuditStore, createBuiltInRegistry, normalizeModelConfig, runPlan, runTask, saveOAuthToken } from "../packages/kernel/src/index.ts";
 import { createDefaultPolicy } from "../packages/policy/src/index.ts";
 
+process.env.ODINN_BROWSER_HEADLESS = "1";
+process.env.ODINN_BROWSER_ACTION_TIMEOUT_MS = "500";
+
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "odinn-kernel-"));
   return {
@@ -565,13 +568,18 @@ test("agent auto-learns explicit facts and recalls them into later model context
     }
   });
   try {
+    const session = await runTask({
+      task: { id: "run_agent_memory_session", tool: "session.create", input: { title: "Memory test session" }, actor: "test" },
+      auditStore,
+      registry
+    });
     const learned = await runTask({
       task: {
         id: "run_agent_learn",
         tool: "agent.run",
         input: {
           model: "test:test-model",
-          sessionId: "sess_memory",
+          sessionId: session.output.id,
           messages: [{ role: "user", content: "Remember that I prefer dark themes." }]
         },
         actor: "test"
@@ -587,7 +595,7 @@ test("agent auto-learns explicit facts and recalls them into later model context
         tool: "agent.run",
         input: {
           model: "test:test-model",
-          sessionId: "sess_memory",
+          sessionId: session.output.id,
           messages: [{ role: "user", content: "What visual style do I prefer?" }]
         },
         actor: "test"

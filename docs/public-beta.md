@@ -6,7 +6,7 @@
 
 - Linux, macOS, or Windows with Node.js 24 or newer and Corepack.
 - One local operator using the loopback gateway at `127.0.0.1`.
-- Public web reading, an isolated browser profile, durable memory, audited tools, sessions, goals, and cron jobs. The console can register and inspect declarative Agent SDK packages, discover reviewed `SKILL.md` files, and stage draft skills; registration and discovery do not execute or activate those packages.
+- Public web reading, an isolated browser profile, scoped durable memory, audited tools, projects, sessions, goals, and cron jobs. The console can register and inspect declarative Agent SDK packages and build integrity-checked Skill SDK packages; both install disabled, and registration and discovery do not execute or activate them.
 - Explicit approval for browser mutations and other external side effects.
 - Experimental Proof, Rewind, Sentinel, Capsules, Darwin, Capability, Counterfactual, and self-improvement features remain disabled until individually enabled.
 

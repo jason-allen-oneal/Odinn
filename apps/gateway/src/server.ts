@@ -3,8 +3,8 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { access, chmod, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, runTask as executeTask, toolSafetyDescriptor, validatePolicy, withStateMutationLock } from "@odinn/kernel";
-import { createDefaultPolicy } from "@odinn/policy";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
@@ -197,25 +197,31 @@ function stableManifestJson(value: any): string {
 
 async function discoverSkills(root: string, state: string) {
   const results: any[] = [];
-  const roots = [root, join(state, "skill-workshop")];
-  const walk = async (directory: string, depth: number) => {
-    if (depth > 5 || results.length >= 250) return;
+  const sources = [
+    { directory: root, status: "unmanaged", source: "workspace" },
+    { directory: join(state, "skill-workshop"), status: "draft", source: "legacy-draft" },
+    { directory: join(state, "imports"), status: "unmanaged", source: "import" }
+  ];
+  const stateRoot = resolve(state);
+  const walk = async (directory: string, depth: number, descriptor: any) => {
+    if (depth > 9 || results.length >= 250) return;
     let entries;
     try { entries = await readdir(directory, { withFileTypes: true }); } catch { return; }
     for (const entry of entries) {
       if ([".git", "node_modules", "dist", "coverage"].includes(entry.name)) continue;
       const path = join(directory, entry.name);
-      if (entry.isDirectory()) await walk(path, depth + 1);
+      if (descriptor.source === "workspace" && resolve(path) === stateRoot) continue;
+      if (entry.isDirectory()) await walk(path, depth + 1, descriptor);
       else if (entry.isFile() && entry.name === "SKILL.md") {
         const content = await readFile(path, "utf8");
         const frontmatter = /^---\s*\n([\s\S]*?)\n---/u.exec(content)?.[1] || "";
         const name = /^name:\s*["']?([^\n"']+)/mu.exec(frontmatter)?.[1]?.trim() || path.split(sep).at(-2) || "skill";
         const description = /^description:\s*["']?([^\n"']+)/mu.exec(frontmatter)?.[1]?.trim() || "No description";
-        results.push({ id: createHash("sha256").update(path).digest("hex").slice(0, 16), name, description, path, bytes: Buffer.byteLength(content), status: path.startsWith(join(state, "skill-workshop")) ? "draft" : "ready" });
+        results.push({ id: createHash("sha256").update(path).digest("hex").slice(0, 16), name, description, path, bytes: Buffer.byteLength(content), status: descriptor.status, source: descriptor.source });
       }
     }
   };
-  for (const directory of roots) await walk(directory, 0);
+  for (const descriptor of sources) await walk(descriptor.directory, 0, descriptor);
   return results;
 }
 
@@ -229,6 +235,163 @@ function validateSkillDraft(input: any) {
   if (instructions.length < 40) errors.push("instructions must contain an actionable workflow");
   const content = `---\nname: ${JSON.stringify(name)}\ndescription: ${JSON.stringify(description)}\n---\n\n# ${name}\n\n${instructions}\n`;
   return { valid: errors.length === 0, errors, content, digest: createHash("sha256").update(content).digest("hex") };
+}
+
+function auditEventOutcome(event: any) {
+  if (["task.failed", "plan.failed"].includes(event.type)) return "failed";
+  if (event.type === "task.blocked" || event.decision === "deny") return "denied";
+  if (event.type === "task.approval_required") return "approval";
+  if (["task.completed", "plan.completed"].includes(event.type)) return "completed";
+  if (["task.started", "plan.started"].includes(event.type)) return "running";
+  return "recorded";
+}
+
+function auditEventTokens(event: any) {
+  if (event.type !== "task.completed") return 0;
+  const usage = event.data?.output?.usage;
+  const total = Number(usage?.totalTokens ?? usage?.total_tokens ?? usage?.total ?? 0);
+  if (Number.isFinite(total) && total > 0) return total;
+  const input = Number(usage?.inputTokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? 0);
+  const output = Number(usage?.outputTokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? 0);
+  return Number.isFinite(input + output) ? input + output : 0;
+}
+
+function summarizeAuditEvents(events: any[]) {
+  const runIds = new Set(events.map((event) => event.runId).filter(Boolean));
+  const modelRuns = new Set(events
+    .filter((event) => event.type === "task.completed" && ["model.chat", "agent.run"].includes(event.tool))
+    .map((event) => event.runId));
+  const errorEvents = events.filter((event) => ["failed", "denied"].includes(auditEventOutcome(event)));
+  return {
+    events: events.length,
+    runs: runIds.size,
+    modelRuns: modelRuns.size,
+    errors: errorEvents.length,
+    totalTokens: events.reduce((sum, event) => sum + auditEventTokens(event), 0),
+    firstAt: events[0]?.at ?? null,
+    lastAt: events.at(-1)?.at ?? null
+  };
+}
+
+function auditFacet(events: any[], key: string) {
+  const counts = new Map<string, number>();
+  for (const event of events) {
+    const value = key === "outcome" ? auditEventOutcome(event) : String(event[key] || "").trim();
+    if (value) counts.set(value, (counts.get(value) ?? 0) + 1);
+  }
+  return Array.from(counts, ([value, count]) => ({ value, count })).sort((left, right) => right.count - left.count || left.value.localeCompare(right.value));
+}
+
+function queryAuditEvents(events: any[], url: URL) {
+  const query = String(url.searchParams.get("q") || "").trim().toLowerCase();
+  const type = String(url.searchParams.get("type") || "").trim();
+  const tool = String(url.searchParams.get("tool") || "").trim();
+  const actor = String(url.searchParams.get("actor") || "").trim();
+  const outcome = String(url.searchParams.get("outcome") || "").trim();
+  const from = Date.parse(url.searchParams.get("from") || "");
+  const to = Date.parse(url.searchParams.get("to") || "");
+  const filtered = events.filter((event) => {
+    const at = Date.parse(event.at || "");
+    return (!query || JSON.stringify(event).toLowerCase().includes(query))
+      && (!type || event.type === type)
+      && (!tool || event.tool === tool)
+      && (!actor || event.actor === actor)
+      && (!outcome || auditEventOutcome(event) === outcome)
+      && (!Number.isFinite(from) || at >= from)
+      && (!Number.isFinite(to) || at <= to + 86_399_999);
+  });
+  const pageSize = Math.max(10, Math.min(100, Number.parseInt(url.searchParams.get("pageSize") || "25", 10) || 25));
+  const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const page = Math.max(1, Math.min(pages, Number.parseInt(url.searchParams.get("page") || "1", 10) || 1));
+  const sorted = filtered.slice().sort((left, right) => String(right.at).localeCompare(String(left.at)));
+  const offset = (page - 1) * pageSize;
+  return {
+    events: sorted.slice(offset, offset + pageSize),
+    pagination: { page, pageSize, pages, total: filtered.length, from: filtered.length ? offset + 1 : 0, to: Math.min(offset + pageSize, filtered.length) },
+    summary: summarizeAuditEvents(events),
+    filteredSummary: summarizeAuditEvents(filtered),
+    facets: {
+      types: auditFacet(events, "type"),
+      tools: auditFacet(events, "tool"),
+      actors: auditFacet(events, "actor"),
+      outcomes: auditFacet(events, "outcome")
+    }
+  };
+}
+
+function classifyTask(run: any) {
+  const systemReadTools = new Set(["session.list", "session.read", "memory.search", "memory.browse", "memory.curate", "goal.list", "project.list", "job.healthcheck"]);
+  if (run.actor === "gateway" && systemReadTools.has(run.tool)) return "system";
+  if (run.actor === "autonomous-controller" || run.actor === "cron") return "automation";
+  if (run.actor === "agent" || run.tool === "agent.run" || run.tool === "model.chat") return "agent";
+  return "user";
+}
+
+function taskTitle(tool: string) {
+  const labels: Record<string, string> = {
+    "agent.run": "Agent response", "model.chat": "Model response", "web.search": "Web search", "web.fetch": "Read webpage",
+    "session.create": "Create session", "session.message": "Save message", "memory.remember": "Store memory", "memory.compact": "Compact session memory"
+  };
+  return labels[tool] || String(tool || "Task").split(".").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" · ");
+}
+
+function summarizeTasks(runs: any[], events: any[], jobs: any[], registry: any, includeSystem: boolean) {
+  const eventsByRun = new Map<string, any[]>();
+  for (const event of events) {
+    const current = eventsByRun.get(event.runId) ?? [];
+    current.push(event);
+    eventsByRun.set(event.runId, current);
+  }
+  const jobsById = new Map(jobs.map((job) => [job.id, job]));
+  const runIds = new Set(runs.map((run) => run.id));
+  const allRuns = runs.slice();
+  for (const job of jobs) {
+    if (runIds.has(job.id)) continue;
+    const task = job.payload?.task && typeof job.payload.task === "object" ? job.payload.task : {};
+    allRuns.push({
+      id: job.id,
+      tool: task.tool || "job",
+      status: job.status,
+      actor: task.actor || "job",
+      startedAt: job.startedAt || job.createdAt,
+      lastEventAt: job.updatedAt || job.completedAt || job.createdAt,
+      eventCount: 0,
+      message: job.error || ""
+    });
+  }
+  return allRuns.map((run) => {
+    const runEvents = eventsByRun.get(run.id) ?? [];
+    const started = runEvents.find((event) => ["task.started", "plan.started"].includes(event.type));
+    const finished = [...runEvents].reverse().find((event) => ["task.completed", "task.failed", "task.blocked", "plan.completed", "plan.failed"].includes(event.type));
+    const startedAt = run.startedAt || started?.at;
+    const updatedAt = run.lastEventAt || finished?.at || startedAt;
+    const durationMs = startedAt && updatedAt ? Math.max(0, Date.parse(updatedAt) - Date.parse(startedAt)) : null;
+    const category = classifyTask(run);
+    const safety = toolSafetyDescriptor(run.tool, registry.get(run.tool));
+    const proofEvents = runEvents.filter((event) => /^(?:proof\.|verification\.|snapshot\.|artifact\.)/u.test(event.type));
+    const job: any = jobsById.get(run.id);
+    return {
+      id: run.id,
+      title: taskTitle(run.tool),
+      tool: run.tool,
+      status: run.status,
+      actor: run.actor || "local",
+      category,
+      startedAt: startedAt ?? null,
+      updatedAt: updatedAt ?? null,
+      durationMs,
+      eventCount: run.eventCount ?? runEvents.length,
+      evidenceCount: proofEvents.length,
+      message: run.message || finished?.message || "",
+      replayable: safety.retrySafe === true && Boolean(started?.data?.input),
+      replayReason: safety.retrySafe !== true
+        ? "Tool is not declared retry-safe"
+        : started?.data?.input ? "Recorded input is retry-safe" : "No audited task input is available",
+      cancellable: Boolean(job && ["queued", "running", "cancelling"].includes(job.status)),
+      source: job ? "job" : category,
+      events: runEvents
+    };
+  }).filter((task) => includeSystem || task.category !== "system");
 }
 
 function normalizeCronJob(value: any) {
@@ -333,6 +496,7 @@ export async function createGatewayServer({
   const quotaGate = createQuotaGate(quotas);
   const cronStore = new CronStore(join(state, "cron-jobs.json"));
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
+  const skillStore = new SkillPackageStore(state);
   const extensionRegistry = new ExtensionRegistry(join(state, "extensions.json"));
   await supervisor.start();
   const cronTimer = setInterval(() => runDueCronJobs(cronStore, isolatedTaskExecutor).catch(() => undefined), 30_000);
@@ -399,8 +563,30 @@ export async function createGatewayServer({
         return json(response, 200, { ok: true, agent: await agentStore.transition(id, body.action) });
       }
       if (request.method === "GET" && url.pathname === "/skills") {
-        const [files, extensions] = await Promise.all([discoverSkills(root, state), extensionRegistry.list()]);
-        return json(response, 200, { skills: [...files, ...extensions.filter((extension: any) => extension.type === "skill").map((extension: any) => ({ ...extension, status: extension.enabled ? "ready" : "disabled", path: extension.entrypoint }))] });
+        const [managed, files, extensions] = await Promise.all([skillStore.list(), discoverSkills(root, state), extensionRegistry.list()]);
+        return json(response, 200, {
+          sdkVersion: "0.1",
+          skills: [
+            ...managed.map((skill: any) => ({ ...skill, source: "managed", path: join(skill.packagePath, "SKILL.md") })),
+            ...files,
+            ...extensions.filter((extension: any) => extension.type === "skill").map((extension: any) => ({ ...extension, source: "legacy-extension", status: "unmanaged", path: extension.entrypoint }))
+          ]
+        });
+      }
+      if (request.method === "POST" && url.pathname === "/skills/validate") {
+        return json(response, 200, { ok: true, ...validateSkillPackage(await readJson(request, { maxBytes: requestMaxBytes })) });
+      }
+      if (request.method === "POST" && url.pathname === "/skills") {
+        return json(response, 200, { ok: true, skill: await skillStore.install(await readJson(request, { maxBytes: requestMaxBytes })) });
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/skills/") && url.pathname.endsWith("/verify")) {
+        const id = decodeURIComponent(url.pathname.slice("/skills/".length, -"/verify".length));
+        return json(response, 200, await skillStore.verify(id));
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/skills/") && url.pathname.endsWith("/lifecycle")) {
+        const id = decodeURIComponent(url.pathname.slice("/skills/".length, -"/lifecycle".length));
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, { ok: true, skill: await skillStore.transition(id, body.action) });
       }
       if (request.method === "POST" && url.pathname === "/skills/workshop/validate") {
         return json(response, 200, validateSkillDraft(await readJson(request, { maxBytes: requestMaxBytes })));
@@ -530,6 +716,8 @@ export async function createGatewayServer({
         const original = await auditStore.readRun(id);
         const started = original?.events?.find((event: any) => event.type === "task.started");
         if (!original || !started?.tool || !started.data?.input) return json(response, 409, { ok: false, error: "run has no replayable task input" });
+        const safety = toolSafetyDescriptor(started.tool, registry.get(started.tool));
+        if (safety.retrySafe !== true) return json(response, 409, { ok: false, error: `tool ${started.tool} is not declared retry-safe and cannot be replayed from the console` });
         const body = await readJson(request, { maxBytes: requestMaxBytes });
         const replayId = body.id || request.headers["idempotency-key"] || `${id}:replay:${Date.now()}`;
         return json(response, 200, await isolatedTaskExecutor({
@@ -591,6 +779,46 @@ export async function createGatewayServer({
       if (request.method === "GET" && url.pathname === "/audit") {
         return json(response, 200, await auditStore.readAll());
       }
+      if (request.method === "GET" && url.pathname === "/audit/query") {
+        return json(response, 200, queryAuditEvents(await auditStore.readAll(), url));
+      }
+      if (request.method === "GET" && url.pathname === "/audit/verify") {
+        return json(response, 200, await auditStore.verifyIntegrity());
+      }
+      if (request.method === "GET" && url.pathname === "/usage") {
+        const events = await auditStore.readAll();
+        const runs = await auditStore.readRuns();
+        const summary = summarizeAuditEvents(events);
+        const days = [];
+        for (let offset = 13; offset >= 0; offset -= 1) {
+          const day = new Date(Date.now() - offset * 86_400_000).toISOString().slice(0, 10);
+          const dayEvents = events.filter((event: any) => String(event.at || "").startsWith(day));
+          days.push({ day, events: dayEvents.length, tokens: dayEvents.reduce((sum: number, event: any) => sum + auditEventTokens(event), 0) });
+        }
+        return json(response, 200, { summary, days, runs: runs.filter((run: any) => ["model.chat", "agent.run"].includes(run.tool)).slice(0, 25) });
+      }
+      if (request.method === "GET" && url.pathname === "/tasks") {
+        const includeSystem = url.searchParams.get("includeSystem") === "true";
+        const [runs, events, jobs] = await Promise.all([auditStore.readRuns(), auditStore.readAll(), supervisor.list()]);
+        const tasks = summarizeTasks(runs, events, jobs, registry, includeSystem);
+        return json(response, 200, {
+          tasks,
+          summary: {
+            total: tasks.length,
+            running: tasks.filter((task: any) => ["queued", "running", "cancelling", "awaiting_approval"].includes(task.status)).length,
+            completed: tasks.filter((task: any) => task.status === "completed").length,
+            needsReview: tasks.filter((task: any) => ["failed", "denied", "blocked", "cancelled", "needs-review"].includes(task.status)).length
+          }
+        });
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/tasks/")) {
+        const id = decodeURIComponent(url.pathname.slice("/tasks/".length));
+        const [run, job] = await Promise.all([auditStore.readRun(id), supervisor.get(id)]);
+        if (!run && !job) return json(response, 404, { ok: false, error: "task not found" });
+        const tasks = summarizeTasks(run ? [run] : [], run?.events || [], job ? [job] : [], registry, true);
+        const ledger = runtime.ledger.getRun(id);
+        return json(response, 200, { task: tasks[0] ?? job, run, job, ledger });
+      }
       if (request.method === "GET" && url.pathname === "/events") {
         return streamAuditEvents(request, response, auditStore, url);
       }
@@ -609,9 +837,13 @@ export async function createGatewayServer({
         const query = url.searchParams.get("query") ?? "";
         const kind = url.searchParams.get("kind") ?? "";
         const subject = url.searchParams.get("subject") ?? "";
+        const scopeType = url.searchParams.get("scopeType") ?? "";
+        const scopeId = url.searchParams.get("scopeId") ?? "";
+        const projectId = url.searchParams.get("projectId") ?? "";
+        const sessionId = url.searchParams.get("sessionId") ?? "";
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
         return json(response, 200, (await runTask({
-          task: { tool: "memory.search", input: { query, kind, subject, limit }, actor: "gateway" },
+          task: { tool: "memory.search", input: { query, kind, subject, scopeType, scopeId, projectId, sessionId, limit }, actor: "gateway" },
           auditStore,
           policy,
           registry
@@ -620,9 +852,11 @@ export async function createGatewayServer({
       if (request.method === "GET" && url.pathname === "/memory/recall") {
         const query = url.searchParams.get("query") ?? "";
         const kind = url.searchParams.get("kind") ?? "";
+        const projectId = url.searchParams.get("projectId") ?? "";
+        const sessionId = url.searchParams.get("sessionId") ?? "";
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "8", 10);
         return json(response, 200, (await runTask({
-          task: { tool: "memory.recall", input: { query, kind, limit }, actor: "gateway" },
+          task: { tool: "memory.recall", input: { query, kind, projectId, sessionId, limit }, actor: "gateway" },
           auditStore,
           policy,
           registry
@@ -638,7 +872,42 @@ export async function createGatewayServer({
           registry
         })).output);
       }
-      if (request.method === "GET" && url.pathname.startsWith("/memory/") && !["/memory/recall", "/memory/browse", "/memory/curated"].includes(url.pathname)) {
+      if (request.method === "GET" && url.pathname === "/memory/status") {
+        const allows = (toolName: string, input: any = {}) => evaluateTaskPolicy({
+          policy,
+          request: { tool: toolName, input },
+          tool: registry.get(toolName)
+        }).allowed;
+        const agentRun = allows("agent.run");
+        const readAllowed = ["memory.curate", "memory.search", "memory.browse", "memory.open"].every((toolName) => allows(toolName));
+        const writeAllowed = ["memory.remember", "memory.correct"].every((toolName) => allows(toolName));
+        const integration = {
+          agentRun,
+          readAllowed,
+          writeAllowed,
+          recallAllowed: allows("memory.recall"),
+          compactAllowed: allows("memory.compact"),
+          autoRecall: agentRun && allows("memory.recall") && config.memory?.autoRecall !== false,
+          autoLearn: agentRun && allows("memory.remember") && config.memory?.autoLearn !== false,
+          autoCompact: agentRun && allows("memory.compact") && config.memory?.autoCompact !== false
+        };
+        if (!integration.readAllowed) return json(response, 200, { working: false, records: null, namespaces: null, latestAt: null, integration });
+        const curated = await runTask({ task: { tool: "memory.curate", input: { limit: 1000 }, actor: "gateway" }, auditStore, policy, registry });
+        const records = Object.values(curated.output.kinds || {}).flat() as any[];
+        const namespaces = new Set<string>();
+        for (const record of records) {
+          const parts = String(record.namespace || "general").split("/").filter(Boolean);
+          for (let index = 1; index <= parts.length; index += 1) namespaces.add(parts.slice(0, index).join("/"));
+        }
+        return json(response, 200, {
+          working: true,
+          records: curated.output.count || 0,
+          namespaces: namespaces.size,
+          latestAt: records.map((record) => record.at).filter(Boolean).sort().at(-1) || null,
+          integration
+        });
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/memory/") && !["/memory/recall", "/memory/browse", "/memory/curated", "/memory/status"].includes(url.pathname)) {
         const id = decodeURIComponent(url.pathname.slice("/memory/".length));
         return json(response, 200, (await runTask({
           task: { tool: "memory.open", input: { id }, actor: "gateway" },
@@ -680,9 +949,10 @@ export async function createGatewayServer({
         })).output);
       }
       if (request.method === "GET" && url.pathname === "/sessions") {
-        const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
+        const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
+        const projectId = url.searchParams.get("projectId") ?? "";
         return json(response, 200, (await runTask({
-          task: { tool: "session.list", input: { limit }, actor: "gateway" },
+          task: { tool: "session.list", input: { limit, projectId }, actor: "gateway" },
           auditStore,
           policy,
           registry
@@ -698,8 +968,9 @@ export async function createGatewayServer({
       }
       if (request.method === "PATCH" && url.pathname.startsWith("/sessions/")) {
         const id = decodeURIComponent(url.pathname.slice("/sessions/".length));
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
         return json(response, 200, (await runTask({
-          task: { tool: "session.rename", input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), sessionId: id }, actor: "gateway" },
+          task: { tool: "session.update", input: { ...body, sessionId: id }, actor: "gateway" },
           auditStore,
           policy,
           registry
@@ -733,9 +1004,12 @@ export async function createGatewayServer({
         })).output);
       }
       if (request.method === "GET" && url.pathname === "/goals") {
-        const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
+        const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
+        const projectId = url.searchParams.get("projectId") ?? "";
+        const sessionId = url.searchParams.get("sessionId") ?? "";
+        const status = url.searchParams.get("status") ?? "";
         return json(response, 200, (await runTask({
-          task: { tool: "goal.list", input: { limit }, actor: "gateway" },
+          task: { tool: "goal.list", input: { limit, projectId, sessionId, status }, actor: "gateway" },
           auditStore,
           policy,
           registry
@@ -757,6 +1031,17 @@ export async function createGatewayServer({
           policy,
           registry
         })).output);
+      }
+      if (request.method === "GET" && url.pathname === "/projects") {
+        const includeArchived = url.searchParams.get("includeArchived") === "true";
+        return json(response, 200, (await runTask({ task: { tool: "project.list", input: { includeArchived, limit: 100 }, actor: "gateway" }, auditStore, policy, registry })).output);
+      }
+      if (request.method === "POST" && url.pathname === "/projects") {
+        return json(response, 200, (await runTask({ task: { tool: "project.create", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" }, auditStore, policy, registry })).output);
+      }
+      if (request.method === "PATCH" && url.pathname.startsWith("/projects/")) {
+        const id = decodeURIComponent(url.pathname.slice("/projects/".length));
+        return json(response, 200, (await runTask({ task: { tool: "project.update", input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), projectId: id }, actor: "gateway" }, auditStore, policy, registry })).output);
       }
       if (request.method === "GET" && url.pathname === "/improvements") {
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
@@ -1148,6 +1433,12 @@ function renderConsoleHtml() {
       width: 100%;
       min-height: 36px;
       padding: 0 10px;
+    }
+    input[type="checkbox"], input[type="radio"] {
+      width: auto;
+      min-height: auto;
+      padding: 0;
+      accent-color: var(--accent);
     }
     textarea {
       width: 100%;
@@ -1932,6 +2223,12 @@ function renderConsoleHtml() {
     .section-kicker { color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
     .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
     .toolbar input { width: min(300px, 100%); }
+    .filter-grid { display: grid; grid-template-columns: minmax(220px, 1fr) repeat(4, minmax(130px, .55fr)); gap: 10px; }
+    .pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 4px; }
+    .pagination .row { flex-wrap: nowrap; }
+    .pagination select { width: auto; }
+    .switch-label { display: inline-flex; align-items: center; gap: 8px; color: var(--text); text-transform: none; font-size: 13px; cursor: pointer; }
+    .inline-error { min-height: 18px; color: var(--danger); font-size: 12px; }
     .record-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
     .record-grid .item { min-height: 98px; }
     .timeline { display: grid; gap: 0; }
@@ -2318,12 +2615,14 @@ function renderConsoleHtml() {
     .data-row { display: grid; grid-template-columns: minmax(260px, 2fr) 110px 120px 130px minmax(120px, 1fr) 160px; align-items: center; gap: 12px; min-height: 58px; padding: 8px 10px; border-bottom: 1px solid #242b35; }
     .data-row:last-child { border-bottom: 0; }
     .data-head { min-height: 40px; color: var(--muted); background: #171c24; font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
-    .session-table .data-row { grid-template-columns: minmax(280px, 2fr) 90px 100px 110px 120px 90px 150px; }
+    .session-table .data-row { grid-template-columns: minmax(250px, 2fr) 150px 90px 100px 110px 120px 80px 280px; }
+    .session-project-select { max-width: 130px; }
+    .data-group { min-height: 40px; background: #101720; }
     .data-primary { display: grid; gap: 4px; min-width: 0; }
     .data-primary strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .data-primary small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .count-badge { display: inline-grid; place-items: center; min-width: 24px; height: 24px; border-radius: 999px; background: #222936; color: var(--muted); font-size: 12px; }
-    .session-filters { display: grid; grid-template-columns: minmax(260px, 1fr) 170px 170px; gap: 10px; padding: 12px 0; }
+    .session-filters { display: grid; grid-template-columns: minmax(240px, 1fr) 190px 150px 150px; gap: 10px; padding: 12px 0; }
     .session-detail { margin-top: 14px; }
     .usage-grid, .agent-layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(320px, .8fr); gap: 14px; }
     .bar-chart { display: flex; align-items: end; gap: 8px; min-height: 220px; padding-top: 20px; }
@@ -2352,9 +2651,14 @@ function renderConsoleHtml() {
     .manifest-advanced { border-top: 1px solid var(--line); padding-top: 12px; }
     .skill-card { min-height: 150px; }
     .skill-path { word-break: break-all; }
+    .project-card.selected, .memory-card.selected, .skill-card.selected { border-color: var(--accent); background: #14231f; }
+    .scope-label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+    .task-timeline { max-height: 360px; overflow: auto; }
+    .audit-filter-panel { display: grid; gap: 10px; }
     @media (max-width: 900px) {
       .usage-grid, .agent-layout, .workshop-grid { grid-template-columns: 1fr; }
       .session-filters { grid-template-columns: 1fr; }
+      .filter-grid { grid-template-columns: 1fr 1fr; }
       .summary-bar { align-items: flex-start; flex-direction: column; gap: 10px; }
     }
   </style>
@@ -2368,6 +2672,7 @@ function renderConsoleHtml() {
     <symbol id="icon-memory" viewBox="0 0 24 24"><path d="M8 5h8v14H8z"></path><path d="M5 8h3M5 12h3M5 16h3M16 8h3M16 12h3M16 16h3"></path></symbol>
     <symbol id="icon-session" viewBox="0 0 24 24"><path d="M5 5h14v14H5z"></path><path d="M8 9h8M8 13h6M8 17h4"></path></symbol>
     <symbol id="icon-goal" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="3"></circle><path d="m17 7 3-3M17 4h3v3"></path></symbol>
+    <symbol id="icon-project" viewBox="0 0 24 24"><path d="M4 7h6l2 2h8v10H4z"></path><path d="M4 7V5h6l2 2"></path></symbol>
     <symbol id="icon-spark" viewBox="0 0 24 24"><path d="m12 3 1.5 6.5L20 12l-6.5 1.5L12 20l-1.5-6.5L4 12l6.5-2.5z"></path></symbol>
     <symbol id="icon-audit" viewBox="0 0 24 24"><path d="M6 4h12v16H6z"></path><path d="M9 8h6M9 12h6M9 16h3"></path><path d="m14 16 1.5 1.5L19 14"></path></symbol>
     <symbol id="icon-runtime" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2"></rect><path d="M8 9h2M14 9h2M8 13h2M14 13h2M8 17h8"></path></symbol>
@@ -2410,16 +2715,15 @@ function renderConsoleHtml() {
         </div>
         <details class="nav-more" open>
           <summary><span class="nav-group-label">More</span><span class="nav-chevron">⌄</span></summary>
-          <button data-view="audit" data-title="Activity" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-activity"></use></svg></span><span class="nav-label">Activity</span></button>
           <button data-view="sessions" data-title="Sessions" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-session"></use></svg></span><span class="nav-label">Sessions</span></button>
           <button data-view="usage" data-title="Usage" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-usage"></use></svg></span><span class="nav-label">Usage</span></button>
           <button data-view="cron" data-title="Cron Jobs" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-clock"></use></svg></span><span class="nav-label">Cron Jobs</span></button>
           <button data-view="tasks" data-title="Tasks" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span><span class="nav-label">Tasks</span></button>
           <button data-view="agents" data-title="Agents" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-agent"></use></svg></span><span class="nav-label">Agents</span></button>
-          <button data-view="skills" data-title="Skills" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-skill"></use></svg></span><span class="nav-label">Skills</span></button>
-          <button data-view="workshop" data-title="Skill Workshop" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Skill Workshop</span></button>
+          <button data-view="skills" data-title="Skill SDK" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-skill"></use></svg></span><span class="nav-label">Skill SDK</span></button>
         </details>
         <div class="nav-group-label nav-advanced-label">Workspace</div>
+        <button data-view="projects" data-title="Projects" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-project"></use></svg></span><span class="nav-label">Projects</span></button>
         <button data-view="memory" data-title="Memory" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-memory"></use></svg></span><span class="nav-label">Memory</span></button>
         <button data-view="goals" data-title="Goals" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-goal"></use></svg></span><span class="nav-label">Goals</span></button>
         <button data-view="audit" data-title="Audit" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-audit"></use></svg></span><span class="nav-label">Audit</span></button>
@@ -2507,10 +2811,10 @@ function renderConsoleHtml() {
 
       <section id="view-tasks" class="view">
         <div class="page oc-page">
-          <div class="page-head"><div><div class="section-kicker">Proof &amp; execution ledger</div><h1>Tasks</h1><p>Inspect work, verify captured proof, replay safe runs, and resolve failures without exposing an arbitrary tool shell.</p></div><button class="secondary" id="refresh-tasks" type="button">Refresh</button></div>
-          <div class="stat-strip"><div class="stat-card"><strong id="task-total">0</strong><span>captured runs</span></div><div class="stat-card"><strong id="task-running">0</strong><span>running</span></div><div class="stat-card"><strong id="task-passed">0</strong><span>completed</span></div><div class="stat-card"><strong id="task-failed">0</strong><span>needs review</span></div></div>
-          <div class="panel table-panel"><div class="toolbar"><input id="task-query" placeholder="Filter by run, tool, actor, or status"><div class="chip-row"><button class="secondary task-filter active" data-task-filter="all" type="button">All</button><button class="secondary task-filter" data-task-filter="running" type="button">Running</button><button class="secondary task-filter" data-task-filter="failed" type="button">Failed</button></div></div><div class="data-table"><div class="data-row data-head"><span>Task</span><span>Status</span><span>Actor</span><span>Updated</span><span>Evidence</span><span>Actions</span></div><div id="task-table"></div></div></div>
-          <div class="panel stack"><div class="panel-head"><div><h2>Selected evidence</h2><span class="muted" id="task-detail-label">Select a task to inspect its audit and proof record.</span></div><div class="row"><button class="secondary" id="task-verify" type="button" disabled>Verify chain</button><button class="secondary" id="task-replay" type="button" disabled>Replay safe task</button></div></div><pre id="task-evidence" class="output">No task selected.</pre></div>
+          <div class="page-head"><div><div class="section-kicker">Work queue &amp; execution history</div><h1>Tasks</h1><p>See meaningful work first. Routine console reads stay hidden unless you ask for the plumbing.</p></div><button class="secondary" id="refresh-tasks" type="button">Refresh</button></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="task-total">0</strong><span>visible tasks</span></div><div class="stat-card"><strong id="task-running">0</strong><span>active or waiting</span></div><div class="stat-card"><strong id="task-passed">0</strong><span>completed</span></div><div class="stat-card"><strong id="task-failed">0</strong><span>needs review</span></div></div>
+          <div class="panel table-panel"><div class="toolbar"><input id="task-query" placeholder="Search task, tool, actor, or run ID"><div class="row"><select id="task-status-filter" aria-label="Task status"><option value="all">All statuses</option><option value="active">Active</option><option value="completed">Completed</option><option value="review">Needs review</option></select><select id="task-category-filter" aria-label="Task origin"><option value="all">All origins</option><option value="user">User</option><option value="agent">Agent</option><option value="automation">Automation</option></select><label class="switch-label"><input id="task-system-toggle" type="checkbox"> System activity</label></div></div><div class="data-table"><div class="data-row data-head"><span>Task</span><span>Status</span><span>Origin</span><span>Updated</span><span>Record</span><span>Actions</span></div><div id="task-table"></div></div></div>
+          <div class="panel stack"><div class="panel-head"><div><h2>Task detail</h2><span class="muted" id="task-detail-label">Select a task for its timeline, outcome, and proof.</span></div><div class="row"><button class="secondary" id="task-verify" type="button" disabled>Verify proof</button><button class="secondary" id="task-replay" type="button" disabled>Replay</button></div></div><div id="task-summary" class="record-grid"></div><div id="task-evidence" class="timeline task-timeline"><div class="empty-state"><strong>No task selected</strong><span>Choose Inspect from the history above.</span></div></div><details class="activity-details"><summary>Raw task record</summary><pre id="task-raw" class="output">No task selected.</pre></details></div>
         </div>
       </section>
 
@@ -2523,76 +2827,47 @@ function renderConsoleHtml() {
         </div>
       </section>
 
+      <section id="view-projects" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Organized workspaces</div><h1>Projects</h1><p>Group related sessions and give goals a real home instead of leaving them loose in the void.</p></div><div class="row"><button id="new-project" type="button">New Project</button><button class="secondary" id="refresh-projects" type="button">Refresh</button></div></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="project-total">0</strong><span>active projects</span></div><div class="stat-card"><strong id="project-session-count">0</strong><span>sessions</span></div><div class="stat-card"><strong id="project-goal-count">0</strong><span>goals</span></div><div class="stat-card"><strong id="project-active-goal-count">0</strong><span>active goals</span></div></div>
+          <div class="agent-layout"><div class="panel stack"><div class="panel-head"><h2>Project registry</h2><input id="project-query" placeholder="Filter projects"></div><div id="project-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Project detail</h2><span class="chip" id="project-detail-status">No selection</span></div><div id="project-detail" class="empty-state"><strong>Select a project</strong><span>Its sessions and scoped goals will appear here.</span></div><div class="row"><button class="secondary" id="project-open-sessions" type="button" disabled>Open Sessions</button><button class="secondary" id="project-open-goals" type="button" disabled>Open Goals</button><button class="danger-button" id="project-archive" type="button" disabled>Archive</button></div></div></div>
+          <dialog id="project-dialog" class="editor-dialog"><form method="dialog" id="project-form"><div class="panel-head"><div><h2>Create project</h2><span class="muted">Sessions and goals can be moved here after creation.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div class="field"><label for="project-name">Project name</label><input id="project-name" placeholder="Website launch" required></div><div class="field"><label for="project-description">Description</label><textarea id="project-description" placeholder="What belongs in this project?"></textarea></div><div class="row"><button value="default" type="submit">Create Project</button></div></form></dialog>
+        </div>
+      </section>
+
       <section id="view-memory" class="view">
-        <div class="page">
-          <div class="page-head"><div><div class="section-kicker">Persistent context</div><h1>Memory</h1><p>Search, curate, and correct the facts Ódinn Forge carries between sessions.</p></div><span class="chip ok">provenance tracked</span></div>
-          <div class="split">
-            <div class="panel stack"><div class="panel-head"><h2>Capture a memory</h2><button id="remember" type="button">Remember</button></div>
-            <div class="grid-2">
-              <div class="field">
-                <label for="memory-kind">Kind</label>
-                <select id="memory-kind">
-                  <option>preference</option>
-                  <option>project</option>
-                  <option>person</option>
-                  <option>artifact</option>
-                  <option>procedure</option>
-                  <option>decision</option>
-                  <option>system</option>
-                </select>
-              </div>
-              <div class="field">
-                <label for="memory-subject">Subject</label>
-                <input id="memory-subject" value="beta">
-              </div>
-            </div>
-            <div class="grid-2">
-              <div class="field">
-                <label for="memory-namespace">Namespace</label>
-                <input id="memory-namespace" value="project/odinn">
-              </div>
-              <div class="field">
-                <label for="memory-tier">Context tier</label>
-                <select id="memory-tier"><option value="l0">L0 · summary</option><option value="l1" selected>L1 · fact</option><option value="l2">L2 · evidence</option></select>
-              </div>
-            </div>
-            <div class="field">
-              <label for="memory-tags">Tags</label>
-              <input id="memory-tags" value="beta,gateway">
-            </div>
-            <div class="field">
-              <label for="memory-text">Text</label>
-              <textarea id="memory-text">Gateway beta testing should expose clear run, audit, memory, goal, and improvement paths.</textarea>
-            </div>
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Persistent context</div><h1>Memory</h1><p>See what Ódinn remembers, where it applies, and why it is trusted.</p></div><div class="row"><span class="chip" id="memory-health">Checking</span><button class="secondary" id="refresh-memory-tree" type="button">Refresh</button></div></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="memory-record-count">0</strong><span>active memories</span></div><div class="stat-card"><strong id="memory-namespace-count">0</strong><span>namespaces</span></div><div class="stat-card"><strong id="memory-recall-status">OFF</strong><span>automatic recall</span></div><div class="stat-card"><strong id="memory-last-update">—</strong><span>last update</span></div></div>
+          <div class="agent-layout">
+            <div class="panel stack"><div class="panel-head"><div><h2>Memory library</h2><span class="muted" id="memory-result-count">0 records</span></div><button id="memory-new-toggle" type="button">Add Memory</button></div><div class="filter-grid"><input id="memory-query" placeholder="Search remembered facts"><select id="memory-kind-filter"><option value="">All kinds</option><option>preference</option><option>project</option><option>person</option><option>artifact</option><option>procedure</option><option>decision</option><option>system</option></select><select id="memory-scope-filter"><option value="">All scopes</option><option value="global">Global</option><option value="project">Project</option><option value="session">Session</option></select></div><div id="memory-list" class="list"></div></div>
+            <div class="panel stack"><div class="panel-head"><h2>Memory detail</h2><span class="chip" id="memory-detail-kind">No selection</span></div><div id="memory-detail" class="empty-state"><strong>Select a memory</strong><span>Text, scope, source, authority, confidence, and provenance will appear here.</span></div><div class="row"><button class="secondary" id="memory-correct" type="button" disabled>Correct</button><button class="secondary" id="memory-recall-test" type="button">Test Recall</button></div></div>
           </div>
-            <div class="panel stack"><div class="panel-head"><h2>Memory browser</h2><input id="memory-query" placeholder="Search subject, text, or tag"></div><div class="chip-row"><span class="chip">L0 summary</span><span class="chip">L1 fact</span><span class="chip">L2 evidence</span></div><div id="memory-list" class="list"></div></div>
-          </div>
-          <div class="panel stack"><div class="panel-head"><div><h2>Context namespaces</h2><p class="muted">Durable context is organized by scope instead of becoming one undifferentiated memory swamp.</p></div><button class="secondary" id="refresh-memory-tree" type="button">Refresh</button></div><div id="memory-tree" class="record-grid"></div></div>
+          <div class="panel stack"><div class="panel-head"><div><h2>Context map</h2><p class="muted">Global, project, and session context stay separated so one conversation does not poison another.</p></div></div><div id="memory-tree" class="record-grid"></div></div>
+          <dialog id="memory-dialog" class="editor-dialog"><form method="dialog" id="memory-form"><div class="panel-head"><div><h2>Remember something</h2><span class="muted">Store only durable context—not scratch notes.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div class="grid-2"><div class="field"><label for="memory-kind">Kind</label><select id="memory-kind"><option>preference</option><option>project</option><option>person</option><option>artifact</option><option>procedure</option><option>decision</option><option>system</option></select></div><div class="field"><label for="memory-subject">Subject</label><input id="memory-subject" placeholder="Deployment preferences" required></div></div><div class="grid-2"><div class="field"><label for="memory-scope-type">Applies to</label><select id="memory-scope-type"><option value="global">Everywhere</option><option value="project">One project</option><option value="session">One session</option></select></div><div class="field"><label for="memory-scope-id">Project or session</label><select id="memory-scope-id" disabled><option value="">Choose a scope first</option></select></div></div><div class="field"><label for="memory-text">What should Ódinn remember?</label><textarea id="memory-text" placeholder="State the durable fact, preference, or decision clearly." required></textarea></div><details><summary>Advanced metadata</summary><div class="grid-2"><div class="field"><label for="memory-namespace">Namespace</label><input id="memory-namespace" placeholder="preferences/development"></div><div class="field"><label for="memory-tier">Detail level</label><select id="memory-tier"><option value="l0">Summary</option><option value="l1" selected>Fact</option><option value="l2">Evidence</option></select></div></div><div class="field"><label for="memory-tags">Tags</label><input id="memory-tags" placeholder="typescript, workflow"></div></details><div class="row"><button value="default" type="submit">Remember</button></div></form></dialog>
+          <dialog id="memory-correction-dialog" class="editor-dialog"><form method="dialog" id="memory-correction-form"><div class="panel-head"><h2>Correct memory</h2><button class="secondary" value="cancel" type="submit">Close</button></div><div class="field"><label for="memory-correction-text">Corrected text</label><textarea id="memory-correction-text" required></textarea></div><div class="field"><label for="memory-correction-reason">Reason</label><input id="memory-correction-reason" placeholder="The previous record is outdated"></div><div class="row"><button value="default" type="submit">Save Correction</button></div></form></dialog>
         </div>
       </section>
 
       <section id="view-sessions" class="view">
         <div class="page oc-page">
           <div class="page-head"><div><div class="section-kicker">Conversation archive</div><h1>Sessions</h1><p>Active sessions and defaults.</p></div><div class="row"><button id="create-session" type="button">New Session</button><button class="secondary" id="refresh-sessions" type="button">Refresh</button></div></div>
-          <div class="panel table-panel"><div class="panel-head"><div><h2>Sessions <span class="count-badge" id="session-count-badge">0</span></h2><span class="muted" id="session-page-count">Loading</span></div></div><div class="session-filters"><input id="session-query" placeholder="Filter by key, agent, label, kind..."><select id="session-status-filter"><option value="all">All statuses</option><option value="open">Open</option><option value="archived">Archived</option></select><select id="session-group"><option value="none">Group by None</option><option value="source">Group by source</option><option value="status">Group by status</option></select></div><div class="data-table session-table"><div class="data-row data-head"><span>Session</span><span>Kind</span><span>Status</span><span>Runtime</span><span>Updated</span><span>Messages</span><span>Actions</span></div><div id="session-list"></div></div></div>
+          <div class="panel table-panel"><div class="panel-head"><div><h2>Sessions <span class="count-badge" id="session-count-badge">0</span></h2><span class="muted" id="session-page-count">Loading</span></div></div><div class="session-filters"><input id="session-query" placeholder="Filter title, source, or ID"><select id="session-project-filter"><option value="all">All projects</option></select><select id="session-status-filter"><option value="all">All statuses</option><option value="open">Open</option><option value="closed">Closed</option></select><select id="session-group"><option value="none">No grouping</option><option value="project">Group by project</option><option value="source">Group by source</option><option value="status">Group by status</option></select></div><div class="data-table session-table"><div class="data-row data-head"><span>Session</span><span>Project</span><span>Kind</span><span>Status</span><span>Runtime</span><span>Updated</span><span>Messages</span><span>Actions</span></div><div id="session-list"></div></div></div>
           <div class="panel stack session-detail"><div class="panel-head"><h2>Selected transcript</h2><span class="chip" id="selected-session-route">No session selected</span></div><div id="session-transcript" class="timeline"><div class="empty-state"><strong>Select a session</strong><span>Its messages and model route will appear here.</span></div></div></div>
         </div>
       </section>
 
       <section id="view-goals" class="view">
-        <div class="page">
-          <div class="page-head"><div><div class="section-kicker">Long-running work</div><h1>Goals</h1><p>Keep objectives visible, update their state, and surface what is blocked.</p></div><span class="chip ok">stateful</span></div>
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Scoped objectives</div><h1>Goals</h1><p>Every goal belongs to a project or one specific session. No more orphan objectives floating in static.</p></div><button class="secondary" id="refresh-goals" type="button">Refresh</button></div>
           <div class="stat-strip"><div class="stat-card"><strong id="goal-active-count">0</strong><span>active</span></div><div class="stat-card"><strong id="goal-blocked-count">0</strong><span>blocked</span></div><div class="stat-card"><strong id="goal-completed-count">0</strong><span>completed</span></div><div class="stat-card"><strong>∞</strong><span>no hard expiry</span></div></div>
           <div class="split">
             <div class="panel stack"><div class="panel-head"><h2>New goal</h2><button id="create-goal" type="button">Create</button></div>
-            <div class="field">
-              <label for="goal-title">Title</label>
-              <input id="goal-title" value="Reach local beta">
-            </div>
-            <div class="field">
-              <label for="goal-note">Update Note</label>
-              <input id="goal-note" value="Beta test pass from gateway console.">
-            </div>
+            <div class="field"><label for="goal-title">Objective</label><input id="goal-title" placeholder="Ship the onboarding release"></div>
+            <div class="grid-2"><div class="field"><label for="goal-scope-type">Belongs to</label><select id="goal-scope-type"><option value="project">Project</option><option value="session">Session</option></select></div><div class="field"><label for="goal-scope-id">Target</label><select id="goal-scope-id"></select></div></div>
+            <div class="field"><label for="goal-description">Success looks like</label><textarea id="goal-description" placeholder="Define the concrete outcome."></textarea></div>
+            <div class="field"><label for="goal-note">Progress update</label><input id="goal-note" placeholder="What changed?"></div>
             <div class="row">
               <select id="goal-status" aria-label="Goal status">
                 <option>active</option>
@@ -2604,36 +2879,34 @@ function renderConsoleHtml() {
               <button class="secondary" id="update-goal" type="button">Update Selected</button>
             </div>
           </div>
-            <div class="panel stack"><div class="panel-head"><h2>Goal board</h2><span class="muted">select a card to update</span></div><div id="goal-list" class="list"></div></div>
+            <div class="panel stack"><div class="panel-head"><h2>Goal board</h2><select id="goal-project-filter" aria-label="Filter goals by project"><option value="all">All projects</option></select></div><div id="goal-list" class="list"></div></div>
           </div>
         </div>
       </section>
 
-      <section id="view-workshop" class="view">
-        <div class="page oc-page">
-          <div class="page-head"><div><div class="section-kicker">Skill authoring pipeline</div><h1>Skill Workshop</h1><p>Draft, validate, and stage a real SKILL.md package. No vague self-improvement theater.</p></div><span class="chip warn" id="workshop-status">not validated</span></div>
-          <div class="split workshop-grid"><div class="panel stack"><div class="panel-head"><h2>Skill definition</h2><button id="validate-skill" type="button">Validate</button></div><div class="field"><label for="skill-draft-name">Package name</label><input id="skill-draft-name" value="odinn-operator-workflow"></div><div class="field"><label for="skill-draft-description">Trigger description</label><textarea id="skill-draft-description">Use when an operator needs a repeatable, audited Ódinn Forge workflow.</textarea></div><div class="field"><label for="skill-draft-instructions">Instructions</label><textarea id="skill-draft-instructions" class="workshop-editor">## Workflow\n\n1. Inspect the live state.\n2. Execute the bounded operation.\n3. Capture evidence and verify the result.\n4. Stop on unknown external outcomes.</textarea></div><div class="row"><button id="save-skill-draft" type="button" disabled>Save Draft Package</button><span class="muted">Saved drafts appear in Skills.</span></div></div><div class="panel stack"><div class="panel-head"><h2>Validation report</h2><span class="chip">SKILL.md</span></div><div id="skill-validation" class="empty-state"><strong>Run validation</strong><span>Frontmatter, trigger quality, workflow depth, and digest will appear here.</span></div><pre id="skill-preview" class="output">No generated package.</pre></div></div>
-        </div>
-      </section>
-
       <section id="view-audit" class="view">
-        <div class="page">
-          <div class="page-head"><div><div class="section-kicker">Evidence trail</div><h1>Audit</h1><p>Every tool, model, memory, and state transition leaves a record here.</p></div><div class="row"><button class="secondary" id="refresh-audit" type="button">Refresh</button><button class="secondary" id="copy-audit" type="button">Copy</button></div></div>
-          <div class="stat-strip"><div class="stat-card"><strong id="audit-count">0</strong><span>events loaded</span></div><div class="stat-card"><strong id="audit-run-count">0</strong><span>runs</span></div><div class="stat-card"><strong id="audit-model-count">0</strong><span>model calls</span></div><div class="stat-card"><strong id="audit-error-count">0</strong><span>errors</span></div></div>
-          <div class="panel stack"><div class="toolbar"><div class="chip-row"><button class="secondary audit-filter active" data-audit-filter="all" type="button">All</button><button class="secondary audit-filter" data-audit-filter="model" type="button">Model</button><button class="secondary audit-filter" data-audit-filter="error" type="button">Errors</button></div><input id="audit-query" placeholder="Filter events"></div><div id="audit-events" class="list"></div><pre id="audit-log" class="output" hidden>No audit loaded.</pre></div>
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Signed evidence trail</div><h1>Audit</h1><p>Filter the ledger, inspect exact events, and verify that its integrity chain is intact.</p></div><div class="row"><button class="secondary" id="audit-verify" type="button">Verify Chain</button><button class="secondary" id="refresh-audit" type="button">Refresh</button><button class="secondary" id="copy-audit" type="button">Copy Page</button><button class="secondary" id="export-audit" type="button">Export JSON</button></div></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="audit-count">0</strong><span>total events</span></div><div class="stat-card"><strong id="audit-run-count">0</strong><span>distinct runs</span></div><div class="stat-card"><strong id="audit-model-count">0</strong><span>model runs</span></div><div class="stat-card"><strong id="audit-error-count">0</strong><span>failed or denied</span></div></div>
+          <div class="panel audit-filter-panel"><div class="filter-grid"><input id="audit-query" placeholder="Search event content"><select id="audit-type-filter"><option value="">All event types</option></select><select id="audit-tool-filter"><option value="">All tools</option></select><select id="audit-actor-filter"><option value="">All actors</option></select><select id="audit-outcome-filter"><option value="">All outcomes</option></select></div><div class="toolbar"><div class="row"><input id="audit-from" type="date" aria-label="From date"><input id="audit-to" type="date" aria-label="To date"><button class="secondary" id="audit-reset" type="button">Reset filters</button></div><span class="chip" id="audit-integrity">Not verified</span></div></div>
+          <div class="panel stack"><div class="panel-head"><h2>Events</h2><span class="muted" id="audit-showing">0 events</span></div><div id="audit-events" class="list"></div><div class="pagination"><span class="muted" id="audit-page-label">Page 1 of 1</span><div class="row"><label class="switch-label">Rows <select id="audit-page-size"><option>10</option><option selected>25</option><option>50</option><option>100</option></select></label><button class="secondary" id="audit-prev" type="button">Previous</button><button class="secondary" id="audit-next" type="button">Next</button></div></div><pre id="audit-log" class="output" hidden>No audit loaded.</pre></div>
         </div>
       </section>
 
       <section id="view-usage" class="view">
-        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Runtime consumption</div><h1>Usage</h1><p>Model tokens, tool activity, failures, and provider routing from the signed audit trail.</p></div><span class="pill" id="status-pill">Unknown</span></div><div class="stat-strip"><div class="stat-card"><strong id="usage-total-tokens">0</strong><span>total tokens</span></div><div class="stat-card"><strong id="usage-model-calls">0</strong><span>model calls</span></div><div class="stat-card"><strong id="metric-runs">0</strong><span>runs</span></div><div class="stat-card"><strong id="usage-errors">0</strong><span>errors</span></div></div><div class="usage-grid"><div class="panel stack"><div class="panel-head"><h2>Activity by day</h2><span class="muted">last 14 days</span></div><div id="usage-chart" class="bar-chart"></div></div><div class="panel stack"><div class="panel-head"><h2>Provider routes</h2><span class="muted">credentials never shown</span></div><div id="provider-list" class="list"></div></div></div><div class="panel table-panel"><div class="panel-head"><h2>Recent metered runs</h2><button class="secondary" data-view-jump="audit" type="button">Open Audit</button></div><div id="runs" class="list"></div></div><div hidden><span id="metric-tools"></span><span id="metric-completed"></span><span id="metric-policy"></span><span id="runtime-chips"></span><span id="status-workspace"></span><span id="status-state"></span><span id="tool-count"></span><select id="tool"></select><div id="tool-list"></div><div id="run-history"></div><span id="plan-run-count"></span><span id="plan-last-status"></span><div id="plan-runs"></div></div><div class="panel" hidden><button id="clear-output" type="button">Clear</button><pre id="output">Ready.</pre></div></div>
+        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Runtime consumption</div><h1>Usage</h1><p>One accounting path for model tokens, distinct runs, and failures—the same signed ledger used by Audit.</p></div><span class="pill" id="status-pill">Unknown</span></div><div class="stat-strip"><div class="stat-card"><strong id="usage-total-tokens">0</strong><span>recorded tokens</span></div><div class="stat-card"><strong id="usage-model-calls">0</strong><span>completed model runs</span></div><div class="stat-card"><strong id="metric-runs">0</strong><span>distinct runs</span></div><div class="stat-card"><strong id="usage-errors">0</strong><span>failed or denied</span></div></div><div class="usage-grid"><div class="panel stack"><div class="panel-head"><h2>Ledger events by day</h2><span class="muted">last 14 days</span></div><div id="usage-chart" class="bar-chart"></div></div><div class="panel stack"><div class="panel-head"><h2>Provider routes</h2><span class="muted">credentials never shown</span></div><div id="provider-list" class="list"></div></div></div><div class="panel table-panel"><div class="panel-head"><h2>Recent metered runs</h2><button class="secondary" data-view-jump="audit" type="button">Open Audit</button></div><div id="runs" class="list"></div></div><div hidden><span id="metric-tools"></span><span id="metric-completed"></span><span id="metric-policy"></span><span id="runtime-chips"></span><span id="status-workspace"></span><span id="status-state"></span><span id="tool-count"></span><select id="tool"></select><div id="tool-list"></div><div id="run-history"></div><span id="plan-run-count"></span><span id="plan-last-status"></span><div id="plan-runs"></div></div><div class="panel" hidden><button id="clear-output" type="button">Clear</button><pre id="output">Ready.</pre></div></div>
       </section>
 
       <section id="view-agents" class="view">
-        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Agent SDK v0.3</div><h1>Agents</h1><p>Create a manifest from the fields below, then validate and install it. Advanced JSON remains available for unusual packages.</p></div><div class="row"><button id="new-agent" type="button">Create Manifest</button><button class="secondary" id="refresh-agents" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="agent-total">0</strong><span>packages</span></div><div class="stat-card"><strong id="agent-enabled">0</strong><span>enabled</span></div><div class="stat-card"><strong id="agent-quarantined">0</strong><span>quarantined</span></div><div class="stat-card"><strong>v0.3</strong><span>SDK contract</span></div></div><div class="agent-layout"><div class="panel stack"><div class="panel-head"><h2>Package registry</h2><input id="agent-query" placeholder="Filter agents"></div><div id="agent-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Package inspector</h2><span class="chip" id="agent-detail-status">No selection</span></div><div id="agent-detail" class="empty-state"><strong>Select an agent package</strong><span>Identity, instructions, tools, plugins, secrets, sandbox, network, schedules, channels, memory, integrity, and tests will appear here.</span></div><div class="row"><button id="agent-enable" type="button" disabled>Enable</button><button class="secondary" id="agent-disable" type="button" disabled>Disable</button><button class="danger-button" id="agent-quarantine" type="button" disabled>Quarantine</button></div></div></div><dialog id="agent-dialog" class="editor-dialog"><form method="dialog" id="agent-form"><div class="panel-head"><div><h2>Create Agent SDK manifest</h2><span class="muted">New packages install disabled until explicitly enabled.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div id="manifest-fields" class="manifest-fields"><div class="grid-2"><div class="field"><label for="agent-id">Package ID</label><input id="agent-id" pattern="[a-z0-9][a-z0-9._-]{1,63}" value="example-agent" required></div><div class="field"><label for="agent-version">Version</label><input id="agent-version" value="1.0.0" required></div></div><div class="field"><label for="agent-name">Display name</label><input id="agent-name" value="Example Agent" required></div><div class="field"><label for="agent-identity">Identity name</label><input id="agent-identity" value="Example"></div><div class="field"><label for="agent-instructions">Instruction files <span class="muted">comma-separated</span></label><input id="agent-instructions" value="AGENTS.md"></div><div class="field"><label for="agent-tools">Tools <span class="muted">comma-separated</span></label><input id="agent-tools" value="workspace.readText"></div><div class="grid-2"><div class="field"><label for="agent-plugins">Plugins <span class="muted">comma-separated</span></label><input id="agent-plugins"></div><div class="field"><label for="agent-secrets">Secret names <span class="muted">comma-separated</span></label><input id="agent-secrets"></div></div><div class="grid-2"><div class="field"><label for="agent-sandbox">Sandbox mode</label><select id="agent-sandbox"><option value="workspace-write">workspace-write</option><option value="workspace-read">workspace-read</option><option value="container">container</option></select></div><div class="field"><label for="agent-network">Network allowlist <span class="muted">comma-separated</span></label><input id="agent-network" placeholder="api.example.com"></div></div></div><div class="manifest-advanced"><label><input type="checkbox" id="agent-advanced-toggle"> Edit full manifest JSON</label><textarea id="agent-manifest" class="manifest-editor" hidden>{"sdkVersion":"0.3","id":"example-agent","version":"1.0.0","name":"Example Agent","identity":{"name":"Example"},"instructions":["AGENTS.md"],"tools":["workspace.readText"],"plugins":[],"secrets":[],"sandbox":{"mode":"workspace-write"},"network":{"default":"deny","allow":[]},"schedules":[],"channels":[],"memory":{},"tests":[]}</textarea></div><div class="row"><button id="validate-agent" value="default" type="submit">Validate &amp; Install</button></div></form></dialog></div>
+        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Agent SDK v0.3</div><h1>Agents</h1><p>Create, validate, inspect, and explicitly enable permissioned agent packages.</p></div><div class="row"><button id="new-agent" type="button">Create Manifest</button><button class="secondary" id="refresh-agents" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="agent-total">0</strong><span>packages</span></div><div class="stat-card"><strong id="agent-enabled">0</strong><span>enabled</span></div><div class="stat-card"><strong id="agent-quarantined">0</strong><span>quarantined</span></div><div class="stat-card"><strong>v0.3</strong><span>SDK contract</span></div></div><div class="agent-layout"><div class="panel stack"><div class="panel-head"><h2>Package registry</h2><input id="agent-query" placeholder="Filter agents"></div><div id="agent-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Package inspector</h2><span class="chip" id="agent-detail-status">No selection</span></div><div id="agent-detail" class="empty-state"><strong>Select an agent package</strong><span>Identity, permissions, integrity, and tests will appear here.</span></div><div class="row"><button id="agent-enable" type="button" disabled>Enable</button><button class="secondary" id="agent-disable" type="button" disabled>Disable</button><button class="danger-button" id="agent-quarantine" type="button" disabled>Quarantine</button></div></div></div>
+          <dialog id="agent-dialog" class="editor-dialog"><form method="dialog" id="agent-form"><div class="panel-head"><div><h2>Create Agent SDK manifest</h2><span class="muted">New packages install disabled until explicitly enabled.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div id="manifest-fields" class="manifest-fields"><div class="grid-2"><div class="field"><label for="agent-id">Package ID</label><input id="agent-id" pattern="[a-z0-9][a-z0-9._\\-]{1,63}" value="example-agent" required></div><div class="field"><label for="agent-version">Version</label><input id="agent-version" value="1.0.0" required></div></div><div class="field"><label for="agent-name">Display name</label><input id="agent-name" value="Example Agent" required></div><div class="field"><label for="agent-identity">Identity name</label><input id="agent-identity" value="Example"></div><div class="field"><label for="agent-instructions">Instruction files <span class="muted">comma-separated</span></label><input id="agent-instructions" value="AGENTS.md"></div><div class="field"><label for="agent-tools">Tools <span class="muted">comma-separated</span></label><input id="agent-tools" value="workspace.readText"></div><div class="grid-2"><div class="field"><label for="agent-plugins">Plugins</label><input id="agent-plugins"></div><div class="field"><label for="agent-secrets">Secret names</label><input id="agent-secrets"></div></div><div class="grid-2"><div class="field"><label for="agent-sandbox">Sandbox mode</label><select id="agent-sandbox"><option value="workspace-write">workspace-write</option><option value="workspace-read">workspace-read</option><option value="container">container</option></select></div><div class="field"><label for="agent-network">Network allowlist</label><input id="agent-network" placeholder="api.example.com"></div></div></div><div class="manifest-advanced"><label class="switch-label"><input type="checkbox" id="agent-advanced-toggle"> Edit full manifest JSON</label><div id="agent-manifest-error" class="inline-error" role="alert"></div><textarea id="agent-manifest" class="manifest-editor" hidden></textarea></div><div class="row"><button id="validate-agent" value="default" type="submit">Validate &amp; Install</button></div></form></dialog>
+        </div>
       </section>
 
       <section id="view-skills" class="view">
-        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Capability instructions</div><h1>Skills</h1><p>Discovered SKILL.md packages and installed skill extensions.</p></div><button class="secondary" id="refresh-skills" type="button">Refresh</button></div><div class="panel stack"><div class="toolbar"><input id="skill-query" placeholder="Filter by name, description, status, or path"><div class="chip-row"><button class="secondary skill-filter active" data-skill-filter="all" type="button">All</button><button class="secondary skill-filter" data-skill-filter="ready" type="button">Ready</button><button class="secondary skill-filter" data-skill-filter="draft" type="button">Drafts</button></div></div><div id="skills-list" class="record-grid"></div></div></div>
+        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Skill SDK v0.1</div><h1>Skills</h1><p>Package reusable instructions with declared requirements, integrity verification, and explicit lifecycle controls.</p></div><div class="row"><button id="new-skill" type="button">Create Skill</button><button class="secondary" id="refresh-skills" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="skill-total">0</strong><span>packages found</span></div><div class="stat-card"><strong id="skill-enabled">0</strong><span>enabled</span></div><div class="stat-card"><strong id="skill-unmanaged">0</strong><span>unmanaged</span></div><div class="stat-card"><strong id="skill-quarantined">0</strong><span>quarantined</span></div></div><div class="agent-layout"><div class="panel stack"><div class="toolbar"><input id="skill-query" placeholder="Filter skill packages"><select id="skill-status-filter"><option value="all">All statuses</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="unmanaged">Unmanaged</option><option value="quarantined">Quarantined</option></select></div><div id="skills-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Package inspector</h2><span class="chip" id="skill-detail-status">No selection</span></div><div id="skill-detail" class="empty-state"><strong>Select a skill</strong><span>Requirements, source, integrity, and lifecycle will appear here.</span></div><div class="row"><button id="skill-enable" type="button" disabled>Enable</button><button class="secondary" id="skill-disable" type="button" disabled>Disable</button><button class="secondary" id="skill-verify" type="button" disabled>Verify</button><button class="danger-button" id="skill-quarantine" type="button" disabled>Quarantine</button></div></div></div>
+          <dialog id="skill-dialog" class="editor-dialog"><form method="dialog" id="skill-form"><div class="panel-head"><div><h2>Create Skill SDK package</h2><span class="muted">Installed packages start disabled and untrusted.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div class="grid-2"><div class="field"><label for="skill-id">Package ID</label><input id="skill-id" pattern="[a-z0-9][a-z0-9\\-]{1,63}" placeholder="release-verifier" required></div><div class="field"><label for="skill-version">Version</label><input id="skill-version" value="1.0.0" required></div></div><div class="field"><label for="skill-name">Display name</label><input id="skill-name" placeholder="Release Verifier" required></div><div class="field"><label for="skill-description">When should it run?</label><textarea id="skill-description" placeholder="Use when a release needs a repeatable verification pass." required></textarea></div><div class="field"><label for="skill-instructions">Instructions</label><textarea id="skill-instructions" class="workshop-editor" placeholder="## Workflow&#10;&#10;1. Inspect the release..." required></textarea></div><div class="grid-2"><div class="field"><label for="skill-tools">Requested tools</label><input id="skill-tools" placeholder="workspace.readText"></div><div class="field"><label for="skill-capabilities">Requested capabilities</label><input id="skill-capabilities" placeholder="workspace.read"></div></div><div class="grid-2"><div class="field"><label for="skill-secrets">Requested secrets</label><input id="skill-secrets"></div><div class="field"><label for="skill-network">Network allowlist</label><input id="skill-network" placeholder="github.com"></div></div><div class="row"><button value="default" type="submit">Validate &amp; Install</button></div></form></dialog>
+        </div>
       </section>
     </main>
   </div>
@@ -2649,14 +2922,20 @@ function renderConsoleHtml() {
       messages: [],
       modelOverride: "",
       audit: [],
-      auditFilter: "all",
+      auditPage: 1,
+      auditPagination: { page: 1, pages: 1 },
       browserTabId: "",
-      taskFilter: "all",
       selectedTaskId: "",
       selectedAgentId: "",
       agents: [],
       skills: [],
-      skillFilter: "all"
+      selectedSkillId: "",
+      projects: [],
+      selectedProjectId: "",
+      memories: [],
+      selectedMemoryId: "",
+      memoryHealth: null,
+      agentManifestDraft: null
     };
     const planTemplates = {
       smoke: {
@@ -2843,6 +3122,9 @@ function renderConsoleHtml() {
       if (name === "cron") refreshCron().catch((error) => showOutput(error.message));
       if (name === "agents") refreshAgents().catch((error) => showOutput(error.message));
       if (name === "skills") refreshSkills().catch((error) => showOutput(error.message));
+      if (name === "projects") refreshProjects().catch((error) => showOutput(error.message));
+      if (name === "memory") refreshMemory().catch((error) => showOutput(error.message));
+      if (name === "goals") refreshGoals().catch((error) => showOutput(error.message));
     }
 
     function renderItemText(text, fallback) {
@@ -2861,13 +3143,9 @@ function renderConsoleHtml() {
     }
 
     function renderAuditEvent(event) {
-      const text = JSON.stringify(event);
-      const isError = /fail|error|denied/i.test(text);
-      const isModel = /model\.chat|provider|assistant/i.test(text);
-      if (state.auditFilter === "model" && !isModel) return "";
-      if (state.auditFilter === "error" && !isError) return "";
-      const query = $("audit-query")?.value.trim().toLowerCase();
-      if (query && !text.toLowerCase().includes(query)) return "";
+      const outcome = ["task.failed", "plan.failed"].includes(event.type) ? "failed" : (event.type === "task.blocked" || event.decision === "deny") ? "denied" : event.type === "task.completed" ? "completed" : event.type === "task.started" ? "running" : "recorded";
+      const isError = ["failed", "denied"].includes(outcome);
+      const isModel = ["model.chat", "agent.run"].includes(event.tool);
       const tone = isError ? "danger" : isModel ? "ok" : "";
       const kind = event.type || event.event || "audit event";
       const labels = {
@@ -2879,7 +3157,7 @@ function renderConsoleHtml() {
       const subject = event.tool ? "Tool " + event.tool : event.capability ? "Capability " + event.capability : "Runtime event";
       const summary = event.message || (event.decision ? "Decision: " + event.decision : event.status ? "Status: " + event.status : subject);
       const metadata = [event.actor && "Actor: " + event.actor, event.runId && "Run: " + event.runId, event.capability && "Capability: " + event.capability, event.tool && "Tool: " + event.tool].filter(Boolean);
-      return '<div class="item activity-event ' + (isError ? "error" : "") + '"><div class="item-line"><strong>' + escapeHtml(title) + '</strong><span class="chip ' + tone + '">' + escapeHtml(event.status || event.decision || (isError ? "error" : "recorded")) + '</span></div><div class="muted">' + escapeHtml(event.at || event.timestamp || "") + ' · ' + escapeHtml(kind) + '</div><p class="activity-summary">' + escapeHtml(summary) + '</p><div class="activity-meta">' + metadata.map((value) => '<span>' + escapeHtml(value) + '</span>').join("") + '</div><details class="activity-details"><summary>Show event details</summary><pre>' + escapeHtml(JSON.stringify(event, null, 2)) + '</pre></details></div>';
+      return '<div class="item activity-event ' + (isError ? "error" : "") + '"><div class="item-line"><strong>' + escapeHtml(title) + '</strong><span class="chip ' + tone + '">' + escapeHtml(outcome) + '</span></div><div class="muted">' + escapeHtml(event.at || event.timestamp || "") + ' · ' + escapeHtml(kind) + '</div><p class="activity-summary">' + escapeHtml(summary) + '</p><div class="activity-meta">' + metadata.map((value) => '<span>' + escapeHtml(value) + '</span>').join("") + '</div><details class="activity-details"><summary>Show event details</summary><pre>' + escapeHtml(JSON.stringify(event, null, 2)) + '</pre></details></div>';
     }
 
     function renderProvider(provider) {
@@ -2909,14 +3187,18 @@ function renderConsoleHtml() {
 
     function renderSessionRecord(session) {
       const updated = session.updatedAt || session.createdAt || "";
+      const project = state.projects.find((entry) => entry.id === session.projectId);
+      const knownProjectOptions = state.projects.filter((entry) => entry.status === "active" || entry.id === session.projectId).map((entry) => '<option value="' + escapeHtml(entry.id) + '"' + (entry.id === session.projectId ? " selected" : "") + '>' + escapeHtml(entry.name + (entry.status === "archived" ? " (archived)" : "")) + '</option>').join("");
+      const projectOptions = project ? knownProjectOptions : '<option value="' + escapeHtml(session.projectId) + '" selected>' + escapeHtml(session.projectId + " (unavailable)") + '</option>' + knownProjectOptions;
       return '<div class="data-row clickable session-record" data-session-id="' + escapeHtml(session.id) + '">' +
         '<span class="data-primary"><strong>' + renderItemText(session.title, "Untitled session") + '</strong><small>' + escapeHtml(session.id) + '</small></span>' +
+        '<span>' + escapeHtml(project?.name || session.projectId || "Workspace") + (project?.status === "archived" ? ' <span class="chip">archived</span>' : '') + '</span>' +
         '<span class="chip">' + escapeHtml(session.source || "direct") + '</span>' +
         '<span class="chip ' + (session.status === "archived" ? "" : "ok") + '">' + escapeHtml(session.status || "open") + '</span>' +
         '<span>' + escapeHtml(session.runtime || "odinn") + '</span>' +
         '<span class="muted">' + escapeHtml(relativeTime(updated)) + '</span>' +
         '<span>' + escapeHtml(session.messageCount || 0) + '</span>' +
-        '<span class="row"><button class="session-action" data-session-action="rename" data-session-id="' + escapeHtml(session.id) + '" title="Rename session" aria-label="Rename session">Rename</button><button class="session-action delete" data-session-action="delete" data-session-id="' + escapeHtml(session.id) + '" title="Delete session" aria-label="Delete session">Delete</button></span>' +
+        '<span class="row"><select class="session-project-select" data-session-project="' + escapeHtml(session.id) + '" aria-label="Move session to project">' + projectOptions + '</select><button class="session-action" data-session-action="rename" data-session-id="' + escapeHtml(session.id) + '" title="Rename session" aria-label="Rename session">Rename</button><button class="session-action delete" data-session-action="delete" data-session-id="' + escapeHtml(session.id) + '" title="Delete session" aria-label="Delete session">Delete</button></span>' +
       '</div>';
     }
 
@@ -2999,10 +3281,11 @@ function renderConsoleHtml() {
     }
 
     async function createChat(title = "Beta chat") {
+      const selectedProject = state.projects.find((project) => project.id === state.selectedProjectId && project.status === "active");
       const session = await api("/sessions", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title, source: "console-chat", tags: ["chat"] })
+        body: JSON.stringify({ title, source: "console-chat", tags: ["chat"], projectId: selectedProject?.id || "project_default" })
       });
       state.activeChatId = session.id;
       state.selectedSessionId = session.id;
@@ -3230,9 +3513,14 @@ function renderConsoleHtml() {
         $("cron-tool").innerHTML = status.tools.map((tool) => '<option value="' + escapeHtml(tool) + '">' + escapeHtml(tool) + '</option>').join("");
         $("tool-list").innerHTML = status.toolDetails.map((tool) => renderRecord(tool, tool.name, tool.capability + " | " + tool.description)).join("");
         const background = [refreshRuns()];
-        if (status.allowedCapabilities.includes("memory.read")) background.push(refreshMemory());
-        if (status.allowedCapabilities.includes("session.read")) background.push(refreshSessions());
-        if (status.allowedCapabilities.includes("goal.read")) background.push(refreshGoals());
+        background.push((async () => {
+          const canReadSessions = status.allowedCapabilities.includes("session.read");
+          const canReadGoals = status.allowedCapabilities.includes("goal.read");
+          if (canReadSessions && canReadGoals) await refreshProjects();
+          if (canReadSessions) await refreshSessions();
+          if (canReadGoals) await refreshGoals();
+          if (status.allowedCapabilities.includes("memory.read")) await refreshMemory();
+        })());
         await Promise.allSettled(background);
         await refreshApprovals();
       } catch (error) {
@@ -3258,48 +3546,62 @@ function renderConsoleHtml() {
     }
 
     async function refreshTasks() {
-      const runs = await api("/runs");
-      state.runs = runs;
+      const data = await api("/tasks?includeSystem=" + String($("task-system-toggle")?.checked === true));
+      state.tasks = data.tasks || [];
+      renderTasks();
+      $("task-total").textContent = data.summary.total;
+      $("task-running").textContent = data.summary.running;
+      $("task-passed").textContent = data.summary.completed;
+      $("task-failed").textContent = data.summary.needsReview;
+    }
+
+    function renderTasks() {
       const query = $("task-query")?.value.trim().toLowerCase() || "";
-      const filtered = runs.filter((run) => (state.taskFilter === "all" || run.status === state.taskFilter || (state.taskFilter === "failed" && ["failed", "blocked", "cancelled"].includes(run.status))) && (!query || JSON.stringify(run).toLowerCase().includes(query)));
-      $("task-total").textContent = runs.length;
-      $("task-running").textContent = runs.filter((run) => run.status === "running").length;
-      $("task-passed").textContent = runs.filter((run) => run.status === "completed").length;
-      $("task-failed").textContent = runs.filter((run) => ["failed", "blocked", "cancelled"].includes(run.status)).length;
-      $("task-table").innerHTML = filtered.map((run) => {
-        const started = run.events?.find((event) => event.type === "task.started") || {};
-        const last = run.events?.at(-1) || {};
-        const proofCount = run.events?.filter((event) => /proof|verify|audit/i.test(event.type || "")).length || 0;
-        const tone = run.status === "completed" ? "ok" : run.status === "running" ? "warn" : "danger";
-        return '<div class="data-row task-row" data-task-id="' + escapeHtml(run.id) + '"><span class="data-primary"><strong>' + escapeHtml(run.tool || run.id) + '</strong><small>' + escapeHtml(run.id) + '</small></span><span class="chip ' + tone + '">' + escapeHtml(run.status) + '</span><span>' + escapeHtml(started.actor || "gateway") + '</span><span class="muted">' + escapeHtml(relativeTime(last.at || started.at)) + '</span><span>' + escapeHtml(proofCount ? proofCount + " proof events" : (run.events?.length || 0) + " audit events") + '</span><span class="row"><button class="secondary" data-task-inspect="' + escapeHtml(run.id) + '" type="button">Inspect</button></span></div>';
+      const status = $("task-status-filter")?.value || "all";
+      const category = $("task-category-filter")?.value || "all";
+      const filtered = (state.tasks || []).filter((task) => {
+        const statusMatches = status === "all" || (status === "active" && ["queued", "running", "cancelling", "awaiting_approval"].includes(task.status)) || (status === "review" && ["failed", "denied", "blocked", "cancelled", "needs-review"].includes(task.status)) || task.status === status;
+        return statusMatches && (category === "all" || task.category === category) && (!query || JSON.stringify(task).toLowerCase().includes(query));
+      });
+      $("task-table").innerHTML = filtered.map((task) => {
+        const tone = task.status === "completed" ? "ok" : ["queued", "running", "cancelling", "awaiting_approval"].includes(task.status) ? "warn" : "danger";
+        const record = task.evidenceCount ? task.evidenceCount + " proof records" : task.eventCount + " ledger events";
+        return '<div class="data-row task-row" data-task-id="' + escapeHtml(task.id) + '"><span class="data-primary"><strong>' + escapeHtml(task.title) + '</strong><small>' + escapeHtml(task.tool + " · " + task.id) + '</small></span><span class="chip ' + tone + '">' + escapeHtml(task.status) + '</span><span>' + escapeHtml(task.category) + '</span><span class="muted">' + escapeHtml(relativeTime(task.updatedAt)) + (task.durationMs !== null ? '<small> · ' + escapeHtml(formatDuration(task.durationMs)) + '</small>' : '') + '</span><span>' + escapeHtml(record) + '</span><span class="row"><button class="secondary" data-task-inspect="' + escapeHtml(task.id) + '" type="button">Inspect</button></span></div>';
       }).join("") || '<div class="empty-state"><strong>No matching tasks</strong><span>The proof and audit ledger is quiet.</span></div>';
     }
 
+    function formatDuration(value) {
+      if (!Number.isFinite(value)) return "—";
+      if (value < 1000) return value + "ms";
+      if (value < 60000) return (value / 1000).toFixed(1) + "s";
+      return Math.floor(value / 60000) + "m " + Math.round(value % 60000 / 1000) + "s";
+    }
+
     async function inspectTask(id) {
-      const detail = await api("/runs/" + encodeURIComponent(id));
+      const detail = await api("/tasks/" + encodeURIComponent(id));
       state.selectedTaskId = id;
-      $("task-detail-label").textContent = id;
-      $("task-evidence").textContent = JSON.stringify(detail, null, 2);
-      $("task-verify").disabled = false;
-      const started = detail.events?.find((event) => event.type === "task.started");
-      $("task-replay").disabled = !started;
+      const task = detail.task || {};
+      $("task-detail-label").textContent = task.title ? task.title + " · " + id : id;
+      $("task-summary").innerHTML = [
+        ["Outcome", task.status || "unknown"], ["Origin", task.category || task.actor || "unknown"],
+        ["Duration", formatDuration(task.durationMs)], ["Replay", task.replayable ? "Safe to retry" : task.replayReason || "Unavailable"]
+      ].map(([label, value]) => '<div class="item"><div class="muted">' + escapeHtml(label) + '</div><strong>' + escapeHtml(value) + '</strong></div>').join("");
+      $("task-evidence").innerHTML = (detail.run?.events || []).map((event) => '<div class="timeline-row"><span class="timeline-dot"></span><div class="item"><div class="item-line"><strong>' + escapeHtml(event.type) + '</strong><span class="chip">' + escapeHtml(event.decision || "recorded") + '</span></div><div class="muted">' + escapeHtml(event.at) + '</div><div>' + escapeHtml(event.message || event.tool || "") + '</div></div></div>').join("") || '<div class="empty-state"><strong>No ledger events</strong><span>This task only has queue metadata.</span></div>';
+      $("task-raw").textContent = JSON.stringify(detail, null, 2);
+      $("task-verify").disabled = !detail.ledger;
+      $("task-replay").disabled = !task.replayable;
     }
 
     async function refreshUsage() {
-      const [audit, runs] = await Promise.all([api("/audit"), api("/runs")]);
-      const modelEvents = audit.filter((event) => /model\.chat|agent\.run|provider/i.test(JSON.stringify(event)));
-      const totalTokens = audit.reduce((sum, event) => sum + Number(event.data?.output?.usage?.totalTokens || event.data?.output?.usage?.total_tokens || 0), 0);
-      $("usage-total-tokens").textContent = totalTokens.toLocaleString();
-      $("usage-model-calls").textContent = modelEvents.filter((event) => event.type === "task.completed").length;
-      $("usage-errors").textContent = audit.filter((event) => /fail|error|denied/i.test(JSON.stringify(event))).length;
-      const days = [];
-      for (let offset = 13; offset >= 0; offset -= 1) {
-        const day = new Date(Date.now() - offset * 86400000).toISOString().slice(0, 10);
-        days.push({ day, count: audit.filter((event) => String(event.at || event.timestamp || "").startsWith(day)).length });
-      }
-      const max = Math.max(1, ...days.map((day) => day.count));
-      $("usage-chart").innerHTML = days.map((day) => '<span class="bar-column" title="' + escapeHtml(day.day + ': ' + day.count + ' events') + '"><i style="height:' + Math.max(3, Math.round(day.count / max * 165)) + 'px"></i><small>' + escapeHtml(day.day.slice(5)) + '</small></span>').join("");
-      $("runs").innerHTML = runs.slice(0, 12).map(renderRun).join("") || '<div class="empty-state"><strong>No usage yet</strong><span>Model and tool activity will appear here.</span></div>';
+      const data = await api("/usage");
+      const summary = data.summary || {};
+      $("usage-total-tokens").textContent = Number(summary.totalTokens || 0).toLocaleString();
+      $("usage-model-calls").textContent = summary.modelRuns || 0;
+      $("metric-runs").textContent = summary.runs || 0;
+      $("usage-errors").textContent = summary.errors || 0;
+      const max = Math.max(1, ...(data.days || []).map((day) => day.events));
+      $("usage-chart").innerHTML = (data.days || []).map((day) => '<span class="bar-column" title="' + escapeHtml(day.day + ': ' + day.events + ' events · ' + day.tokens + ' tokens') + '"><i style="height:' + Math.max(3, Math.round(day.events / max * 165)) + 'px"></i><small>' + escapeHtml(day.day.slice(5)) + '</small></span>').join("");
+      $("runs").innerHTML = (data.runs || []).slice(0, 12).map(renderRun).join("") || '<div class="empty-state"><strong>No model usage yet</strong><span>Completed model and agent runs will appear here.</span></div>';
     }
 
     async function refreshCron() {
@@ -3342,21 +3644,137 @@ function renderConsoleHtml() {
       const data = await api("/skills");
       state.skills = data.skills || [];
       const query = $("skill-query")?.value.trim().toLowerCase() || "";
-      const skills = state.skills.filter((skill) => (state.skillFilter === "all" || skill.status === state.skillFilter) && (!query || JSON.stringify(skill).toLowerCase().includes(query)));
-      $("skills-list").innerHTML = skills.map((skill) => '<div class="item skill-card"><div class="item-line"><strong>' + escapeHtml(skill.name) + '</strong><span class="chip ' + (skill.status === "ready" ? "ok" : "warn") + '">' + escapeHtml(skill.status) + '</span></div><p>' + escapeHtml(skill.description || "No description") + '</p><div class="muted skill-path">' + escapeHtml(skill.path || skill.entrypoint || "") + '</div><div class="chip-row"><span class="chip">' + escapeHtml(skill.bytes ? skill.bytes + " bytes" : skill.version || "package") + '</span></div></div>').join("") || '<div class="empty-state"><strong>No matching skills</strong><span>Create a draft in Skill Workshop.</span></div>';
+      const status = $("skill-status-filter")?.value || "all";
+      const skills = state.skills.filter((skill) => (status === "all" || skill.status === status) && (!query || JSON.stringify(skill).toLowerCase().includes(query)));
+      $("skill-total").textContent = state.skills.length;
+      $("skill-enabled").textContent = state.skills.filter((skill) => skill.status === "enabled").length;
+      $("skill-unmanaged").textContent = state.skills.filter((skill) => skill.status === "unmanaged" || skill.status === "draft").length;
+      $("skill-quarantined").textContent = state.skills.filter((skill) => skill.status === "quarantined").length;
+      $("skills-list").innerHTML = skills.map((skill) => '<div class="item skill-card ' + (skill.id === state.selectedSkillId ? "selected" : "") + '" data-skill-id="' + escapeHtml(skill.id) + '"><div class="item-line"><strong>' + escapeHtml(skill.name) + '</strong><span class="chip ' + (skill.status === "enabled" ? "ok" : skill.status === "quarantined" ? "danger" : "warn") + '">' + escapeHtml(skill.status) + '</span></div><p>' + escapeHtml(skill.description || "No description") + '</p><div class="muted skill-path">' + escapeHtml(skill.path || skill.entrypoint || "") + '</div><div class="chip-row"><span class="chip">' + escapeHtml(skill.source || "managed") + '</span><span class="chip">' + escapeHtml(skill.version || (skill.bytes ? skill.bytes + " bytes" : "package")) + '</span></div></div>').join("") || '<div class="empty-state"><strong>No matching skills</strong><span>Create a managed Skill SDK package or change the filter.</span></div>';
+      if (state.selectedSkillId) renderSkillDetail(state.skills.find((skill) => skill.id === state.selectedSkillId));
+    }
+
+    function renderSkillDetail(skill) {
+      if (!skill) return;
+      state.selectedSkillId = skill.id;
+      $("skill-detail-status").textContent = skill.status;
+      $("skill-detail-status").className = "chip " + (skill.status === "enabled" ? "ok" : skill.status === "quarantined" ? "danger" : "warn");
+      const requirements = [
+        ["Tools", skill.requestedTools || []], ["Capabilities", skill.requestedCapabilities || []], ["Secrets", skill.requestedSecrets || []],
+        ["Network", skill.network?.allow || []], ["Integrity", skill.verification?.valid === true ? "verified" : skill.verification?.valid === false ? "failed" : skill.integrity ? "recorded" : "unmanaged"], ["Source", skill.source || "managed"]
+      ];
+      $("skill-detail").className = "agent-inspector";
+      $("skill-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(skill.name) + '</strong><p>' + escapeHtml(skill.description || "No description") + '</p><div class="muted">' + escapeHtml(skill.id + (skill.version ? "@" + skill.version : "")) + '</div></div>' + requirements.map(([label, value]) => '<div class="agent-section"><strong>' + escapeHtml(label) + '</strong><pre>' + escapeHtml(Array.isArray(value) ? (value.join("\\n") || "None") : value) + '</pre></div>').join("");
+      const managed = skill.source === "managed";
+      $("skill-enable").disabled = !managed || skill.status === "enabled";
+      $("skill-disable").disabled = !managed || skill.status === "disabled";
+      $("skill-verify").disabled = !managed;
+      $("skill-quarantine").disabled = !managed || skill.status === "quarantined";
+      document.querySelectorAll("[data-skill-id]").forEach((item) => item.classList.toggle("selected", item.dataset.skillId === skill.id));
+    }
+
+    async function refreshProjects() {
+      const projectData = await api("/projects?includeArchived=true");
+      const sessionData = await api("/sessions?limit=100");
+      const goalData = await api("/goals?limit=100");
+      state.projects = projectData.projects || [];
+      state.sessions = sessionData.sessions || [];
+      state.goals = goalData.goals || [];
+      if (!state.selectedProjectId || !state.projects.some((project) => project.id === state.selectedProjectId)) state.selectedProjectId = projectData.defaultProjectId || state.projects[0]?.id || "";
+      const query = $("project-query")?.value.trim().toLowerCase() || "";
+      const projects = state.projects.filter((project) => !query || JSON.stringify(project).toLowerCase().includes(query));
+      $("project-total").textContent = state.projects.filter((project) => project.status === "active").length;
+      $("project-session-count").textContent = state.projects.reduce((sum, project) => sum + Number(project.sessionCount || 0), 0);
+      $("project-goal-count").textContent = state.projects.reduce((sum, project) => sum + Number(project.goalCount || 0), 0);
+      $("project-active-goal-count").textContent = state.projects.reduce((sum, project) => sum + Number(project.activeGoalCount || 0), 0);
+      $("project-list").innerHTML = projects.map((project) => '<div class="item project-card ' + (project.id === state.selectedProjectId ? "selected" : "") + '" data-project-id="' + escapeHtml(project.id) + '"><div class="item-line"><strong>' + escapeHtml(project.name) + '</strong><span class="chip ' + (project.status === "active" ? "ok" : "") + '">' + escapeHtml(project.status) + '</span></div><p>' + escapeHtml(project.description || "No description") + '</p><div class="chip-row"><span class="chip">' + escapeHtml(project.sessionCount + " sessions") + '</span><span class="chip">' + escapeHtml(project.goalCount + " goals") + '</span></div></div>').join("") || '<div class="empty-state"><strong>No matching projects</strong><span>Create one or clear the filter.</span></div>';
+      populateScopeSelectors();
+      renderProjectDetail(state.projects.find((project) => project.id === state.selectedProjectId));
+    }
+
+    function renderProjectDetail(project) {
+      if (!project) return;
+      state.selectedProjectId = project.id;
+      const sessions = (state.sessions || []).filter((session) => session.projectId === project.id);
+      const goals = (state.goals || []).filter((goal) => goal.projectId === project.id);
+      $("project-detail-status").textContent = project.status;
+      $("project-detail").className = "agent-inspector";
+      $("project-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(project.name) + '</strong><p>' + escapeHtml(project.description || "No description") + '</p><div class="muted">' + escapeHtml(project.id) + '</div></div><div class="agent-section"><strong>Sessions</strong><pre>' + escapeHtml(sessions.map((session) => session.title).join("\\n") || "None") + '</pre></div><div class="agent-section"><strong>Goals</strong><pre>' + escapeHtml(goals.map((goal) => goal.status + " · " + goal.title).join("\\n") || "None") + '</pre></div>';
+      $("project-open-sessions").disabled = false;
+      $("project-open-goals").disabled = false;
+      $("project-archive").disabled = project.id === "project_default" || project.status === "archived";
+      document.querySelectorAll("[data-project-id]").forEach((item) => item.classList.toggle("selected", item.dataset.projectId === project.id));
+    }
+
+    function populateScopeSelectors() {
+      const projectOptions = (state.projects || []).map((project) => '<option value="' + escapeHtml(project.id) + '">' + escapeHtml(project.name + (project.status === "archived" ? " (archived)" : "")) + '</option>').join("");
+      const allProjectOptions = '<option value="all">All projects</option>' + projectOptions;
+      if ($("session-project-filter")) { const selected = $("session-project-filter").value; $("session-project-filter").innerHTML = allProjectOptions; $("session-project-filter").value = selected && [...$("session-project-filter").options].some((option) => option.value === selected) ? selected : "all"; }
+      if ($("goal-project-filter")) { const selected = $("goal-project-filter").value; $("goal-project-filter").innerHTML = allProjectOptions; $("goal-project-filter").value = selected && [...$("goal-project-filter").options].some((option) => option.value === selected) ? selected : "all"; }
+      updateGoalScopeOptions();
+      updateMemoryScopeOptions();
+    }
+
+    function updateGoalScopeOptions() {
+      const type = $("goal-scope-type")?.value || "project";
+      const values = type === "session" ? (state.sessions || []).map((session) => [session.id, session.title]) : (state.projects || []).filter((project) => project.status === "active").map((project) => [project.id, project.name]);
+      $("goal-scope-id").innerHTML = values.map(([id, name]) => '<option value="' + escapeHtml(id) + '">' + escapeHtml(name) + '</option>').join("");
+    }
+
+    function updateMemoryScopeOptions() {
+      const type = $("memory-scope-type")?.value || "global";
+      $("memory-scope-id").disabled = type === "global";
+      const values = type === "session" ? (state.sessions || []).map((session) => [session.id, session.title]) : type === "project" ? (state.projects || []).map((project) => [project.id, project.name]) : [["", "Available everywhere"]];
+      $("memory-scope-id").innerHTML = values.map(([id, name]) => '<option value="' + escapeHtml(id) + '">' + escapeHtml(name) + '</option>').join("");
     }
 
     async function refreshMemory() {
       const query = $("memory-query").value.trim();
-      const data = query ? await api("/memory?query=" + encodeURIComponent(query)) : await api("/memory/curated");
-      const memories = query ? (data.memories || []) : Object.values(data.kinds || {}).flat();
-      $("memory-list").innerHTML = memories.slice(0, 16).map((memory) =>
-        renderRecord(memory, (memory.namespace ? memory.namespace + " · " : "") + (memory.subject || memory.kind), (memory.tier || "l1") + " · " + (memory.tags || []).join(", "), "")
-      ).join("") || '<div class="muted">No memory records.</div>';
-      const tree = await api("/memory/browse");
-      $("memory-tree").innerHTML = (tree.namespaces || []).map((entry) =>
-        '<div class="item"><div class="item-line"><strong>' + escapeHtml(entry.namespace) + '</strong><span class="chip">' + escapeHtml(entry.count + " records") + '</span></div><div class="muted">' + escapeHtml(Object.entries(entry.tiers || {}).map(([tier, count]) => tier + ":" + count).join(" · ")) + '</div></div>'
-      ).join("") || '<div class="empty-state"><strong>No namespaces yet</strong><span>New durable context will appear here.</span></div>';
+      const kind = $("memory-kind-filter").value;
+      const scopeType = $("memory-scope-filter").value;
+      const params = new URLSearchParams({ limit: "100" });
+      if (query) params.set("query", query);
+      if (kind) params.set("kind", kind);
+      if (scopeType) params.set("scopeType", scopeType);
+      const health = await api("/memory/status");
+      state.memoryHealth = health;
+      $("memory-new-toggle").disabled = !health.integration?.writeAllowed;
+      if (!health.integration?.readAllowed) {
+        $("memory-record-count").textContent = "—";
+        $("memory-namespace-count").textContent = "—";
+        $("memory-recall-status").textContent = "OFF";
+        $("memory-last-update").textContent = "—";
+        $("memory-health").textContent = "Memory permission required";
+        $("memory-health").className = "chip danger";
+        $("memory-result-count").textContent = "Unavailable";
+        $("memory-list").innerHTML = '<div class="empty-state"><strong>Memory is disabled by policy</strong><span>Enable memory.read to inspect and recall durable context.</span></div>';
+        $("memory-tree").innerHTML = '<div class="empty-state"><strong>Context map unavailable</strong><span>No memory contents were read.</span></div>';
+        return;
+      }
+      const data = await api("/memory?" + params);
+      const tree = await api("/memory/browse?limit=100");
+      state.memories = data.memories || [];
+      $("memory-record-count").textContent = health.records || 0;
+      $("memory-namespace-count").textContent = health.namespaces || 0;
+      $("memory-recall-status").textContent = health.integration?.readAllowed && health.integration?.autoRecall ? "ON" : "OFF";
+      $("memory-last-update").textContent = health.latestAt ? relativeTime(health.latestAt) : "—";
+      const healthy = health.integration?.readAllowed && health.integration?.writeAllowed;
+      $("memory-health").textContent = healthy ? "Memory online" : "Permission required";
+      $("memory-health").className = "chip " + (healthy ? "ok" : "danger");
+      $("memory-result-count").textContent = state.memories.length + " records";
+      $("memory-list").innerHTML = state.memories.map((memory) => '<div class="item memory-card ' + (memory.id === state.selectedMemoryId ? "selected" : "") + '" data-memory-id="' + escapeHtml(memory.id) + '"><div class="item-line"><strong>' + escapeHtml(memory.subject || memory.kind) + '</strong><span class="chip">' + escapeHtml(memory.kind) + '</span></div><p>' + escapeHtml(memory.summary || memory.text) + '</p><div class="scope-label">' + escapeHtml((memory.scopeType || "global") + (memory.scopeId ? " · " + memory.scopeId : "")) + '</div><div class="muted">' + escapeHtml(memory.authority || memory.source || "unknown source") + ' · ' + escapeHtml(relativeTime(memory.at)) + '</div></div>').join("") || '<div class="empty-state"><strong>No matching memory</strong><span>Try another search or add a durable fact.</span></div>';
+      $("memory-tree").innerHTML = (tree.namespaces || []).map((entry) => '<div class="item"><div class="item-line"><strong>' + escapeHtml(entry.namespace) + '</strong><span class="chip">' + escapeHtml(entry.count + " records") + '</span></div><div class="muted">' + escapeHtml(Object.entries(entry.tiers || {}).map(([tier, count]) => tier + ":" + count).join(" · ")) + '</div></div>').join("") || '<div class="empty-state"><strong>No namespaces yet</strong><span>New durable context will appear here.</span></div>';
+      if (state.selectedMemoryId) renderMemoryDetail(state.memories.find((memory) => memory.id === state.selectedMemoryId));
+    }
+
+    function renderMemoryDetail(memory) {
+      if (!memory) return;
+      state.selectedMemoryId = memory.id;
+      $("memory-detail-kind").textContent = memory.kind;
+      $("memory-detail").className = "agent-inspector";
+      $("memory-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(memory.subject || memory.kind) + '</strong><p>' + escapeHtml(memory.text) + '</p></div>' + [["Scope", (memory.scopeType || "global") + (memory.scopeId ? " · " + memory.scopeId : "")], ["Source", memory.source || "unknown"], ["Authority", memory.authority || "unknown"], ["Confidence", memory.confidence ?? "—"], ["Namespace", memory.namespace || "general"], ["Recorded", memory.at || "—"]].map(([label, value]) => '<div class="agent-section"><strong>' + escapeHtml(label) + '</strong><pre>' + escapeHtml(value) + '</pre></div>').join("");
+      $("memory-correct").disabled = !state.memoryHealth?.integration?.writeAllowed;
+      document.querySelectorAll("[data-memory-id]").forEach((item) => item.classList.toggle("selected", item.dataset.memoryId === memory.id));
     }
 
     async function refreshSessions() {
@@ -3393,29 +3811,63 @@ function renderConsoleHtml() {
     function renderSessionTable() {
       const query = $("session-query")?.value.trim().toLowerCase() || "";
       const status = $("session-status-filter")?.value || "all";
-      const sessions = (state.sessions || []).filter((session) => (!query || JSON.stringify(session).toLowerCase().includes(query)) && (status === "all" || (session.status || "open") === status));
-      $("session-list").innerHTML = sessions.map(renderSessionRecord).join("") || '<div class="empty-state"><strong>No matching sessions</strong><span>Change the filters or create a new session.</span></div>';
+      const projectId = $("session-project-filter")?.value || "all";
+      const groupBy = $("session-group")?.value || "none";
+      const sessions = (state.sessions || []).filter((session) => (!query || JSON.stringify(session).toLowerCase().includes(query)) && (status === "all" || (session.status || "open") === status) && (projectId === "all" || session.projectId === projectId));
+      if (groupBy === "none") {
+        $("session-list").innerHTML = sessions.map(renderSessionRecord).join("") || '<div class="empty-state"><strong>No matching sessions</strong><span>Change the filters or create a new session.</span></div>';
+        return;
+      }
+      const groups = new Map();
+      for (const session of sessions) {
+        const key = groupBy === "project" ? (state.projects.find((project) => project.id === session.projectId)?.name || "Workspace") : groupBy === "source" ? (session.source || "direct") : (session.status || "open");
+        groups.set(key, [...(groups.get(key) || []), session]);
+      }
+      $("session-list").innerHTML = Array.from(groups.entries()).map(([label, entries]) => '<div class="data-row data-group"><span style="grid-column:1/-1"><strong>' + escapeHtml(label) + '</strong> <span class="muted">' + escapeHtml(entries.length + " sessions") + '</span></span></div>' + entries.map(renderSessionRecord).join("")).join("") || '<div class="empty-state"><strong>No matching sessions</strong><span>Change the filters or create a new session.</span></div>';
     }
 
     async function refreshGoals() {
-      const data = await api("/goals");
-      $("goal-active-count").textContent = (data.goals || []).filter((goal) => goal.status === "active").length;
-      $("goal-blocked-count").textContent = (data.goals || []).filter((goal) => goal.status === "blocked").length;
-      $("goal-completed-count").textContent = (data.goals || []).filter((goal) => goal.status === "completed").length;
-      $("goal-list").innerHTML = (data.goals || []).slice(0, 16).map((goal) =>
-        renderRecord(goal, goal.title, goal.status, 'data-goal-id="' + escapeHtml(goal.id) + '"')
-      ).join("") || '<div class="empty-state"><strong>No active goals</strong><span>Create one to make long-running work visible.</span></div>';
+      const data = await api("/goals?limit=100");
+      state.goals = data.goals || [];
+      const projectId = $("goal-project-filter")?.value || "all";
+      const goals = state.goals.filter((goal) => projectId === "all" || goal.projectId === projectId);
+      $("goal-active-count").textContent = state.goals.filter((goal) => goal.status === "active").length;
+      $("goal-blocked-count").textContent = state.goals.filter((goal) => goal.status === "blocked").length;
+      $("goal-completed-count").textContent = state.goals.filter((goal) => goal.status === "completed").length;
+      $("goal-list").innerHTML = goals.map((goal) => {
+        const project = state.projects.find((entry) => entry.id === goal.projectId);
+        const session = state.sessions.find((entry) => entry.id === goal.sessionId);
+        return '<div class="item clickable ' + (goal.id === state.selectedGoalId ? "selected" : "") + '" data-goal-id="' + escapeHtml(goal.id) + '"><div class="item-line"><strong>' + escapeHtml(goal.title) + '</strong><span class="chip ' + (goal.status === "completed" ? "ok" : goal.status === "blocked" ? "danger" : "warn") + '">' + escapeHtml(goal.status) + '</span></div><p>' + escapeHtml(goal.description || "No success criteria recorded") + '</p><div class="scope-label">' + escapeHtml(goal.scopeType === "session" ? "Session · " + (session?.title || goal.sessionId) : "Project · " + (project?.name || goal.projectId)) + '</div><div class="muted">Updated ' + escapeHtml(relativeTime(goal.updatedAt)) + (goal.notes?.length ? " · " + escapeHtml(goal.notes.at(-1).note) : "") + '</div></div>';
+      }).join("") || '<div class="empty-state"><strong>No matching goals</strong><span>Create a scoped objective or choose another project.</span></div>';
     }
 
     async function refreshAudit() {
-      const audit = await api("/audit");
-      state.audit = audit.slice(-120).reverse();
-      $("audit-count").textContent = audit.length;
-      $("audit-run-count").textContent = audit.filter((event) => event.tool || event.type === "run").length;
-      $("audit-model-count").textContent = audit.filter((event) => /model\.chat|provider/i.test(JSON.stringify(event))).length;
-      $("audit-error-count").textContent = audit.filter((event) => /fail|error|denied/i.test(JSON.stringify(event))).length;
+      const params = new URLSearchParams({ page: String(state.auditPage || 1), pageSize: $("audit-page-size").value });
+      const filters = { q: "audit-query", type: "audit-type-filter", tool: "audit-tool-filter", actor: "audit-actor-filter", outcome: "audit-outcome-filter", from: "audit-from", to: "audit-to" };
+      for (const [key, id] of Object.entries(filters)) if ($(id).value) params.set(key, $(id).value);
+      const result = await api("/audit/query?" + params);
+      state.audit = result.events || [];
+      state.auditPagination = result.pagination || { page: 1, pages: 1, total: 0, from: 0, to: 0 };
+      state.auditPage = state.auditPagination.page;
+      const summary = result.summary || {};
+      $("audit-count").textContent = summary.events || 0;
+      $("audit-run-count").textContent = summary.runs || 0;
+      $("audit-model-count").textContent = summary.modelRuns || 0;
+      $("audit-error-count").textContent = summary.errors || 0;
       $("audit-events").innerHTML = state.audit.map(renderAuditEvent).join("") || '<div class="empty-state"><strong>No matching audit events</strong><span>Try another filter or run something.</span></div>';
-      $("audit-log").textContent = JSON.stringify(audit.slice(-80), null, 2);
+      $("audit-log").textContent = JSON.stringify(state.audit, null, 2);
+      $("audit-showing").textContent = state.auditPagination.total ? state.auditPagination.from + "–" + state.auditPagination.to + " of " + state.auditPagination.total + " matching" : "0 matching events";
+      $("audit-page-label").textContent = "Page " + state.auditPagination.page + " of " + state.auditPagination.pages;
+      $("audit-prev").disabled = state.auditPagination.page <= 1;
+      $("audit-next").disabled = state.auditPagination.page >= state.auditPagination.pages;
+      const facetTargets = { types: "audit-type-filter", tools: "audit-tool-filter", actors: "audit-actor-filter", outcomes: "audit-outcome-filter" };
+      for (const [facet, id] of Object.entries(facetTargets)) {
+        const select = $(id);
+        const selected = select.value;
+        const label = select.options[0]?.textContent || "All";
+        select.innerHTML = '<option value="">' + escapeHtml(label) + '</option>' + (result.facets?.[facet] || []).map((entry) => '<option value="' + escapeHtml(entry.value) + '">' + escapeHtml(entry.value + " (" + entry.count + ")") + '</option>').join("");
+        if ([...select.options].some((option) => option.value === selected)) select.value = selected;
+      }
     }
 
     async function showRunDetail(runId) {
@@ -3534,20 +3986,41 @@ function renderConsoleHtml() {
     });
     $("copy-audit").addEventListener("click", async () => {
       await navigator.clipboard?.writeText($("audit-log").textContent);
-      showOutput("Audit copied.");
+      showOutput("Current audit page copied.");
     });
-    $("refresh-audit").addEventListener("click", refreshAudit);
-    $("memory-query").addEventListener("input", () => refreshMemory().catch((error) => showOutput(error.message)));
-    $("refresh-memory-tree").addEventListener("click", () => refreshMemory().catch((error) => showOutput(error.message)));
-    document.querySelectorAll(".audit-filter").forEach((button) => {
-      button.addEventListener("click", () => {
-        state.auditFilter = button.dataset.auditFilter || "all";
-        document.querySelectorAll(".audit-filter").forEach((item) => item.classList.toggle("active", item === button));
-        $("audit-events").innerHTML = state.audit.map(renderAuditEvent).join("") || '<div class="empty-state"><strong>No matching audit events</strong><span>Try another filter or run something.</span></div>';
-      });
+    $("refresh-audit").addEventListener("click", () => refreshAudit().catch((error) => showOutput(error.message)));
+    let auditDebounce;
+    const changeAuditFilters = () => {
+      state.auditPage = 1;
+      clearTimeout(auditDebounce);
+      auditDebounce = setTimeout(() => refreshAudit().catch((error) => showOutput(error.message)), 180);
+    };
+    ["audit-query", "audit-type-filter", "audit-tool-filter", "audit-actor-filter", "audit-outcome-filter", "audit-from", "audit-to"].forEach((id) => {
+      $(id).addEventListener(id === "audit-query" ? "input" : "change", changeAuditFilters);
     });
-    $("audit-query").addEventListener("input", () => {
-      $("audit-events").innerHTML = state.audit.map(renderAuditEvent).join("") || '<div class="empty-state"><strong>No matching audit events</strong><span>Try another filter or run something.</span></div>';
+    $("audit-page-size").addEventListener("change", changeAuditFilters);
+    $("audit-prev").addEventListener("click", () => { state.auditPage = Math.max(1, state.auditPage - 1); refreshAudit().catch((error) => showOutput(error.message)); });
+    $("audit-next").addEventListener("click", () => { state.auditPage = Math.min(state.auditPagination.pages || 1, state.auditPage + 1); refreshAudit().catch((error) => showOutput(error.message)); });
+    $("audit-reset").addEventListener("click", () => {
+      ["audit-query", "audit-type-filter", "audit-tool-filter", "audit-actor-filter", "audit-outcome-filter", "audit-from", "audit-to"].forEach((id) => { $(id).value = ""; });
+      changeAuditFilters();
+    });
+    $("audit-verify").addEventListener("click", async () => {
+      try {
+        const result = await api("/audit/verify");
+        const valid = result.valid !== false;
+        $("audit-integrity").textContent = valid ? "Chain verified" : "Integrity failure";
+        $("audit-integrity").className = "chip " + (valid ? "ok" : "danger");
+        showOutput(result);
+      } catch (error) { showOutput(error.message); }
+    });
+    $("export-audit").addEventListener("click", () => {
+      const blob = new Blob([JSON.stringify(state.audit, null, 2)], { type: "application/json" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "odinn-audit-page-" + String(state.auditPage) + ".json";
+      link.click();
+      URL.revokeObjectURL(link.href);
     });
 
     $("runs").addEventListener("click", (event) => {
@@ -3562,7 +4035,15 @@ function renderConsoleHtml() {
       const item = event.target.closest("[data-goal-id]");
       if (!item) return;
       state.selectedGoalId = item.dataset.goalId;
-      showOutput("Selected goal " + state.selectedGoalId);
+      const goal = state.goals.find((entry) => entry.id === state.selectedGoalId);
+      if (!goal) return;
+      $("goal-title").value = goal.title || "";
+      $("goal-description").value = goal.description || "";
+      $("goal-status").value = goal.status || "active";
+      $("goal-scope-type").value = goal.scopeType || "project";
+      updateGoalScopeOptions();
+      $("goal-scope-id").value = goal.scopeId || goal.projectId || "";
+      refreshGoals().catch((error) => showOutput(error.message));
     });
     $("session-list").addEventListener("click", async (event) => {
       const action = event.target.closest("[data-session-action]");
@@ -3578,6 +4059,17 @@ function renderConsoleHtml() {
       const detail = await api("/sessions/" + encodeURIComponent(state.selectedSessionId));
       renderSessionTranscript(detail);
       showOutput(detail);
+    });
+    $("session-list").addEventListener("change", async (event) => {
+      const select = event.target.closest("[data-session-project]");
+      if (!select) return;
+      try {
+        const detail = await api("/sessions/" + encodeURIComponent(select.dataset.sessionProject), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ projectId: select.value }) });
+        state.selectedProjectId = select.value;
+        showOutput(detail);
+        await refreshProjects();
+        await refreshSessions();
+      } catch (error) { showOutput(error.message); }
     });
 
     $("quick-smoke").addEventListener("click", async (event) => {
@@ -3595,30 +4087,6 @@ function renderConsoleHtml() {
         setBusy(event.currentTarget, false);
       }
     });
-    $("remember").addEventListener("click", async (event) => {
-      try {
-        setBusy(event.currentTarget, true);
-        showOutput(await api("/memory", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            kind: $("memory-kind").value,
-            subject: $("memory-subject").value,
-            namespace: $("memory-namespace").value,
-            tier: $("memory-tier").value,
-            text: $("memory-text").value,
-            tags: $("memory-tags").value.split(",").map((tag) => tag.trim()).filter(Boolean),
-            source: "console"
-          })
-        }));
-        await refreshMemory();
-        await refreshRuns();
-      } catch (error) {
-        showOutput(error.message);
-      } finally {
-        setBusy(event.currentTarget, false);
-      }
-    });
     $("create-session").addEventListener("click", async (event) => {
       try {
         const title = window.prompt("Session title", "New session");
@@ -3627,7 +4095,7 @@ function renderConsoleHtml() {
         const session = await api("/sessions", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ title: title.trim(), source: "console" })
+          body: JSON.stringify({ title: title.trim(), source: "console", projectId: state.projects.find((project) => project.id === $("session-project-filter").value && project.status === "active")?.id || state.projects.find((project) => project.id === state.selectedProjectId && project.status === "active")?.id || "project_default" })
         });
         state.selectedSessionId = session.id;
         showOutput(session);
@@ -3642,10 +4110,12 @@ function renderConsoleHtml() {
     $("create-goal").addEventListener("click", async (event) => {
       try {
         setBusy(event.currentTarget, true);
+        const scopeType = $("goal-scope-type").value;
+        const scopeId = $("goal-scope-id").value;
         const goal = await api("/goals", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ title: $("goal-title").value, source: "console" })
+          body: JSON.stringify({ title: $("goal-title").value, description: $("goal-description").value, source: "console", ...(scopeType === "session" ? { sessionId: scopeId } : { projectId: scopeId }) })
         });
         state.selectedGoalId = goal.id;
         showOutput(goal);
@@ -3664,7 +4134,7 @@ function renderConsoleHtml() {
         showOutput(await api("/goals/" + encodeURIComponent(state.selectedGoalId) + "/updates", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ status: $("goal-status").value, note: $("goal-note").value, source: "console" })
+          body: JSON.stringify({ title: $("goal-title").value, description: $("goal-description").value, status: $("goal-status").value, note: $("goal-note").value, source: "console" })
         }));
         await refreshGoals();
         await refreshRuns();
@@ -3677,22 +4147,28 @@ function renderConsoleHtml() {
     $("refresh-sessions").addEventListener("click", () => refreshSessions().catch((error) => showOutput(error.message)));
     $("session-query").addEventListener("input", renderSessionTable);
     $("session-status-filter").addEventListener("change", renderSessionTable);
+    $("session-project-filter").addEventListener("change", renderSessionTable);
+    $("session-group").addEventListener("change", renderSessionTable);
+    $("refresh-goals").addEventListener("click", () => refreshGoals().catch((error) => showOutput(error.message)));
+    $("goal-project-filter").addEventListener("change", () => refreshGoals().catch((error) => showOutput(error.message)));
+    $("goal-scope-type").addEventListener("change", updateGoalScopeOptions);
 
     $("refresh-tasks").addEventListener("click", () => refreshTasks().catch((error) => showOutput(error.message)));
-    $("task-query").addEventListener("input", () => refreshTasks().catch((error) => showOutput(error.message)));
-    document.querySelectorAll(".task-filter").forEach((button) => button.addEventListener("click", () => {
-      state.taskFilter = button.dataset.taskFilter || "all";
-      document.querySelectorAll(".task-filter").forEach((item) => item.classList.toggle("active", item === button));
-      refreshTasks().catch((error) => showOutput(error.message));
-    }));
+    $("task-query").addEventListener("input", renderTasks);
+    $("task-status-filter").addEventListener("change", renderTasks);
+    $("task-category-filter").addEventListener("change", renderTasks);
+    $("task-system-toggle").addEventListener("change", () => refreshTasks().catch((error) => showOutput(error.message)));
     $("task-table").addEventListener("click", (event) => {
       const button = event.target.closest("[data-task-inspect]");
       if (button) inspectTask(button.dataset.taskInspect).catch((error) => showOutput(error.message));
     });
     $("task-verify").addEventListener("click", async () => {
       if (!state.selectedTaskId) return;
-      try { $("task-evidence").textContent = JSON.stringify(await api("/runtime/runs/" + encodeURIComponent(state.selectedTaskId) + "/verify"), null, 2); }
-      catch (error) { $("task-evidence").textContent = "Verification unavailable: " + error.message; }
+      try {
+        const result = await api("/runtime/runs/" + encodeURIComponent(state.selectedTaskId) + "/verify");
+        $("task-summary").insertAdjacentHTML("beforeend", '<div class="item"><div class="muted">Proof integrity</div><strong>' + escapeHtml(result.valid === false ? "Failed" : "Verified") + '</strong></div>');
+        showOutput(result);
+      } catch (error) { showOutput("Verification unavailable: " + error.message); }
     });
     $("task-replay").addEventListener("click", async () => {
       if (!state.selectedTaskId || !window.confirm("Replay this task only if its tool is safe and idempotent?")) return;
@@ -3724,10 +4200,74 @@ function renderConsoleHtml() {
       } catch (error) { showOutput(error.message); }
     });
 
-    $("new-agent").addEventListener("click", () => $("agent-dialog").showModal());
+    function manifestList(id) {
+      return $(id).value.split(",").map((value) => value.trim()).filter(Boolean);
+    }
+
+    function readAgentManifestFields() {
+      return {
+        ...(state.agentManifestDraft || {}),
+        sdkVersion: "0.3",
+        id: $("agent-id").value.trim(),
+        version: $("agent-version").value.trim(),
+        name: $("agent-name").value.trim(),
+        identity: { ...(state.agentManifestDraft?.identity || {}), name: $("agent-identity").value.trim() },
+        instructions: manifestList("agent-instructions"),
+        tools: manifestList("agent-tools"),
+        plugins: manifestList("agent-plugins"),
+        secrets: manifestList("agent-secrets"),
+        sandbox: { ...(state.agentManifestDraft?.sandbox || {}), mode: $("agent-sandbox").value },
+        network: { ...(state.agentManifestDraft?.network || {}), default: "deny", allow: manifestList("agent-network") },
+        schedules: state.agentManifestDraft?.schedules || [],
+        channels: state.agentManifestDraft?.channels || [],
+        memory: state.agentManifestDraft?.memory || {},
+        tests: state.agentManifestDraft?.tests || []
+      };
+    }
+
+    function writeAgentManifestFields(manifest) {
+      $("agent-id").value = manifest.id || "";
+      $("agent-version").value = manifest.version || "1.0.0";
+      $("agent-name").value = manifest.name || "";
+      $("agent-identity").value = manifest.identity?.name || "";
+      $("agent-instructions").value = (manifest.instructions || []).join(", ");
+      $("agent-tools").value = (manifest.tools || []).join(", ");
+      $("agent-plugins").value = (manifest.plugins || []).join(", ");
+      $("agent-secrets").value = (manifest.secrets || []).join(", ");
+      $("agent-sandbox").value = manifest.sandbox?.mode || "workspace-write";
+      $("agent-network").value = (manifest.network?.allow || []).join(", ");
+    }
+
+    function setAgentAdvanced(enabled) {
+      $("agent-manifest-error").textContent = "";
+      if (enabled) {
+        $("agent-manifest").value = JSON.stringify(readAgentManifestFields(), null, 2);
+      } else if (!$("agent-manifest").hidden && $("agent-manifest").value.trim()) {
+        state.agentManifestDraft = JSON.parse($("agent-manifest").value);
+        writeAgentManifestFields(state.agentManifestDraft);
+      }
+      $("agent-advanced-toggle").checked = enabled;
+      $("agent-manifest").hidden = !enabled;
+      $("manifest-fields").hidden = enabled;
+    }
+
+    $("new-agent").addEventListener("click", () => {
+      $("agent-form").reset();
+      state.agentManifestDraft = null;
+      $("agent-manifest").hidden = true;
+      $("manifest-fields").hidden = false;
+      $("agent-manifest-error").textContent = "";
+      $("agent-manifest").value = JSON.stringify(readAgentManifestFields(), null, 2);
+      $("agent-dialog").showModal();
+    });
     $("agent-advanced-toggle").addEventListener("change", (event) => {
-      $("agent-manifest").hidden = !event.target.checked;
-      $("manifest-fields").hidden = event.target.checked;
+      try { setAgentAdvanced(event.target.checked); }
+      catch (error) {
+        event.target.checked = true;
+        $("agent-manifest").hidden = false;
+        $("manifest-fields").hidden = true;
+        $("agent-manifest-error").textContent = "Fix the JSON before returning to the guided fields: " + error.message;
+      }
     });
     $("refresh-agents").addEventListener("click", () => refreshAgents().catch((error) => showOutput(error.message)));
     $("agent-query").addEventListener("input", () => refreshAgents().catch((error) => showOutput(error.message)));
@@ -3735,19 +4275,17 @@ function renderConsoleHtml() {
       if (event.submitter?.value === "cancel") return;
       event.preventDefault();
       try {
-        const list = (id) => $(id).value.split(",").map((value) => value.trim()).filter(Boolean);
-        const manifest = $("agent-advanced-toggle").checked ? JSON.parse($("agent-manifest").value) : {
-          sdkVersion: "0.3", id: $("agent-id").value.trim(), version: $("agent-version").value.trim(), name: $("agent-name").value.trim(),
-          identity: { name: $("agent-identity").value.trim() }, instructions: list("agent-instructions"), tools: list("agent-tools"), plugins: list("agent-plugins"), secrets: list("agent-secrets"),
-          sandbox: { mode: $("agent-sandbox").value }, network: { default: "deny", allow: list("agent-network") }, schedules: [], channels: [], memory: {}, tests: []
-        };
+        const manifest = $("agent-advanced-toggle").checked ? JSON.parse($("agent-manifest").value) : readAgentManifestFields();
         await api("/agents/validate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
         const result = await api("/agents", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
         state.selectedAgentId = result.agent.id;
         $("agent-dialog").close();
         await refreshAgents();
         renderAgentDetail(result.agent);
-      } catch (error) { showOutput(error.message); }
+      } catch (error) {
+        $("agent-manifest-error").textContent = error.message;
+        showOutput(error.message);
+      }
     });
     $("agent-list").addEventListener("click", (event) => {
       const item = event.target.closest("[data-agent-id]");
@@ -3763,31 +4301,154 @@ function renderConsoleHtml() {
 
     $("refresh-skills").addEventListener("click", () => refreshSkills().catch((error) => showOutput(error.message)));
     $("skill-query").addEventListener("input", () => refreshSkills().catch((error) => showOutput(error.message)));
-    document.querySelectorAll(".skill-filter").forEach((button) => button.addEventListener("click", () => {
-      state.skillFilter = button.dataset.skillFilter || "all";
-      document.querySelectorAll(".skill-filter").forEach((item) => item.classList.toggle("active", item === button));
-      refreshSkills().catch((error) => showOutput(error.message));
-    }));
-
-    async function validateSkillDraft() {
-      const result = await api("/skills/workshop/validate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: $("skill-draft-name").value, description: $("skill-draft-description").value, instructions: $("skill-draft-instructions").value }) });
-      state.skillDraft = result;
-      $("workshop-status").textContent = result.valid ? "valid" : "needs work";
-      $("workshop-status").className = "chip " + (result.valid ? "ok" : "danger");
-      $("save-skill-draft").disabled = !result.valid;
-      $("skill-validation").className = result.valid ? "item" : "empty-state";
-      $("skill-validation").innerHTML = result.valid ? '<strong>Package is valid</strong><span class="muted">SHA-256 ' + escapeHtml(result.digest) + '</span>' : '<strong>Validation failed</strong><span>' + escapeHtml(result.errors.join(" · ")) + '</span>';
-      $("skill-preview").textContent = result.content;
-      return result;
+    $("skill-status-filter").addEventListener("change", () => refreshSkills().catch((error) => showOutput(error.message)));
+    $("skills-list").addEventListener("click", (event) => {
+      const item = event.target.closest("[data-skill-id]");
+      if (item) renderSkillDetail(state.skills.find((skill) => skill.id === item.dataset.skillId));
+    });
+    $("new-skill").addEventListener("click", () => {
+      $("skill-form").reset();
+      $("skill-dialog").showModal();
+    });
+    $("skill-form").addEventListener("submit", async (event) => {
+      if (event.submitter?.value === "cancel") return;
+      event.preventDefault();
+      const list = (id) => $(id).value.split(",").map((value) => value.trim()).filter(Boolean);
+      const manifest = {
+        sdkVersion: "0.1", id: $("skill-id").value.trim(), version: $("skill-version").value.trim(), name: $("skill-name").value.trim(),
+        description: $("skill-description").value.trim(), instructions: $("skill-instructions").value.trim(),
+        requestedTools: list("skill-tools"), requestedCapabilities: list("skill-capabilities"), requestedSecrets: list("skill-secrets"),
+        network: { default: "deny", allow: list("skill-network") }, tests: []
+      };
+      try {
+        await api("/skills/validate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
+        const result = await api("/skills", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(manifest) });
+        state.selectedSkillId = result.skill.id;
+        $("skill-dialog").close();
+        await refreshSkills();
+        renderSkillDetail(state.skills.find((skill) => skill.id === state.selectedSkillId));
+        showOutput(result);
+      } catch (error) { showOutput(error.message); }
+    });
+    for (const [buttonId, action] of [["skill-enable", "enable"], ["skill-disable", "disable"], ["skill-quarantine", "quarantine"]]) {
+      $(buttonId).addEventListener("click", async () => {
+        if (!state.selectedSkillId) return;
+        await api("/skills/" + encodeURIComponent(state.selectedSkillId) + "/lifecycle", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action }) });
+        await refreshSkills();
+        renderSkillDetail(state.skills.find((skill) => skill.id === state.selectedSkillId));
+      });
     }
-    $("validate-skill").addEventListener("click", () => validateSkillDraft().catch((error) => showOutput(error.message)));
-    $("save-skill-draft").addEventListener("click", async () => {
-      const result = state.skillDraft?.valid ? state.skillDraft : await validateSkillDraft();
-      if (!result.valid) return;
-      const saved = await api("/skills/workshop/save", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: $("skill-draft-name").value, description: $("skill-draft-description").value, instructions: $("skill-draft-instructions").value }) });
-      showOutput(saved);
+    $("skill-verify").addEventListener("click", async () => {
+      if (!state.selectedSkillId) return;
+      const result = await api("/skills/" + encodeURIComponent(state.selectedSkillId) + "/verify");
+      showOutput(result);
       await refreshSkills();
-      switchView("skills");
+      renderSkillDetail(state.skills.find((skill) => skill.id === state.selectedSkillId));
+    });
+
+    $("new-project").addEventListener("click", () => {
+      $("project-form").reset();
+      $("project-dialog").showModal();
+    });
+    $("refresh-projects").addEventListener("click", () => refreshProjects().catch((error) => showOutput(error.message)));
+    $("project-query").addEventListener("input", () => refreshProjects().catch((error) => showOutput(error.message)));
+    $("project-list").addEventListener("click", (event) => {
+      const item = event.target.closest("[data-project-id]");
+      if (item) renderProjectDetail(state.projects.find((project) => project.id === item.dataset.projectId));
+    });
+    $("project-form").addEventListener("submit", async (event) => {
+      if (event.submitter?.value === "cancel") return;
+      event.preventDefault();
+      try {
+        const result = await api("/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: $("project-name").value.trim(), description: $("project-description").value.trim(), source: "console" }) });
+        state.selectedProjectId = result.id;
+        $("project-dialog").close();
+        await refreshProjects();
+        showOutput(result);
+      } catch (error) { showOutput(error.message); }
+    });
+    $("project-archive").addEventListener("click", async () => {
+      if (!state.selectedProjectId || state.selectedProjectId === "project_default" || !window.confirm("Archive this project? Its sessions and goals remain stored.")) return;
+      const result = await api("/projects/" + encodeURIComponent(state.selectedProjectId), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: "archived", source: "console" }) });
+      state.selectedProjectId = "project_default";
+      await refreshProjects();
+      showOutput(result);
+    });
+    $("project-open-sessions").addEventListener("click", () => {
+      $("session-project-filter").value = state.selectedProjectId;
+      renderSessionTable();
+      switchView("sessions");
+    });
+    $("project-open-goals").addEventListener("click", () => {
+      $("goal-project-filter").value = state.selectedProjectId;
+      refreshGoals().catch((error) => showOutput(error.message));
+      switchView("goals");
+    });
+
+    let memoryDebounce;
+    const queueMemoryRefresh = () => {
+      clearTimeout(memoryDebounce);
+      memoryDebounce = setTimeout(() => refreshMemory().catch((error) => showOutput(error.message)), 180);
+    };
+    $("memory-query").addEventListener("input", queueMemoryRefresh);
+    $("memory-kind-filter").addEventListener("change", queueMemoryRefresh);
+    $("memory-scope-filter").addEventListener("change", queueMemoryRefresh);
+    $("refresh-memory-tree").addEventListener("click", () => refreshMemory().catch((error) => showOutput(error.message)));
+    $("memory-new-toggle").addEventListener("click", () => {
+      $("memory-form").reset();
+      updateMemoryScopeOptions();
+      $("memory-dialog").showModal();
+    });
+    $("memory-scope-type").addEventListener("change", updateMemoryScopeOptions);
+    $("memory-list").addEventListener("click", (event) => {
+      const item = event.target.closest("[data-memory-id]");
+      if (item) renderMemoryDetail(state.memories.find((memory) => memory.id === item.dataset.memoryId));
+    });
+    $("memory-form").addEventListener("submit", async (event) => {
+      if (event.submitter?.value === "cancel") return;
+      event.preventDefault();
+      const scopeType = $("memory-scope-type").value;
+      const scopeId = $("memory-scope-id").value;
+      try {
+        const result = await api("/memory", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+          kind: $("memory-kind").value, subject: $("memory-subject").value.trim(), namespace: $("memory-namespace").value.trim(), tier: $("memory-tier").value,
+          text: $("memory-text").value.trim(), tags: $("memory-tags").value.split(",").map((tag) => tag.trim()).filter(Boolean), source: "console", authority: "user",
+          scopeType, ...(scopeType === "global" ? {} : { scopeId }), ...(scopeType === "project" ? { projectId: scopeId } : {}), ...(scopeType === "session" ? { sessionId: scopeId } : {})
+        }) });
+        state.selectedMemoryId = result.id;
+        $("memory-dialog").close();
+        await refreshMemory();
+        showOutput(result);
+      } catch (error) { showOutput(error.message); }
+    });
+    $("memory-correct").addEventListener("click", () => {
+      const memory = state.memories.find((entry) => entry.id === state.selectedMemoryId);
+      if (!memory) return;
+      $("memory-correction-form").reset();
+      $("memory-correction-text").value = memory.text || "";
+      $("memory-correction-dialog").showModal();
+    });
+    $("memory-correction-form").addEventListener("submit", async (event) => {
+      if (event.submitter?.value === "cancel") return;
+      event.preventDefault();
+      try {
+        const result = await api("/memory/corrections", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ targetId: state.selectedMemoryId, text: $("memory-correction-text").value.trim(), reason: $("memory-correction-reason").value.trim(), source: "console", authority: "user-correction" }) });
+        state.selectedMemoryId = result.id;
+        $("memory-correction-dialog").close();
+        await refreshMemory();
+        showOutput(result);
+      } catch (error) { showOutput(error.message); }
+    });
+    $("memory-recall-test").addEventListener("click", async () => {
+      const query = window.prompt("What should Ódinn try to remember?", $("memory-query").value || "project decisions");
+      if (!query?.trim()) return;
+      const params = new URLSearchParams({ query: query.trim(), limit: "8" });
+      if (state.selectedProjectId) params.set("projectId", state.selectedProjectId);
+      if (state.activeChatId) params.set("sessionId", state.activeChatId);
+      const result = await api("/memory/recall?" + params);
+      showOutput(result);
+      const recalledIds = new Set((result.memories || []).map((memory) => memory.id));
+      document.querySelectorAll("[data-memory-id]").forEach((item) => item.classList.toggle("selected", recalledIds.has(item.dataset.memoryId)));
     });
     refresh();
   </script>

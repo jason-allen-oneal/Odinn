@@ -226,7 +226,7 @@ Executable extensions use one of two explicit adapters. `container` is the defau
 
 Use `--allow-unsafe-sandbox` only when enabling a manifest that explicitly selects `unconfined-process`. The flag is not required for the default container adapter.
 
-The local console includes Sessions, Usage, Cron Jobs, proof/audit Tasks, an Agent SDK package registry, Skills discovery, and Skill Workshop draft staging. Agent packages and skills are review surfaces in this beta; registration or discovery does not execute or activate them. See [Operator console](docs/operator-console.md) for the API, persistence, and security boundaries behind those views.
+The local console includes Projects, scoped Sessions and Goals, durable Memory, Usage, Cron Jobs, meaningful proof/audit Tasks, a paginated Audit ledger, an Agent SDK package registry, and a managed Skill SDK. Agent and skill packages install disabled; registration or discovery does not execute or activate them. See [Operator console](docs/operator-console.md) for the API, persistence, and security boundaries behind those views.
 
 ## Architecture
 
@@ -243,7 +243,7 @@ chat / CLI / plans
           │              ├─ local OpenAI-compatible servers
           │              └─ CLI adapters
   ├── web and isolated browser tools
-  ├── durable sessions, goals, improvements
+  ├── durable projects, scoped sessions, goals, improvements
   ├── original memory journal and ranked recall
           ├── SQLite run ledger, artifacts, snapshots, and verification evidence
           ├── Proof, Sentinel, capabilities, rewind, capsules, branches, and routing
@@ -267,12 +267,12 @@ tests/                 kernel, gateway, CLI, integration, and platform coverage
 By default, runtime state lives under `.odinn/`:
 
 - `config.json` — provider and policy metadata;
-- `records.jsonl` — memory, session, goal, and improvement records;
+- `records.jsonl` — memory, project, session, goal, and improvement records;
 - `audit.jsonl` — policy decisions and execution events;
 - `db/odinn.sqlite` and `artifacts/` — the durable run ledger and content-addressed evidence;
 - `jobs/`, `approvals.json`, and browser recovery records — restart-safe execution state;
 - `cron-jobs.json` and `agents.json` — scheduled jobs and Agent SDK package state;
-- `skill-workshop/` — validated draft skill packages;
+- `skills/registry.json` and `skills/packages/` — managed Skill SDK state and immutable package versions;
 - `gateway.token` and audit signing keys — owner-only local control-plane secrets;
 - `oauth/` — refreshable OAuth tokens;
 - `browser-profile/` — the isolated Chromium profile;

@@ -221,6 +221,14 @@ export class FileAuditStore {
       } else if (event.type === "task.approval_required") {
         current.status = "awaiting_approval";
         current.message = event.message;
+      } else if (event.type === "task.blocked") {
+        current.status = "blocked";
+        current.completedAt = event.at;
+        current.message = event.message;
+      } else if (event.type === "task.cancelled") {
+        current.status = "cancelled";
+        current.completedAt = event.at;
+        current.message = event.message;
       } else if (event.type === "task.failed") {
         current.status = "failed";
         current.completedAt = event.at;
@@ -241,10 +249,14 @@ export class FileAuditStore {
 
 export class FileRecordStore {
   readonly path: string;
+  readonly lockPath: string;
+  private writeChain: Promise<unknown>;
 
   constructor(path: string) {
     if (!path) throw new Error("FileRecordStore requires a path");
     this.path = path;
+    this.lockPath = `${path}.lock`;
+    this.writeChain = Promise.resolve();
   }
 
   async append(record: JsonObject): Promise<StoredRecord> {
@@ -253,10 +265,14 @@ export class FileRecordStore {
       at: typeof record.at === "string" ? record.at : new Date().toISOString(),
       ...record
     };
-    await ensureSecureStateDirectory(dirname(this.path));
-    await writeFile(this.path, `${JSON.stringify(normalized)}\n`, { flag: "a" });
-    await secureStoreFile(this.path);
-    return normalized;
+    const operation = this.writeChain.then(() => withInterprocessLock(this.lockPath, async () => {
+      await ensureSecureStateDirectory(dirname(this.path));
+      await writeFile(this.path, `${JSON.stringify(normalized)}\n`, { flag: "a" });
+      await secureStoreFile(this.path);
+      return normalized;
+    }));
+    this.writeChain = operation.catch(() => undefined);
+    return operation;
   }
 
   async readAll(): Promise<StoredRecord[]> {

@@ -1,4 +1,6 @@
 process.env.ODINN_GATEWAY_AUTH = "off";
+process.env.ODINN_BROWSER_HEADLESS = "1";
+process.env.ODINN_BROWSER_ACTION_TIMEOUT_MS = "500";
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -67,15 +69,18 @@ test("gateway serves the local console shell", async () => {
     assert.match(html, /Odinn Forge Console/);
     assert.match(html, /Ódinn Forge/);
     assert.match(html, /odinn-logo\.png/);
-    assert.match(html, /Proof &amp; execution ledger/);
+    assert.match(html, /Work queue &amp; execution history/);
     assert.match(html, /Scheduled automation/);
     assert.match(html, /Agent SDK v0\.3/);
-    assert.match(html, /Skill authoring pipeline/);
+    assert.match(html, /Skill SDK v0\.1/);
     assert.doesNotMatch(html, /data-title="Instances"/);
     assert.doesNotMatch(html, /<h1>Run tools<\/h1>/);
     assert.match(html, /Memory/);
     assert.match(html, /Goals/);
-    assert.match(html, /Skill Workshop/);
+    assert.match(html, /Projects/);
+    assert.match(html, /Skill SDK/);
+    assert.doesNotMatch(html, />\s*Activity\s*</);
+    assert.doesNotMatch(html, /Skill Workshop/);
     assert.match(html, /modelOverride/);
     assert.match(html, /allowedCapabilities\?\.includes\("agent\.run"\) \? "agent\.run" : "model\.chat"/);
     assert.match(html, /provider \+ ":" \+ message\.model/);
@@ -367,7 +372,9 @@ test("gateway exposes sessions, goals, and improvement proposals", async () => {
       body: JSON.stringify({ title: "Renamed gateway chat" })
     });
     assert.equal(renamedResponse.status, 200);
-    assert.equal((await renamedResponse.json()).type, "session.renamed");
+    const renamed = await renamedResponse.json();
+    assert.equal(renamed.type, "session.updated");
+    assert.equal(renamed.session.title, "Renamed gateway chat");
     assert.equal((await getJson(`${base}/sessions/${encodeURIComponent(session.id)}`)).session.title, "Renamed gateway chat");
 
     const deletedResponse = await fetch(`${base}/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });

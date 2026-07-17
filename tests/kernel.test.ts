@@ -223,12 +223,14 @@ test("kernel speaks the ChatGPT Codex SSE transport for imported OAuth", async (
     }));
     assert.equal(body.stream, true);
     assert.equal(body.store, false);
+    assert.equal(body.tools[0].name, "web_x2e_search");
     // The live ChatGPT Codex endpoint may omit Content-Type for an SSE body.
     response.writeHead(200);
     response.end([
       'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ODINN_"}\n\n',
       'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"CODEX_OK"}\n\n',
-      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_test","usage":{"total_tokens":3}}}\n\n'
+      'event: response.output_item.done\ndata: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_test","name":"web_x2e_search","arguments":"{\\"query\\":\\"Odinn\\"}"}}\n\n',
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_test","output":[],"usage":{"total_tokens":3}}}\n\n'
     ].join(""));
   });
   await new Promise((resolve: any) => providerServer.listen(0, "127.0.0.1", resolve));
@@ -258,7 +260,10 @@ test("kernel speaks the ChatGPT Codex SSE transport for imported OAuth", async (
       task: {
         id: "run_codex_model",
         tool: "model.chat",
-        input: { messages: [{ role: "user", content: "Hello Codex" }] },
+        input: {
+          messages: [{ role: "user", content: "Hello Codex" }],
+          tools: [{ type: "function", function: { name: "web.search", description: "Search the web", parameters: { type: "object", properties: {} } } }]
+        },
         actor: "test"
       },
       auditStore,
@@ -266,6 +271,8 @@ test("kernel speaks the ChatGPT Codex SSE transport for imported OAuth", async (
     });
     assert.equal(result.output.content, "ODINN_CODEX_OK");
     assert.equal(result.output.id, "resp_test");
+    assert.equal(result.output.toolCalls[0].name, "web.search");
+    assert.equal(result.output.toolCalls[0].arguments, '{"query":"Odinn"}');
   } finally {
     await new Promise((resolve: any, reject: any) => providerServer.close((error: any) => error ? reject(error) : resolve()));
   }

@@ -1964,7 +1964,9 @@ async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, sign
     const tools = Array.isArray(input.tools) ? input.tools : [];
     const requestBody = {
       model: parsed.model,
-      ...(isResponsesTransport ? { input: responsesInput(messages), ...(tools.length ? { tools: responseTools(tools) } : {}) } : { messages: chatCompletionMessages(messages), ...(tools.length ? { tools } : {}) }),
+      ...(isResponsesTransport
+        ? { input: responsesInput(messages), ...(tools.length ? { tools: responseTools(tools) } : {}) }
+        : { messages: chatCompletionMessages(messages), ...(tools.length ? { tools: chatCompletionTools(tools) } : {}) }),
       ...(isChatGptResponsesTransport || streamRequested ? { stream: true, ...(isChatGptResponsesTransport ? { store: false } : {}) } : {}),
       ...(input.temperature === undefined ? {} : { temperature: normalizeTemperature(input.temperature) }),
       ...(input.maxTokens === undefined
@@ -1992,7 +1994,7 @@ async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, sign
     if (!response) throw new Error("model provider returned no response");
     if (!response.ok) throw new Error(`model provider returned ${response.status}: ${modelErrorMessage(payload)}`);
     const content = isResponsesTransport ? responseText(payload) : payload?.choices?.[0]?.message?.content;
-    const toolCalls = extractToolCalls(payload, isResponsesTransport);
+    const toolCalls = extractToolCalls(payload, isResponsesTransport, tools);
     if ((!content || !content.trim()) && !toolCalls.length) {
       const reasoning = payload?.choices?.[0]?.message?.reasoning;
       if (typeof reasoning === "string" && reasoning.trim()) {
@@ -2090,7 +2092,7 @@ function responsesInput(messages: any) {
   return messages.flatMap((message: any) => {
     if (message.role === "tool") return [{ type: "function_call_output", call_id: message.tool_call_id, output: message.content }];
     if (message.role === "assistant" && Array.isArray(message.tool_calls)) {
-      return message.tool_calls.map((call: any) => ({ type: "function_call", call_id: call.id, name: call.name || call.function?.name, arguments: call.arguments || call.function?.arguments || "{}" }));
+      return message.tool_calls.map((call: any) => ({ type: "function_call", call_id: call.id, name: providerToolName(call.name || call.function?.name), arguments: call.arguments || call.function?.arguments || "{}" }));
     }
     return [{ role: message.role, content: message.content }];
   });
@@ -2098,28 +2100,55 @@ function responsesInput(messages: any) {
 
 function chatCompletionMessages(messages: any) {
   return messages.map((message: any) => message.role === "assistant" && Array.isArray(message.tool_calls)
-    ? { ...message, tool_calls: message.tool_calls.map((call: any) => ({ id: call.id, type: "function", function: { name: call.name || call.function?.name, arguments: call.arguments || call.function?.arguments || "{}" } })) }
+    ? { ...message, tool_calls: message.tool_calls.map((call: any) => ({ id: call.id, type: "function", function: { name: providerToolName(call.name || call.function?.name), arguments: call.arguments || call.function?.arguments || "{}" } })) }
     : message);
 }
 
 function responseTools(tools: any) {
+  assertDistinctProviderToolNames(tools);
   return tools.map((tool: any) => tool.function ? {
     type: "function",
-    name: tool.function.name,
+    name: providerToolName(tool.function.name),
     description: tool.function.description,
     parameters: tool.function.parameters
   } : tool);
 }
 
-function extractToolCalls(payload: any, responsesTransport: any) {
+function chatCompletionTools(tools: any) {
+  assertDistinctProviderToolNames(tools);
+  return tools.map((tool: any) => tool.function
+    ? { ...tool, function: { ...tool.function, name: providerToolName(tool.function.name) } }
+    : tool);
+}
+
+function providerToolName(name: any) {
+  return String(name ?? "").replace(/[^a-zA-Z0-9_-]/gu, (character) => `_x${character.codePointAt(0)?.toString(16)}_`);
+}
+
+function assertDistinctProviderToolNames(tools: any) {
+  const names = new Set();
+  for (const tool of tools) {
+    const original = tool?.function?.name;
+    if (!original) continue;
+    const encoded = providerToolName(original);
+    if (names.has(encoded)) throw new Error(`model tool names collide after provider encoding: ${encoded}`);
+    names.add(encoded);
+  }
+}
+
+function originalToolName(name: any, tools: any) {
+  return tools.find((tool: any) => providerToolName(tool?.function?.name) === name)?.function?.name ?? name;
+}
+
+function extractToolCalls(payload: any, responsesTransport: any, tools: any = []) {
   if (responsesTransport) {
     return (payload?.output || [])
       .filter((item: any) => item?.type === "function_call")
-      .map((item: any) => ({ id: item.call_id || item.id || prefixedId("call"), name: item.name, arguments: item.arguments || "{}" }));
+      .map((item: any) => ({ id: item.call_id || item.id || prefixedId("call"), name: originalToolName(item.name, tools), arguments: item.arguments || "{}" }));
   }
   return (payload?.choices?.[0]?.message?.tool_calls || []).map((call: any) => ({
     id: call.id || prefixedId("call"),
-    name: call.function?.name,
+    name: originalToolName(call.function?.name, tools),
     arguments: call.function?.arguments || "{}"
   }));
 }
@@ -2183,9 +2212,10 @@ async function readResponsesModelResponse(response: any, onDelta?: (delta: strin
       return { error: raw.slice(0, 500) };
     }
   }
-  let completed = {};
+  let completed: any = {};
   let content = "";
   let error;
+  const output = [];
   for await (const line of boundedResponseLines(response)) {
     if (!line.startsWith("data:")) continue;
     const value = line.slice("data:".length).trim();
@@ -2200,12 +2230,16 @@ async function readResponsesModelResponse(response: any, onDelta?: (delta: strin
       content += event.delta;
       await onDelta?.(event.delta);
     }
+    if (event.type === "response.output_item.done" && event.item?.type === "function_call") output.push(event.item);
     if (event.type === "response.completed" && event.response && typeof event.response === "object") completed = event.response;
     if (event.type === "error" || event.type === "response.failed") error = event.error ?? event.response?.error ?? event;
   }
+  const completedOutput = Array.isArray(completed.output) ? completed.output : [];
+  const effectiveOutput = completedOutput.length ? completedOutput : output;
   return {
     ...completed,
     ...(content ? { output_text: content } : {}),
+    ...(effectiveOutput.length ? { output: effectiveOutput } : {}),
     ...(error ? { error } : {})
   };
 }

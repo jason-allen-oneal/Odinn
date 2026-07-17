@@ -20,6 +20,12 @@ Tasks is the operator view over meaningful user, agent, and automation runs. Rou
 
 Audit provides server-side search, type/tool/actor/outcome/date filtering, pagination, JSON export, and integrity verification. Proof remains disabled by default and command assertions require exact operator-owned argument-vector allowlisting. Chain verification detects journal damage; it does not make a local journal tamper-proof against an attacker who controls the state directory.
 
+## Experimental Lab
+
+Experimental Lab is the console home for Proof, Sentinel, Capability Tokens, Rewind, Capsules, Counterfactuals, and Darwin. It reads the active startup gates from `/status`, lists recent records from the SQLite runtime ledger, and exposes a fixed set of forms backed by the existing authenticated experimental endpoints. Requests are not arbitrary URLs: each workbench action maps to a known method and route.
+
+The lab does not weaken the disabled-by-default posture. A disabled feature stays locked, destructive operations remain explicit, Rewind and Counterfactual selection default to previews, and configuration changes require an intentional edit or `odinn experimental enable <feature>` followed by a gateway restart. The CLI equivalent is `odinn experimental status`; use `odinn experimental help <feature>` to see the real commands behind one system.
+
 ## Agent SDK packages
 
 Agents manages declarative Agent SDK v0.3 manifests through `/agents`, `/agents/validate`, and `/agents/<id>/lifecycle`. Installation validates and records package metadata; lifecycle controls enable, disable, or quarantine a package. This beta surface is a package registry and inspector, not an Agent SDK execution engine. Package metadata is not executable trust, and registration does not bypass extension, sandbox, capability, network, secret, or policy controls.

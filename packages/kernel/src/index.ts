@@ -1808,7 +1808,7 @@ export async function runTask({
           stepId: ledgerStep?.stepId,
           toolName: request.tool,
           input: request.input,
-          policy,
+          policy: { id: policy.id, version: 1, invariants: policy.invariants },
           workspaceRoot: runLedger.workspaceRoot
         });
       } else {

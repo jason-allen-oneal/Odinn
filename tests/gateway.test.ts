@@ -4,7 +4,7 @@ process.env.ODINN_BROWSER_ACTION_TIMEOUT_MS = "500";
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +32,14 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
     assert.equal(status.security.browser.requireApproval, true);
     assert.ok(status.toolDetails.some((tool: any) => tool.name === "text.echo" && tool.capability === "text.echo"));
 
+    const disabledProof = await fetch(`${base}/proof`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ schemaVersion: 1, id: "disabled-proof", runId: "disabled-proof-run", assertions: [{ id: "fixture", type: "file", path: "README.md", expect: { exists: true } }] })
+    });
+    assert.equal(disabledProof.status, 409);
+    assert.match((await disabledProof.json()).error, /experimental\.proof is disabled/);
+
     const run = await postJson(`${base}/run`, { tool: "text.echo", input: { text: "ODINN_GATEWAY_OK" } });
     assert.equal(run.ok, true);
     assert.equal(run.output.text, "ODINN_GATEWAY_OK");
@@ -51,6 +59,43 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
     const runDetail = await getJson(`${base}/runs/${encodeURIComponent(run.id)}`);
     assert.equal(runDetail.id, run.id);
     assert.equal(runDetail.events.length, 3);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
+test("gateway permits capability inspection and revocation after the feature is disabled", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-capability-cleanup-"));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-capability-workspace-"));
+  const enabledConfig = {
+    version: 1,
+    experimental: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: true, counterfactual: false }
+  };
+  await writeFile(join(stateDir, "config.json"), JSON.stringify(enabledConfig));
+  let server = await createGatewayServer({ stateDir, workspaceRoot });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const issued = await postJson(`${base}/capabilities/issue`, {
+      runId: "capability-cleanup-run",
+      stepId: "capability-cleanup-step",
+      toolName: "text.echo",
+      scopes: ["text:echo"]
+    });
+    assert.ok(issued.claims.id);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+
+  await writeFile(join(stateDir, "config.json"), JSON.stringify({ ...enabledConfig, experimental: { ...enabledConfig.experimental, capabilities: false } }));
+  server = await createGatewayServer({ stateDir, workspaceRoot });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const listed = await getJson(`${base}/capabilities/capability-cleanup-run`);
+    assert.equal(listed.length, 1);
+    const revoked = await postJson(`${base}/capabilities/${encodeURIComponent(listed[0].id)}/revoke`, {});
+    assert.equal(revoked.status, "revoked");
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }
@@ -77,6 +122,9 @@ test("gateway serves the local console shell", async () => {
     assert.doesNotMatch(html, /<h1>Run tools<\/h1>/);
     assert.match(html, /Memory/);
     assert.match(html, /Goals/);
+    assert.match(html, /Experimental Lab/);
+    assert.match(html, /Self-improvement/);
+    assert.match(html, /availableWhenDisabled/);
     assert.match(html, /Projects/);
     assert.match(html, /Skill SDK/);
     assert.doesNotMatch(html, />\s*Activity\s*</);
@@ -504,15 +552,36 @@ test("gateway exposes the experimental runtime against persisted SQLite state", 
     const choice = await postJson(`${base}/routing/choose`, { taskClass: "general" });
     assert.equal(choice.model, "test:verified");
 
+    await writeFile(join(workspaceRoot, "branch-evidence.txt"), "candidate-only evidence\n");
     const branch = await postJson(`${base}/counterfactual`, {
       sourceRunId: "gateway-runtime-run",
       sourceStepId: timeline.steps[0].id,
       workspaceRoot: attackerRoot,
-      plans: [{ id: "a", title: "A", summary: "candidate A" }, { id: "b", title: "B", summary: "candidate B" }]
+      plans: [{
+        id: "a",
+        title: "A",
+        summary: "candidate A",
+        tasks: [{ tool: "workspace.readText", input: { path: "branch-evidence.txt" }, readOnly: true }],
+        contract: {
+          schemaVersion: 1,
+          id: "gateway-candidate-contract",
+          assertions: [{ id: "branch-evidence", type: "file", path: "branch-evidence.txt", expect: { exists: true, content: { contains: "candidate-only" } } }]
+        }
+      }, {
+        id: "b",
+        title: "B",
+        summary: "candidate B",
+        tasks: [{ tool: "text.echo", input: { text: "candidate B" }, readOnly: true }]
+      }]
     });
     assert.equal(branch.candidates.length, 2);
     assert.ok(branch.candidates.every((candidate: any) => candidate.workspaceRoot.startsWith(`${workspaceRoot}/.odinn-worktrees/`)));
     assert.equal((await getJson(`${base}/counterfactual/${branch.groupId}`)).candidates.length, 2);
+    await rm(join(workspaceRoot, "branch-evidence.txt"));
+    const executed = await postJson(`${base}/counterfactual/${branch.groupId}/execute`, {});
+    const verifiedCandidate = executed.results.find((result: any) => result.planId === "a");
+    assert.equal(verifiedCandidate.status, "verified");
+    assert.equal(verifiedCandidate.proof.status, "passed");
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }

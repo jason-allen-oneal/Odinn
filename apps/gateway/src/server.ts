@@ -615,6 +615,7 @@ export async function createGatewayServer({
       }
       if (request.method === "POST" && url.pathname === "/proof") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
+        if (featureFlags.proof !== true) throw new GatewayError(409, "experimental.proof is disabled; enable it in config and restart the gateway");
         return json(response, 200, await proofVerifier.verify(body));
       }
       if (request.method === "GET" && url.pathname.startsWith("/proof/")) {
@@ -682,7 +683,14 @@ export async function createGatewayServer({
         return json(response, 200, await runtime.counterfactual.execute(groupId, {
           capabilities: runtime.capabilities,
           proof: {
-            run: async (runId: string, contract: any) => proofVerifier.verify({ ...contract, runId })
+            run: async (runId: string, contract: any, { workspaceRoot = root }: any = {}) => {
+              if (featureFlags.proof !== true) throw new GatewayError(409, "experimental.proof is disabled; counterfactual verification cannot run");
+              return new ProofVerifier({
+                runLedger: runtime.ledger,
+                allowedRoot: workspaceRoot,
+                allowedCommands: config.proof?.allowedCommands ?? []
+              }).verify({ ...contract, runId });
+            }
           },
           policy,
           executor: (task: any, context: any) => isolatedTaskExecutor({ task, workspaceRoot: context.workspaceRoot })
@@ -2655,8 +2663,48 @@ function renderConsoleHtml() {
     .scope-label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
     .task-timeline { max-height: 360px; overflow: auto; }
     .audit-filter-panel { display: grid; gap: 10px; }
+    .experimental-warning {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      border-color: #655722;
+      background: linear-gradient(135deg, rgba(101, 87, 34, .18), rgba(17, 22, 30, .92));
+    }
+    .experimental-warning p { margin: 5px 0 0; color: var(--muted); line-height: 1.5; }
+    .experimental-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
+      gap: 10px;
+    }
+    .experimental-card {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 10px;
+      min-height: 178px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: linear-gradient(145deg, #171d27, #10151d);
+    }
+    .experimental-card.enabled { border-color: #2c6656; box-shadow: inset 0 1px rgba(125, 224, 189, .08); }
+    .experimental-card.disabled { opacity: .78; }
+    .experimental-card p { margin: 0; color: var(--muted); line-height: 1.45; }
+    .experimental-card code { color: #b8c8dd; font-size: 11px; }
+    .experimental-workbench {
+      display: grid;
+      grid-template-columns: minmax(290px, .72fr) minmax(0, 1.28fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .experimental-controls { display: grid; gap: 12px; }
+    .experimental-controls textarea { min-height: 260px; }
+    .experimental-result { min-height: 260px; max-height: 520px; }
+    .experimental-config { max-height: none; color: #b9d7cc; }
+    .experimental-run-card { cursor: pointer; }
+    .experimental-run-card:hover { border-color: #456071; }
     @media (max-width: 900px) {
-      .usage-grid, .agent-layout, .workshop-grid { grid-template-columns: 1fr; }
+      .usage-grid, .agent-layout, .workshop-grid, .experimental-workbench { grid-template-columns: 1fr; }
       .session-filters { grid-template-columns: 1fr; }
       .filter-grid { grid-template-columns: 1fr 1fr; }
       .summary-bar { align-items: flex-start; flex-direction: column; gap: 10px; }
@@ -2721,6 +2769,7 @@ function renderConsoleHtml() {
           <button data-view="tasks" data-title="Tasks" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span><span class="nav-label">Tasks</span></button>
           <button data-view="agents" data-title="Agents" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-agent"></use></svg></span><span class="nav-label">Agents</span></button>
           <button data-view="skills" data-title="Skill SDK" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-skill"></use></svg></span><span class="nav-label">Skill SDK</span></button>
+          <button data-view="experiments" data-title="Experimental Lab" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Experimental Lab</span><span class="badge warn" id="nav-experimental-count">0/7</span></button>
         </details>
         <div class="nav-group-label nav-advanced-label">Workspace</div>
         <button data-view="projects" data-title="Projects" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-project"></use></svg></span><span class="nav-label">Projects</span></button>
@@ -2884,6 +2933,55 @@ function renderConsoleHtml() {
         </div>
       </section>
 
+      <section id="view-experiments" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Operator-controlled preview systems</div><h1>Experimental Lab</h1><p>Inspect feature gates and exercise the real Proof, Sentinel, Rewind, Capsule, Capability, Counterfactual, and Darwin APIs.</p></div><div class="row"><span class="chip warn">experimental · off by default</span><button class="secondary" id="refresh-experiments" type="button">Refresh</button></div></div>
+          <div class="panel experimental-warning">
+            <div><h2>Sharp machinery. Deliberate switches.</h2><p>These systems can verify runs, issue scoped credentials, restore files, replay capsules, or replace a workspace. Flags are read from <code id="experimental-config-path">.odinn/config.json</code> at startup; this console never enables them silently.</p></div>
+            <span class="pill warn" id="experimental-overall-state">DISABLED</span>
+          </div>
+          <div class="stat-strip"><div class="stat-card"><strong id="experimental-enabled-count">0</strong><span>features enabled</span></div><div class="stat-card"><strong id="experimental-disabled-count">7</strong><span>features locked</span></div><div class="stat-card"><strong id="experimental-run-count">0</strong><span>ledger runs</span></div><div class="stat-card"><strong>RESTART</strong><span>required after flag changes</span></div></div>
+          <div id="experimental-feature-grid" class="experimental-grid"><div class="empty-state"><strong>Reading feature gates</strong><span>Waiting for gateway status.</span></div></div>
+          <div class="panel stack">
+            <div class="page-head"><div><div class="section-kicker">Separate review-gated control plane</div><h2>Self-improvement</h2><p>Mine repeated failures into proposals, require an operator decision by default, and roll back the narrow runtime tuning allowed in auto mode.</p></div><div class="row"><span class="chip warn" id="improvement-mode-chip">review-gated</span><button class="secondary" id="refresh-improvements" type="button">Refresh proposals</button><button id="learn-improvements" type="button">Learn from audit</button><button id="new-improvement" type="button">New proposal</button></div></div>
+            <div class="summary-bar"><span><small>CONTROLLER</small><strong id="improvement-controller-state">OFF</strong></span><span><small>MODE</small><strong id="improvement-mode">PROPOSE</strong></span><span><small>PROPOSALS</small><strong id="improvement-count">0</strong></span><span><small>NEEDS REVIEW</small><strong id="improvement-review-count">0</strong></span></div>
+            <div class="agent-layout">
+              <div class="stack"><pre id="self-improvement-config" class="output experimental-config">&quot;selfImprovement&quot;: { &quot;enabled&quot;: false, &quot;mode&quot;: &quot;propose&quot; }</pre><div id="improvement-list" class="list"><div class="empty-state"><strong>No proposals loaded</strong><span>Refresh or mine the audit ledger for repeated failures.</span></div></div></div>
+              <div class="panel stack"><div class="panel-head"><h3>Proposal review</h3><span class="chip" id="improvement-detail-status">No selection</span></div><div id="improvement-detail" class="empty-state"><strong>Select a proposal</strong><span>Evidence, target, decisions, and rollback state will appear here.</span></div><div class="row"><button id="improvement-approve" type="button" disabled>Approve</button><button class="secondary" id="improvement-reject" type="button" disabled>Reject</button><button class="danger" id="improvement-rollback" type="button" disabled>Rollback applied change</button></div></div>
+            </div>
+            <dialog id="improvement-dialog" class="editor-dialog"><form method="dialog" id="improvement-form"><div class="panel-head"><div><h2>Propose an improvement</h2><span class="muted">Recording a proposal never applies it.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div class="field"><label for="improvement-title">Title</label><input id="improvement-title" required></div><div class="field"><label for="improvement-rationale">Rationale</label><textarea id="improvement-rationale" required></textarea></div><div class="grid-2"><div class="field"><label for="improvement-target">Target</label><input id="improvement-target" value="runtime"></div><div class="field"><label for="improvement-priority">Priority</label><select id="improvement-priority"><option>normal</option><option>high</option><option>low</option></select></div></div><div class="row"><button value="default" type="submit">Record proposal</button></div></form></dialog>
+          </div>
+          <div class="experimental-workbench">
+            <div class="stack">
+              <div class="panel stack">
+                <div class="panel-head"><div><h2>Enable intentionally</h2><span class="muted">Copy into the existing config, choose only what you intend, then restart.</span></div><button class="secondary" id="copy-experimental-config" type="button">Copy JSON</button></div>
+                <pre id="experimental-config" class="output experimental-config">&quot;experimental&quot;: {
+  &quot;proof&quot;: false,
+  &quot;rewind&quot;: false,
+  &quot;sentinel&quot;: false,
+  &quot;capsules&quot;: false,
+  &quot;darwin&quot;: false,
+  &quot;capabilities&quot;: false,
+  &quot;counterfactual&quot;: false
+}</pre>
+              </div>
+              <div class="panel stack">
+                <div class="panel-head"><div><h2>Recent experimental runs</h2><span class="muted">Backed by the persisted runtime ledger.</span></div></div>
+                <div id="experimental-recent-runs" class="list"><div class="empty-state"><strong>No runtime records loaded</strong><span>Refresh the lab to inspect the ledger.</span></div></div>
+              </div>
+            </div>
+            <div class="panel experimental-controls">
+              <div class="panel-head"><div><h2>Operator workbench</h2><span class="muted" id="experimental-action-description">Choose a feature and action.</span></div><span class="chip" id="experimental-action-risk">read/write API</span></div>
+              <div class="grid-2"><div class="field"><label for="experimental-feature-select">Feature</label><select id="experimental-feature-select"></select></div><div class="field"><label for="experimental-action-select">Action</label><select id="experimental-action-select"></select></div></div>
+              <div class="field" id="experimental-target-field" hidden><label for="experimental-target" id="experimental-target-label">Target</label><input id="experimental-target" autocomplete="off"></div>
+              <div class="field"><label for="experimental-payload">Request JSON</label><textarea id="experimental-payload" spellcheck="false">{}</textarea></div>
+              <div class="row"><button id="experimental-run" type="button" disabled>Feature disabled</button><span class="muted" id="experimental-endpoint">Select an action</span></div>
+              <div class="field"><label for="experimental-result">Result</label><pre id="experimental-result" class="output experimental-result" aria-live="polite">No experimental action has run.</pre></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <section id="view-audit" class="view">
         <div class="page oc-page">
           <div class="page-head"><div><div class="section-kicker">Signed evidence trail</div><h1>Audit</h1><p>Filter the ledger, inspect exact events, and verify that its integrity chain is intact.</p></div><div class="row"><button class="secondary" id="audit-verify" type="button">Verify Chain</button><button class="secondary" id="refresh-audit" type="button">Refresh</button><button class="secondary" id="copy-audit" type="button">Copy Page</button><button class="secondary" id="export-audit" type="button">Export JSON</button></div></div>
@@ -2935,7 +3033,81 @@ function renderConsoleHtml() {
       memories: [],
       selectedMemoryId: "",
       memoryHealth: null,
-      agentManifestDraft: null
+      agentManifestDraft: null,
+      experimentalRuns: [],
+      improvements: []
+    };
+    const experimentalFeatures = {
+      proof: {
+        title: "Proof",
+        summary: "Verify file, HTTP, Git, and explicitly allowlisted command assertions against a persisted run.",
+        endpoint: "/proof",
+        actions: [
+          { id: "verify", label: "Verify contract", method: "POST", path: "/proof", description: "Run a versioned verification contract against an existing ledger run.", sample: () => ({ schemaVersion: 1, id: "ui-proof-" + Date.now(), runId: defaultExperimentalRunId(), assertions: [{ id: "readme-exists", type: "file", path: "README.md", expect: { exists: true } }] }) },
+          { id: "inspect", label: "Inspect assertions", method: "GET", path: "/proof/{target}", target: "Run ID", description: "Read persisted assertion results for one run.", availableWhenDisabled: true, sample: () => ({}) }
+        ]
+      },
+      sentinel: {
+        title: "Sentinel",
+        summary: "Evaluate runtime inputs against explicit invariants before privileged behavior crosses the boundary.",
+        endpoint: "/policy/evaluate",
+        actions: [
+          { id: "evaluate", label: "Evaluate policy", method: "POST", path: "/policy/evaluate", description: "Evaluate one tool input against a concrete policy without executing the tool.", sample: () => ({ runId: "ui-sentinel-" + Date.now(), toolName: "text.echo", input: { text: "safe input" }, policy: { version: 1, invariants: [{ id: "deny-example", type: "command.deny-pattern", values: ["never-match"], enforcement: "block" }] } }) }
+        ]
+      },
+      capabilities: {
+        title: "Capability Tokens",
+        summary: "Issue short-lived, signed, scoped credentials and audit their use or revocation.",
+        endpoint: "/capabilities",
+        actions: [
+          { id: "issue", label: "Issue token", method: "POST", path: "/capabilities/issue", description: "Issue a one-use token bound to a run, step, tool, and scope.", sample: () => ({ runId: "ui-capability-" + Date.now(), stepId: "operator-step", toolName: "text.echo", scopes: ["text:echo"], expiresInMs: 60000, maxUses: 1 }) },
+          { id: "consume", label: "Consume token", method: "POST", path: "/capabilities/use", description: "Validate and consume a token. Paste the token returned by Issue token.", sample: () => ({ token: "paste-issued-token", runId: "replace-with-token-run-id", toolName: "text.echo", resource: {} }) },
+          { id: "list", label: "List for run", method: "GET", path: "/capabilities/{target}", target: "Run ID", description: "List redacted capability records for one run.", availableWhenDisabled: true, sample: () => ({}) },
+          { id: "revoke", label: "Revoke token", method: "POST", path: "/capabilities/{target}/revoke", target: "Capability ID", description: "Permanently revoke an issued capability by ID.", dangerous: true, availableWhenDisabled: true, sample: () => ({}) }
+        ]
+      },
+      rewind: {
+        title: "Rewind",
+        summary: "Snapshot selected workspace paths, preview a restore plan, and apply it only on explicit command.",
+        endpoint: "/checkpoints · /rewind",
+        actions: [
+          { id: "checkpoint", label: "Create checkpoint", method: "POST", path: "/checkpoints", description: "Capture selected workspace paths into the content-addressed artifact store.", sample: () => ({ runId: "ui-rewind-" + Date.now(), stepId: "operator-checkpoint", paths: ["README.md"], label: "operator checkpoint" }) },
+          { id: "preview", label: "Preview restore", method: "POST", path: "/rewind/{target}", target: "Snapshot ID", description: "Build the restore plan without touching workspace files.", sample: () => ({ apply: false }) },
+          { id: "apply", label: "Apply restore", method: "POST", path: "/rewind/{target}", target: "Snapshot ID", description: "Restore the snapshot to its recorded workspace. This changes files.", dangerous: true, sample: () => ({ apply: true }) }
+        ]
+      },
+      capsules: {
+        title: "Capsules",
+        summary: "Export a portable run record, verify its checksums, and replay recorded boundaries without live tools.",
+        endpoint: "/capsules",
+        actions: [
+          { id: "export", label: "Export run", method: "POST", path: "/capsules/export", description: "Export one persisted ledger run into the gateway capsule store.", sample: () => ({ runId: defaultExperimentalRunId() }) },
+          { id: "verify", label: "Verify capsule", method: "POST", path: "/capsules/verify", description: "Verify a capsule path returned by Export run.", sample: () => ({ path: "paste-exported-capsule-path" }) },
+          { id: "replay", label: "Replay capsule", method: "POST", path: "/capsules/replay", description: "Replay recorded boundaries in tool-mocked mode; external tools do not execute.", sample: () => ({ path: "paste-exported-capsule-path", mode: "tool-mocked" }) }
+        ]
+      },
+      counterfactual: {
+        title: "Counterfactuals",
+        summary: "Fork up to four isolated candidate workspaces, execute plans, compare evidence, and select deliberately.",
+        endpoint: "/counterfactual",
+        actions: [
+          { id: "create", label: "Create candidates", method: "POST", path: "/counterfactual", description: "Create two isolated candidate workspaces from an existing source run.", sample: () => ({ sourceRunId: defaultExperimentalRunId(), sourceStepId: "operator-branch", plans: [{ id: "read", title: "Inspect README", summary: "Read the project README", tasks: [{ tool: "workspace.readText", input: { path: "README.md", maxBytes: 2048 }, readOnly: true }] }, { id: "echo", title: "Echo probe", summary: "Run a bounded echo probe", tasks: [{ tool: "text.echo", input: { text: "counterfactual probe" }, readOnly: true }] }] }) },
+          { id: "inspect", label: "Compare candidates", method: "GET", path: "/counterfactual/{target}", target: "Group ID", description: "Read candidate state, plans, and verification summaries.", sample: () => ({}) },
+          { id: "execute", label: "Execute candidates", method: "POST", path: "/counterfactual/{target}/execute", target: "Group ID", description: "Execute every candidate plan inside its isolated workspace.", dangerous: true, sample: () => ({}) },
+          { id: "select", label: "Preview selection", method: "POST", path: "/counterfactual/{target}/select", target: "Group ID", description: "Preview selecting a completed candidate without replacing the source workspace.", sample: () => ({ runId: "paste-candidate-run-id", apply: false }) },
+          { id: "apply", label: "Apply selection", method: "POST", path: "/counterfactual/{target}/select", target: "Group ID", description: "Replace the source workspace with a completed candidate. Review the dry-run first.", dangerous: true, sample: () => ({ runId: "paste-candidate-run-id", apply: true }) }
+        ]
+      },
+      darwin: {
+        title: "Darwin Router",
+        summary: "Observe verified outcomes and choose routes from persisted reliability, speed, cost, and tool-use evidence.",
+        endpoint: "/routing",
+        actions: [
+          { id: "observe", label: "Record outcome", method: "POST", path: "/routing/observe", description: "Record one model outcome for a task class.", sample: () => ({ runId: defaultExperimentalRunId(), providerId: "operator", modelId: "candidate", taskClass: "general", verified: true, durationMs: 1000, toolCalls: 1, toolErrors: 0 }) },
+          { id: "stats", label: "View statistics", method: "GET", path: "/routing/stats?taskClass={target}", target: "Task class", defaultTarget: "general", description: "Read accumulated route statistics for one task class.", sample: () => ({}) },
+          { id: "choose", label: "Choose route", method: "POST", path: "/routing/choose", description: "Ask the evidence-weighted router to choose a model for a task class.", sample: () => ({ taskClass: "general" }) }
+        ]
+      }
     };
     const planTemplates = {
       smoke: {
@@ -3122,9 +3294,239 @@ function renderConsoleHtml() {
       if (name === "cron") refreshCron().catch((error) => showOutput(error.message));
       if (name === "agents") refreshAgents().catch((error) => showOutput(error.message));
       if (name === "skills") refreshSkills().catch((error) => showOutput(error.message));
+      if (name === "experiments") refreshExperiments().catch((error) => showOutput(error.message));
       if (name === "projects") refreshProjects().catch((error) => showOutput(error.message));
       if (name === "memory") refreshMemory().catch((error) => showOutput(error.message));
       if (name === "goals") refreshGoals().catch((error) => showOutput(error.message));
+    }
+
+    function defaultExperimentalRunId() {
+      return state.experimentalRuns[0]?.id || "replace-with-runtime-run-id";
+    }
+
+    function selectedExperimentalFeature() {
+      return experimentalFeatures[$("experimental-feature-select").value] || experimentalFeatures.proof;
+    }
+
+    function selectedExperimentalAction() {
+      const feature = selectedExperimentalFeature();
+      return feature.actions.find((action) => action.id === $("experimental-action-select").value) || feature.actions[0];
+    }
+
+    function experimentalPath(action, requireTarget = false) {
+      const target = $("experimental-target").value.trim();
+      if (action.target && requireTarget && !target) throw new Error(action.target + " is required");
+      return action.path.replace("{target}", encodeURIComponent(target || "target"));
+    }
+
+    function renderExperimentalRuns() {
+      $("experimental-run-count").textContent = String(state.experimentalRuns.length);
+      $("experimental-recent-runs").innerHTML = state.experimentalRuns.slice(0, 8).map((run) => {
+        const tone = ["verified", "completed-unverified", "passed"].includes(run.status) ? "ok" : ["failed", "denied"].includes(run.status) ? "danger" : "warn";
+        return '<div class="item experimental-run-card" data-experimental-run-id="' + escapeHtml(run.id) + '">' +
+          '<div class="item-line"><span class="item-title">' + escapeHtml(run.objective || run.id) + '</span><span class="chip ' + tone + '">' + escapeHtml(run.status) + '</span></div>' +
+          '<div class="muted">' + escapeHtml(run.id) + '</div>' +
+          '<div class="muted">' + escapeHtml(run.createdAt || "") + '</div></div>';
+      }).join("") || '<div class="empty-state"><strong>No runtime runs yet</strong><span>Use a workbench action to create the first persisted record.</span></div>';
+    }
+
+    function renderSelfImprovementStatus(status) {
+      const settings = status?.selfImprovement || { enabled: false, mode: "propose", intervalMs: 300000, maxChangesPerCycle: 1, rollbackOnFailure: true };
+      const automatic = settings.enabled === true && settings.mode === "auto";
+      $("improvement-controller-state").textContent = automatic ? "ON" : "OFF";
+      $("improvement-mode").textContent = String(settings.mode || "propose").toUpperCase();
+      $("improvement-mode-chip").textContent = automatic ? "auto · allowlisted only" : "review-gated";
+      $("improvement-mode-chip").className = "chip " + (automatic ? "danger" : "warn");
+      $("self-improvement-config").textContent = '"selfImprovement": ' + JSON.stringify(settings, null, 2);
+      const canWrite = status?.allowedCapabilities?.includes("improve.write") === true;
+      $("learn-improvements").disabled = !canWrite;
+      $("new-improvement").disabled = !canWrite;
+    }
+
+    function selectedImprovement() {
+      return state.improvements.find((item) => item.id === state.selectedImprovementId);
+    }
+
+    function renderImprovementDetail() {
+      const improvement = selectedImprovement();
+      if (!improvement) {
+        $("improvement-detail-status").textContent = "No selection";
+        $("improvement-detail-status").className = "chip";
+        $("improvement-detail").className = "empty-state";
+        $("improvement-detail").innerHTML = '<strong>Select a proposal</strong><span>Evidence, target, decisions, and rollback state will appear here.</span>';
+        $("improvement-approve").disabled = true;
+        $("improvement-reject").disabled = true;
+        $("improvement-rollback").disabled = true;
+        return;
+      }
+      const status = improvement.status || "proposed";
+      const tone = ["approved", "applied"].includes(status) ? "ok" : ["rejected", "failed"].includes(status) ? "danger" : "warn";
+      $("improvement-detail-status").textContent = status;
+      $("improvement-detail-status").className = "chip " + tone;
+      $("improvement-detail").className = "agent-inspector";
+      $("improvement-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(improvement.title) + '</strong><p>' + escapeHtml(improvement.rationale) + '</p></div>' +
+        '<div class="record-grid">' +
+          '<div class="record"><small>TARGET</small><strong>' + escapeHtml(improvement.target || "runtime") + '</strong></div>' +
+          '<div class="record"><small>PRIORITY</small><strong>' + escapeHtml(improvement.priority || "normal") + '</strong></div>' +
+          '<div class="record"><small>EVIDENCE</small><strong>' + escapeHtml(String((improvement.evidence || []).length)) + '</strong></div>' +
+          '<div class="record"><small>UPDATED</small><strong>' + escapeHtml(improvement.updatedAt || "—") + '</strong></div></div>' +
+        '<details class="activity-details"><summary>Evidence and decision history</summary><pre>' + escapeHtml(JSON.stringify({ evidence: improvement.evidence || [], action: improvement.action, decisions: improvement.decisions || [] }, null, 2)) + '</pre></details>';
+      const canWrite = state.status?.allowedCapabilities?.includes("improve.write") === true;
+      const canDecide = canWrite && status === "proposed";
+      $("improvement-approve").disabled = !canDecide;
+      $("improvement-reject").disabled = !canDecide;
+      $("improvement-rollback").disabled = !canWrite || status !== "applied";
+    }
+
+    function renderImprovements() {
+      $("improvement-count").textContent = String(state.improvements.length);
+      $("improvement-review-count").textContent = String(state.improvements.filter((item) => item.status === "proposed").length);
+      $("improvement-list").innerHTML = state.improvements.map((improvement) => {
+        const selected = improvement.id === state.selectedImprovementId;
+        const tone = ["approved", "applied"].includes(improvement.status) ? "ok" : ["rejected", "failed"].includes(improvement.status) ? "danger" : "warn";
+        return '<div class="item clickable ' + (selected ? "selected" : "") + '" data-improvement-id="' + escapeHtml(improvement.id) + '"><div class="item-line"><strong>' + escapeHtml(improvement.title) + '</strong><span class="chip ' + tone + '">' + escapeHtml(improvement.status || "proposed") + '</span></div><div class="muted">' + escapeHtml(improvement.target || "runtime") + ' · ' + escapeHtml(improvement.priority || "normal") + '</div><div>' + renderItemText(improvement.rationale, "No rationale") + '</div></div>';
+      }).join("") || '<div class="empty-state"><strong>No proposals yet</strong><span>Record one directly or mine repeated failures from the audit ledger.</span></div>';
+      renderImprovementDetail();
+    }
+
+    async function refreshImprovements() {
+      if (state.status?.allowedCapabilities?.includes("improve.read") !== true) {
+        state.improvements = [];
+        $("improvement-list").innerHTML = '<div class="empty-state"><strong>Improvement review is disabled by policy</strong><span>Add improve.read to inspect proposals.</span></div>';
+        renderImprovementDetail();
+        return;
+      }
+      const result = await api("/improvements?limit=100");
+      state.improvements = result.improvements || [];
+      if (state.selectedImprovementId && !selectedImprovement()) state.selectedImprovementId = "";
+      renderImprovements();
+    }
+
+    async function decideImprovement(decision) {
+      const improvement = selectedImprovement();
+      if (!improvement) throw new Error("select an improvement proposal first");
+      const note = window.prompt(decision === "approved" ? "Approval note" : "Rejection reason", "") ?? "";
+      const result = await api("/improvements/" + encodeURIComponent(improvement.id) + "/decisions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ decision, note, source: "experimental-lab" }) });
+      showOutput(result);
+      await refreshImprovements();
+    }
+
+    async function rollbackImprovement() {
+      const improvement = selectedImprovement();
+      if (!improvement) throw new Error("select an applied improvement first");
+      if (!window.confirm("Restore the captured pre-change configuration for " + improvement.title + "?")) return;
+      const result = await api("/improvements/" + encodeURIComponent(improvement.id) + "/rollback", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      showOutput(result);
+      await refreshImprovements();
+    }
+
+    async function learnImprovements() {
+      const automatic = state.status?.selfImprovement?.enabled === true && state.status?.selfImprovement?.mode === "auto";
+      if (automatic && !window.confirm("Auto mode may apply allowlisted runtime tuning immediately. Continue mining the audit ledger?")) return;
+      const button = $("learn-improvements");
+      setBusy(button, true);
+      try {
+        const result = await api("/improvements/learn", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: 1000 }) });
+        showOutput(result);
+        await refreshImprovements();
+      } finally { setBusy(button, false); }
+    }
+
+    function updateExperimentalWorkbench({ resetPayload = true, resetTarget = true } = {}) {
+      const featureKey = $("experimental-feature-select").value || "proof";
+      const feature = experimentalFeatures[featureKey];
+      const action = selectedExperimentalAction();
+      const enabled = state.status?.experimental?.[featureKey] === true;
+      const available = enabled || action.availableWhenDisabled === true;
+      const targetField = $("experimental-target-field");
+      targetField.hidden = !action.target;
+      $("experimental-target-label").textContent = action.target || "Target";
+      if (resetTarget) $("experimental-target").value = action.defaultTarget || (action.target === "Run ID" ? defaultExperimentalRunId() : "");
+      const payloadField = $("experimental-payload").parentElement;
+      payloadField.hidden = action.method === "GET";
+      if (resetPayload) $("experimental-payload").value = JSON.stringify(action.sample(), null, 2);
+      $("experimental-action-description").textContent = action.description;
+      $("experimental-action-risk").textContent = action.dangerous ? "changes persisted state" : action.method === "GET" ? "read only" : "audited mutation";
+      $("experimental-action-risk").className = "chip " + (action.dangerous ? "danger" : action.method === "GET" ? "ok" : "warn");
+      $("experimental-endpoint").textContent = action.method + " " + experimentalPath(action, false);
+      $("experimental-run").disabled = !available;
+      $("experimental-run").className = action.dangerous ? "danger" : "";
+      $("experimental-run").textContent = available ? action.label : "Feature disabled";
+    }
+
+    function populateExperimentalActions() {
+      const feature = selectedExperimentalFeature();
+      $("experimental-action-select").innerHTML = feature.actions.map((action) => '<option value="' + escapeHtml(action.id) + '">' + escapeHtml(action.label) + '</option>').join("");
+      updateExperimentalWorkbench();
+    }
+
+    function renderExperimentalHome(status) {
+      const entries = Object.entries(experimentalFeatures);
+      const flags = status?.experimental || {};
+      const enabledCount = entries.filter(([key]) => flags[key] === true).length;
+      $("experimental-enabled-count").textContent = String(enabledCount);
+      $("experimental-disabled-count").textContent = String(entries.length - enabledCount);
+      $("experimental-overall-state").textContent = enabledCount === 0 ? "DISABLED" : enabledCount === entries.length ? "ALL ENABLED" : enabledCount + " / " + entries.length + " ENABLED";
+      $("experimental-overall-state").className = "pill " + (enabledCount === entries.length ? "" : "warn");
+      $("nav-experimental-count").textContent = enabledCount + "/" + entries.length;
+      $("nav-experimental-count").className = "badge " + (enabledCount ? "ok" : "warn");
+      $("experimental-config").textContent = '"experimental": ' + JSON.stringify(Object.fromEntries(entries.map(([key]) => [key, flags[key] === true])), null, 2);
+      $("experimental-config-path").textContent = (status?.state || ".odinn") + "/config.json";
+      renderSelfImprovementStatus(status);
+      $("experimental-feature-grid").innerHTML = entries.map(([key, feature]) => {
+        const enabled = flags[key] === true;
+        return '<article class="experimental-card ' + (enabled ? "enabled" : "disabled") + '"><div class="panel-head"><h2>' + escapeHtml(feature.title) + '</h2><span class="chip ' + (enabled ? "ok" : "warn") + '">' + (enabled ? "enabled" : "off") + '</span></div><p>' + escapeHtml(feature.summary) + '</p><div class="row"><code>' + escapeHtml(feature.endpoint) + '</code><button class="secondary" data-experimental-feature="' + escapeHtml(key) + '" type="button">Open workbench</button></div></article>';
+      }).join("");
+      const featureSelect = $("experimental-feature-select");
+      if (!featureSelect.options.length) {
+        featureSelect.innerHTML = entries.map(([key, feature]) => '<option value="' + escapeHtml(key) + '">' + escapeHtml(feature.title) + '</option>').join("");
+        populateExperimentalActions();
+      } else {
+        updateExperimentalWorkbench({ resetPayload: false, resetTarget: false });
+      }
+    }
+
+    async function refreshExperimentalRuns() {
+      state.experimentalRuns = await api("/runtime/runs?limit=100");
+      renderExperimentalRuns();
+    }
+
+    async function refreshExperiments() {
+      state.status = await api("/status");
+      renderExperimentalHome(state.status);
+      await Promise.all([refreshExperimentalRuns(), refreshImprovements()]);
+      updateExperimentalWorkbench();
+    }
+
+    async function runExperimentalAction() {
+      const featureKey = $("experimental-feature-select").value;
+      const action = selectedExperimentalAction();
+      if (state.status?.experimental?.[featureKey] !== true && action.availableWhenDisabled !== true) throw new Error("experimental " + featureKey + " feature is disabled; enable it in config and restart the gateway");
+      if (action.dangerous && !window.confirm(action.description + " Continue?")) return;
+      const path = experimentalPath(action, true);
+      const options = { method: action.method };
+      if (action.method !== "GET") {
+        let payload;
+        try { payload = JSON.parse($("experimental-payload").value || "{}"); }
+        catch (error) { throw new Error("request JSON is invalid: " + error.message); }
+        options.headers = { "content-type": "application/json" };
+        options.body = JSON.stringify(payload);
+      }
+      const button = $("experimental-run");
+      setBusy(button, true);
+      $("experimental-result").textContent = "Running " + action.method + " " + path + "...";
+      try {
+        const result = await api(path, options);
+        $("experimental-result").textContent = JSON.stringify(result, null, 2);
+        showOutput(result);
+        await refreshExperimentalRuns();
+      } catch (error) {
+        $("experimental-result").textContent = "ERROR\\n" + error.message;
+        throw error;
+      } finally {
+        setBusy(button, false);
+        updateExperimentalWorkbench({ resetPayload: false, resetTarget: false });
+      }
     }
 
     function renderItemText(text, fallback) {
@@ -3476,6 +3878,7 @@ function renderConsoleHtml() {
       try {
         const status = await api("/status");
         state.status = status;
+        renderExperimentalHome(status);
         $("health").textContent = "Online";
         $("nav-health").textContent = "online";
         $("status-pill").textContent = "Online";
@@ -3882,6 +4285,57 @@ function renderConsoleHtml() {
     });
     document.querySelectorAll("[data-view-jump]").forEach((button) => {
       button.addEventListener("click", () => switchView(button.dataset.viewJump));
+    });
+
+    $("refresh-experiments").addEventListener("click", () => refreshExperiments().catch((error) => showOutput(error.message)));
+    $("experimental-feature-select").addEventListener("change", populateExperimentalActions);
+    $("experimental-action-select").addEventListener("change", () => updateExperimentalWorkbench());
+    $("experimental-target").addEventListener("input", () => updateExperimentalWorkbench({ resetPayload: false, resetTarget: false }));
+    $("experimental-feature-grid").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-experimental-feature]");
+      if (!button) return;
+      $("experimental-feature-select").value = button.dataset.experimentalFeature;
+      populateExperimentalActions();
+      document.querySelector(".experimental-workbench")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    $("experimental-run").addEventListener("click", () => runExperimentalAction().catch((error) => showOutput(error.message)));
+    $("copy-experimental-config").addEventListener("click", async () => {
+      await navigator.clipboard?.writeText($("experimental-config").textContent);
+      showOutput("Experimental configuration copied. Merge it into the existing config and restart the gateway.");
+    });
+    $("experimental-recent-runs").addEventListener("click", async (event) => {
+      const item = event.target.closest("[data-experimental-run-id]");
+      if (!item) return;
+      try {
+        const detail = await api("/runtime/runs/" + encodeURIComponent(item.dataset.experimentalRunId));
+        $("experimental-result").textContent = JSON.stringify(detail, null, 2);
+        showOutput(detail);
+      } catch (error) { showOutput(error.message); }
+    });
+    $("refresh-improvements").addEventListener("click", () => refreshImprovements().catch((error) => showOutput(error.message)));
+    $("learn-improvements").addEventListener("click", () => learnImprovements().catch((error) => showOutput(error.message)));
+    $("new-improvement").addEventListener("click", () => $("improvement-dialog").showModal());
+    $("improvement-list").addEventListener("click", (event) => {
+      const item = event.target.closest("[data-improvement-id]");
+      if (!item) return;
+      state.selectedImprovementId = item.dataset.improvementId;
+      renderImprovements();
+    });
+    $("improvement-approve").addEventListener("click", () => decideImprovement("approved").catch((error) => showOutput(error.message)));
+    $("improvement-reject").addEventListener("click", () => decideImprovement("rejected").catch((error) => showOutput(error.message)));
+    $("improvement-rollback").addEventListener("click", () => rollbackImprovement().catch((error) => showOutput(error.message)));
+    $("improvement-form").addEventListener("submit", async (event) => {
+      if (event.submitter?.value === "cancel") return;
+      event.preventDefault();
+      try {
+        const result = await api("/improvements", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: $("improvement-title").value.trim(), rationale: $("improvement-rationale").value.trim(), target: $("improvement-target").value.trim() || "runtime", priority: $("improvement-priority").value, source: "experimental-lab" }) });
+        state.selectedImprovementId = result.id;
+        $("improvement-dialog").close();
+        $("improvement-form").reset();
+        $("improvement-target").value = "runtime";
+        await refreshImprovements();
+        showOutput(result);
+      } catch (error) { showOutput(error.message); }
     });
 
     $("sidebar-toggle").addEventListener("click", () => {

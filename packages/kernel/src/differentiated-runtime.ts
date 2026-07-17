@@ -4,6 +4,7 @@ import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync
 import { readFile, writeFile, mkdir, readdir, stat, lstat, rm, cp } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { createRunLedger, redact } from "./run-ledger.ts";
+import { ProofVerifier } from "./proof.ts";
 
 type AnyRecord = Record<string, any>;
 type FeatureFlags = Record<string, boolean>;
@@ -30,13 +31,22 @@ export class OdinnRuntimeError extends Error {
 function now() { return new Date().toISOString(); }
 function json(value: unknown) { return JSON.stringify(value); }
 function containsRedaction(value: unknown): boolean {
-  if (value === "[redacted]") return true;
+  if (typeof value === "string") return value.includes("[redacted");
   if (Array.isArray(value)) return value.some(containsRedaction);
   if (value && typeof value === "object") return Object.values(value).some(containsRedaction);
   return false;
 }
 function hash(value: string | Buffer) { return createHash("sha256").update(value).digest("hex"); }
 function parse(value: string | undefined | null, fallback: any = {}): any { try { return value ? JSON.parse(value) : fallback; } catch { return fallback; } }
+function odinnVersion() {
+  const configured = process.env.ODINN_VERSION?.trim();
+  if (configured) return configured;
+  try {
+    const manifest = JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8"));
+    if (typeof manifest.version === "string" && manifest.version.trim()) return manifest.version.trim();
+  } catch {}
+  return "unknown";
+}
 function requireExperimental(flags: FeatureFlags, name: string) {
   if (flags?.[name] !== true) throw new OdinnRuntimeError("POLICY_VIOLATION", `experimental.${name} is disabled`, { feature: name });
 }
@@ -47,12 +57,26 @@ function safePath(root: string, candidate: string) {
   return target;
 }
 function safeExistingPath(root: string, candidate: string) {
-  const target = safePath(root, candidate);
+  const base = resolve(root);
+  const target = safePath(base, candidate);
   let cursor = target;
-  while (cursor !== root && !existsSync(cursor)) cursor = dirname(cursor);
+  while (cursor !== base && !existsSync(cursor)) cursor = dirname(cursor);
   const real = resolve(realpathSync(cursor));
-  if (real !== root && !real.startsWith(`${resolve(root)}${sep}`)) throw new OdinnRuntimeError("POLICY_VIOLATION", "symlink escapes allowed root", { path: candidate });
+  const physicalBase = resolve(realpathSync(base));
+  if (real !== physicalBase && !real.startsWith(`${physicalBase}${sep}`)) throw new OdinnRuntimeError("POLICY_VIOLATION", "symlink escapes allowed root", { path: candidate });
   return target;
+}
+
+function isWithin(root: string, target: string) {
+  const base = resolve(root);
+  const resolvedTarget = resolve(target);
+  return resolvedTarget === base || resolvedTarget.startsWith(`${base}${sep}`);
+}
+
+function isPlainRecord(value: unknown): value is AnyRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Reflect.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function isLoopbackUrl(value: string) {
@@ -126,8 +150,13 @@ export function validatePolicy(policy: unknown): AnyRecord {
   const value = policy as AnyRecord;
   if (value.version !== 1) throw new OdinnRuntimeError("POLICY_VIOLATION", "policy version must be 1");
   if (!Array.isArray(value.invariants)) throw new OdinnRuntimeError("POLICY_VIOLATION", "policy invariants must be an array");
+  const ids = new Set<string>();
   for (const item of value.invariants) {
-    if (!item?.id || !item?.type || !["log", "warn", "pause", "block", "rollback", "terminate"].includes(item.enforcement ?? "block")) throw new OdinnRuntimeError("POLICY_VIOLATION", "invalid policy invariant");
+    if (!isPlainRecord(item) || typeof item.id !== "string" || !item.id.trim() || ids.has(item.id)) throw new OdinnRuntimeError("POLICY_VIOLATION", "policy invariant ids must be unique non-empty strings");
+    ids.add(item.id);
+    if (!["command.deny-pattern", "tool.requires-approval", "filesystem.allowed-roots"].includes(item.type)) throw new OdinnRuntimeError("POLICY_VIOLATION", `unsupported policy invariant type: ${String(item.type ?? "missing")}`);
+    if (!Array.isArray(item.values) || item.values.length === 0 || item.values.some((entry: unknown) => typeof entry !== "string" || !entry.trim())) throw new OdinnRuntimeError("POLICY_VIOLATION", `policy invariant ${item.id} requires non-empty string values`);
+    if (!["log", "warn", "pause", "block", "rollback", "terminate"].includes(item.enforcement ?? "block")) throw new OdinnRuntimeError("POLICY_VIOLATION", `invalid enforcement for policy invariant ${item.id}`);
   }
   return value;
 }
@@ -147,9 +176,23 @@ function runProcess(command: string, args: string[], { cwd, timeoutMs = 120_000 
 
 export class ProofEngine {
   [key: string]: any;
-  constructor({ ledger, featureFlags = {}, allowExternalHttp = false }: AnyRecord = {}) { this.ledger = ledger; this.featureFlags = featureFlags; this.allowExternalHttp = allowExternalHttp === true; }
+  constructor({ ledger, featureFlags = {}, allowExternalHttp = false, allowedCommands = [], maxOutputBytes, maxFileBytes, commandEnvironment }: AnyRecord = {}) {
+    this.ledger = ledger;
+    this.featureFlags = featureFlags;
+    this.allowExternalHttp = allowExternalHttp === true;
+    this.verifierOptions = { allowedCommands, maxOutputBytes, maxFileBytes, commandEnvironment };
+  }
   async run(runId: string, contract: AnyRecord, { workspaceRoot = process.cwd() }: AnyRecord = {}) {
     requireExperimental(this.featureFlags, "proof");
+    if (contract?.schemaVersion === 1) {
+      const verifierOptions = Object.fromEntries(Object.entries(this.verifierOptions).filter(([, value]) => value !== undefined));
+      return new ProofVerifier({
+        runLedger: this.ledger,
+        ...verifierOptions,
+        allowedRoot: workspaceRoot,
+        allowExternalHttp: this.allowExternalHttp
+      }).verify({ ...contract, runId });
+    }
     validateContract(contract);
     const id = contract.id ?? `contract_${randomUUID()}`;
     const createdAt = now();
@@ -206,7 +249,11 @@ function policyMatch(invariant: AnyRecord, toolName: string, input: AnyRecord, w
   const value = JSON.stringify(input ?? {});
   if (invariant.type === "tool.requires-approval") return (invariant.values ?? []).includes(toolName);
   if (invariant.type === "command.deny-pattern") return (invariant.values ?? []).some((pattern: string) => value.includes(pattern));
-  if (invariant.type === "filesystem.allowed-roots") return toolName.includes("write") && typeof input?.path === "string" && !(invariant.values ?? []).some((root: string) => safePath(workspaceRoot, input.path).startsWith(safePath(workspaceRoot, root)));
+  if (invariant.type === "filesystem.allowed-roots") {
+    if (!toolName.includes("write") || typeof input?.path !== "string") return false;
+    const target = safePath(workspaceRoot, input.path);
+    return !(invariant.values ?? []).some((root: string) => isWithin(safePath(workspaceRoot, root), target));
+  }
   return false;
 }
 
@@ -270,19 +317,77 @@ export class CapabilityBroker {
   list(runId: string) { return this.ledger.database.db.prepare("SELECT id, run_id, step_id, tool_name, scopes_json, constraints_json, issued_at, expires_at, max_uses, uses, status, revoked_at FROM capabilities WHERE run_id = ? ORDER BY issued_at").all(runId).map((row: AnyRecord) => ({ ...row, scopes: parse(row.scopes_json, []), resourceConstraints: parse(row.constraints_json, {}) })); }
 }
 
-function fileDigest(path: string) { return existsSync(path) && lstatSync(path).isFile() ? hash(readFileSync(path)) : null; }
 function walkFiles(root: string, current = root, output: string[] = []): string[] { if (!existsSync(current)) return output; const st = lstatSync(current); if (st.isSymbolicLink()) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "symlinks are not snapshot-safe", { path: current }); if (st.isFile()) { output.push(current); return output; } for (const entry of readdirSync(current)) walkFiles(root, join(current, entry), output); return output; }
+function rejectSymbolicPath(root: string, target: string) {
+  const base = resolve(root);
+  let cursor = resolve(target);
+  while (cursor !== base && isWithin(base, cursor)) {
+    if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "symlinks are not snapshot-safe", { path: relative(base, cursor) });
+    cursor = dirname(cursor);
+  }
+}
 
 export class SnapshotManager {
   [key: string]: any;
   constructor({ ledger, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.featureFlags = featureFlags; }
   create({ runId, stepId, paths = [], label, workspaceRoot = process.cwd() }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "rewind"); const snapshotId = `snap_${randomUUID()}`; const entries: AnyRecord[] = [];
-    for (const relativePath of paths) { const target = safeExistingPath(workspaceRoot, relativePath); for (const path of walkFiles(workspaceRoot, target)) { const rel = relative(workspaceRoot, path); const artifact = this.ledger.artifacts.put(readFileSync(path)); entries.push({ path: rel, existed: true, mode: lstatSync(path).mode, digest: fileDigest(path), artifactDigest: artifact.digest }); } if (!existsSync(target)) entries.push({ path: relativePath, existed: false }); }
+    requireExperimental(this.featureFlags, "rewind");
+    if (!this.ledger.getRun(runId)) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot run not found", { runId });
+    if (!Array.isArray(paths) || paths.length === 0 || paths.some((path) => typeof path !== "string" || !path.trim())) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot paths must contain at least one non-empty path");
+    const requestedPaths = [...new Set(paths)];
+    if (requestedPaths.length !== paths.length) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot paths must be unique");
+    const root = resolve(workspaceRoot);
+    const snapshotId = `snap_${randomUUID()}`;
+    const entriesByPath = new Map<string, AnyRecord>();
+    for (const relativePath of requestedPaths) {
+      const target = safeExistingPath(root, relativePath);
+      if (isWithin(target, this.ledger.stateDir) || isWithin(this.ledger.stateDir, target)) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot paths cannot include the Odinn state directory", { path: relativePath });
+      rejectSymbolicPath(root, target);
+      for (const path of walkFiles(root, target)) {
+        const rel = relative(root, path);
+        if (entriesByPath.has(rel)) continue;
+        const bytes = readFileSync(path);
+        const artifact = this.ledger.artifacts.put(bytes);
+        entriesByPath.set(rel, { path: rel, existed: true, mode: lstatSync(path).mode, digest: hash(bytes), artifactDigest: artifact.digest });
+      }
+      if (!existsSync(target)) entriesByPath.set(relativePath, { path: relativePath, existed: false });
+    }
+    const entries = [...entriesByPath.values()];
     const createdAt = now(); this.ledger.database.transaction((db: any) => { db.prepare("INSERT INTO snapshots(id, run_id, step_id, label, workspace_root, manifest_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(snapshotId, runId, stepId ?? null, label ?? null, resolve(workspaceRoot), json({ entries: entries.map((entry) => ({ path: entry.path, existed: entry.existed, digest: entry.digest, artifactDigest: entry.artifactDigest })) }), createdAt); for (const entry of entries) db.prepare("INSERT INTO snapshot_entries(id, snapshot_id, path, existed, mode, digest, artifact_digest) VALUES (?, ?, ?, ?, ?, ?, ?)").run(randomUUID(), snapshotId, entry.path, entry.existed ? 1 : 0, entry.mode ?? null, entry.digest ?? null, entry.artifactDigest ?? null); }); this.ledger.appendEvent({ runId, type: "snapshot", payload: { snapshotId, label, entries: entries.length } }); return { snapshotId, entries };
   }
   plan(snapshotId: string): AnyRecord { const snapshot = this.ledger.database.db.prepare("SELECT * FROM snapshots WHERE id = ?").get(snapshotId) as AnyRecord | undefined; if (!snapshot) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot not found"); return { snapshotId, workspaceRoot: snapshot.workspace_root, entries: this.ledger.database.db.prepare("SELECT * FROM snapshot_entries WHERE snapshot_id = ? ORDER BY path").all(snapshotId) }; }
-  restore(snapshotId: string, { apply = false }: AnyRecord = {}) { requireExperimental(this.featureFlags, "rewind"); const plan = this.plan(snapshotId); const actions: AnyRecord[] = []; for (const entry of plan.entries) { const target = safeExistingPath(plan.workspaceRoot, entry.path); if (!apply) { actions.push({ path: entry.path, action: entry.existed ? "restore" : "remove" }); continue; } if (entry.existed) { const artifactPath = join(this.ledger.artifacts.root, "sha256", entry.artifact_digest.slice(0, 2), entry.artifact_digest); mkdirSync(dirname(target), { recursive: true }); writeFileSync(target, readFileSync(artifactPath), { mode: entry.mode ?? 0o600 }); actions.push({ path: entry.path, action: "restored" }); } else if (existsSync(target)) { rmSync(target, { recursive: true, force: true }); actions.push({ path: entry.path, action: "removed" }); } } const snapshotRow = this.ledger.database.db.prepare("SELECT run_id FROM snapshots WHERE id = ?").get(snapshotId) as AnyRecord; this.ledger.appendEvent({ runId: snapshotRow.run_id, type: "rollback", payload: { snapshotId, applied: apply, actions } }); return { snapshotId, applied: apply, actions }; }
+  restore(snapshotId: string, { apply = false }: AnyRecord = {}) {
+    requireExperimental(this.featureFlags, "rewind");
+    const plan = this.plan(snapshotId);
+    const prepared = plan.entries.map((entry: AnyRecord) => {
+      const target = safeExistingPath(plan.workspaceRoot, entry.path);
+      rejectSymbolicPath(plan.workspaceRoot, target);
+      if (!entry.existed) return { entry, target };
+      if (typeof entry.artifact_digest !== "string" || !/^[a-f0-9]{64}$/.test(entry.artifact_digest)) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot entry has an invalid artifact digest", { path: entry.path });
+      const artifactPath = join(this.ledger.artifacts.root, "sha256", entry.artifact_digest.slice(0, 2), entry.artifact_digest);
+      if (!isWithin(this.ledger.artifacts.root, artifactPath) || !existsSync(artifactPath) || !lstatSync(artifactPath).isFile()) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot artifact is missing", { path: entry.path, digest: entry.artifact_digest });
+      const bytes = readFileSync(artifactPath);
+      const actualDigest = hash(bytes);
+      if (actualDigest !== entry.artifact_digest || (entry.digest && actualDigest !== entry.digest)) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot artifact failed integrity verification", { path: entry.path, expected: entry.artifact_digest, actual: actualDigest });
+      return { entry, target, bytes };
+    });
+    const actions: AnyRecord[] = [];
+    for (const item of prepared) {
+      const { entry, target, bytes } = item;
+      if (!apply) { actions.push({ path: entry.path, action: entry.existed ? "restore" : "remove" }); continue; }
+      if (entry.existed) {
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, bytes, { mode: entry.mode ?? 0o600 });
+        actions.push({ path: entry.path, action: "restored" });
+      } else if (existsSync(target)) {
+        rmSync(target, { recursive: true, force: true });
+        actions.push({ path: entry.path, action: "removed" });
+      }
+    }
+    const snapshotRow = this.ledger.database.db.prepare("SELECT run_id FROM snapshots WHERE id = ?").get(snapshotId) as AnyRecord;
+    this.ledger.appendEvent({ runId: snapshotRow.run_id, type: "rollback", payload: { snapshotId, applied: apply, actions } });
+    return { snapshotId, applied: apply, actions };
+  }
 }
 
 export class DarwinRouter {
@@ -311,7 +416,7 @@ export class CapsuleManager {
       const storedPolicy = this.ledger.database.db.prepare("SELECT policy_json FROM policies WHERE run_id = ? ORDER BY created_at DESC LIMIT 1").get(runId);
       const effectiveContract = contract ?? parse(storedContract?.contract_json, null);
       const effectivePolicy = policy ?? parse(storedPolicy?.policy_json, null);
-      const manifest = { formatVersion: 1, odinnVersion: "0.1.0", runId, createdAt: now(), sourcePlatform: `${process.platform}-${process.arch}`, model: { provider: run.providerId, modelId: run.modelId }, replayMode, redactions: ["api keys", "tokens", "cookies", "authorization headers"], requiredSecrets: [], checksumsFile: "checksums.sha256" };
+      const manifest = { formatVersion: 1, odinnVersion: odinnVersion(), runId, createdAt: now(), sourcePlatform: `${process.platform}-${process.arch}`, model: { provider: run.providerId, modelId: run.modelId }, replayMode, redactions: ["api keys", "tokens", "cookies", "authorization headers"], requiredSecrets: [], checksumsFile: "checksums.sha256" };
       writeFileSync(join(staging, "manifest.json"), `${json(manifest)}\n`);
       writeFileSync(join(staging, "run.json"), `${json(redact(run))}\n`);
       writeFileSync(join(staging, "events.jsonl"), `${(run.events ?? []).map((event: AnyRecord) => json(redact(event))).join("\n")}\n`);
@@ -348,11 +453,50 @@ export class CapsuleManager {
   }
   async verify(path: string) {
     requireExperimental(this.featureFlags, "capsules");
-    const archive = resolve(path); if (!existsSync(archive)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule not found"); const recorded = this.ledger.database.db.prepare("SELECT digest FROM capsules WHERE path = ? ORDER BY created_at DESC LIMIT 1").get(archive); if (recorded && recorded.digest !== hash(readFileSync(archive))) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule archive digest changed", { path: archive });
-    const listing = await runProcess("unzip", ["-Z1", archive], { timeoutMs: 30_000 }); if (listing.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "invalid capsule archive");
-    const names = listing.stdout.split(/\r?\n/).filter(Boolean); for (const name of names) if (name.startsWith("/") || name.includes("..") || /^[A-Za-z]:/.test(name)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule contains unsafe path", { name });
-    const staging = join(this.root, `.verify-${randomUUID()}`); mkdirSync(staging, { recursive: true }); const extracted = await runProcess("unzip", ["-q", archive, "-d", staging], { timeoutMs: 60_000 }); if (extracted.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule extraction failed");
-    const manifest = parse(readFileSync(join(staging, "manifest.json"), "utf8"), null); if (!manifest || manifest.formatVersion !== 1) throw new OdinnRuntimeError("CAPSULE_INVALID", "unsupported capsule version"); const checksums = readFileSync(join(staging, "checksums.sha256"), "utf8").split(/\r?\n/).filter(Boolean); const failures = []; for (const line of checksums) { const match = line.match(/^([a-f0-9]{64})  (.+)$/); if (!match || !names.includes(match[2]) || !existsSync(join(staging, match[2])) || hash(readFileSync(join(staging, match[2]))) !== match[1]) failures.push(match?.[2] ?? line); } await rm(staging, { recursive: true, force: true }); if (failures.length) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule checksum verification failed", { failures }); return { valid: true, manifest, entries: names };
+    const archive = resolve(path);
+    if (!existsSync(archive)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule not found");
+    const recorded = this.ledger.database.db.prepare("SELECT digest FROM capsules WHERE path = ? ORDER BY created_at DESC LIMIT 1").get(archive);
+    if (recorded && recorded.digest !== hash(readFileSync(archive))) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule archive digest changed", { path: archive });
+    const listing = await runProcess("unzip", ["-Z1", archive], { timeoutMs: 30_000 });
+    if (listing.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "invalid capsule archive");
+    const names = listing.stdout.split(/\r?\n/).filter(Boolean);
+    const normalizedNames = names.map((name) => name.replaceAll("\\", "/"));
+    const seenNames = new Set<string>();
+    for (const name of normalizedNames) {
+      const segments = name.split("/").filter(Boolean);
+      if (!name || name.startsWith("/") || name.includes("\0") || /^[A-Za-z]:/.test(name) || segments.some((segment) => segment === "." || segment === "..") || seenNames.has(name)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule contains an unsafe or duplicate path", { name });
+      seenNames.add(name);
+    }
+    const staging = join(this.root, `.verify-${randomUUID()}`);
+    mkdirSync(staging, { recursive: true });
+    try {
+      const extracted = await runProcess("unzip", ["-q", archive, "-d", staging], { timeoutMs: 60_000 });
+      if (extracted.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule extraction failed");
+      for (const name of normalizedNames) {
+        const target = join(staging, name);
+        if (!existsSync(target)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule entry was not extracted", { name });
+        if (lstatSync(target).isSymbolicLink()) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule contains a symbolic link", { name });
+      }
+      const required = ["manifest.json", "run.json", "events.jsonl", "environment.json", "checksums.sha256"];
+      for (const name of required) if (!seenNames.has(name)) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule is missing ${name}`);
+      const manifest = parse(readFileSync(join(staging, "manifest.json"), "utf8"), null);
+      if (!manifest || manifest.formatVersion !== 1) throw new OdinnRuntimeError("CAPSULE_INVALID", "unsupported capsule version");
+      const checksumLines = readFileSync(join(staging, "checksums.sha256"), "utf8").split(/\r?\n/).filter(Boolean);
+      const checksummed = new Set<string>();
+      const failures: string[] = [];
+      for (const line of checksumLines) {
+        const match = line.match(/^([a-f0-9]{64})  (.+)$/);
+        const name = match?.[2]?.replaceAll("\\", "/");
+        if (!match || !name || checksummed.has(name) || !seenNames.has(name) || name === "checksums.sha256" || !existsSync(join(staging, name)) || !lstatSync(join(staging, name)).isFile() || hash(readFileSync(join(staging, name))) !== match[1]) failures.push(name ?? line);
+        else checksummed.add(name);
+      }
+      const expectedFiles = normalizedNames.filter((name) => name !== "checksums.sha256" && existsSync(join(staging, name)) && lstatSync(join(staging, name)).isFile());
+      for (const name of expectedFiles) if (!checksummed.has(name)) failures.push(name);
+      if (failures.length) throw new OdinnRuntimeError("CAPSULE_TAMPERED", "capsule checksum verification failed", { failures: [...new Set(failures)] });
+      return { valid: true, manifest, entries: normalizedNames };
+    } finally {
+      await rm(staging, { recursive: true, force: true });
+    }
   }
   async replay(path: string, { mode = "verification-only", workspace, executor, approveExternal = false }: AnyRecord = {}) {
     const verified = await this.verify(path);
@@ -379,8 +523,9 @@ export class CapsuleManager {
         if (!tool || !digest) throw new OdinnRuntimeError("CAPSULE_INVALID", "recorded tool request is missing replay metadata");
         const artifact = await runProcess("unzip", ["-p", resolve(path), `artifacts/${digest}`], { timeoutMs: 30_000 });
         if (artifact.code !== 0) throw new OdinnRuntimeError("CAPSULE_INVALID", `capsule is missing input artifact ${digest}`);
+        if (hash(artifact.stdout) !== digest) throw new OdinnRuntimeError("CAPSULE_TAMPERED", `tool ${tool} input artifact does not match its digest`);
         const input = parse(artifact.stdout, null);
-        if (!input || containsRedaction(input)) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", `tool ${tool} requires redacted or missing input`);
+        if (!isPlainRecord(input) || containsRedaction(input)) throw new OdinnRuntimeError("REPLAY_UNSUPPORTED", `tool ${tool} requires redacted, missing, or invalid input`);
         const safety = event.payload?.safety ?? {};
         const external = safety.reversibility === "irreversible" || (safety.effects ?? []).some((effect: string) => ["network", "credential", "external-state"].includes(effect));
         if (external && approveExternal !== true) throw new OdinnRuntimeError("CAPABILITY_DENIED", `full replay of external tool ${tool} requires explicit approval`);
@@ -421,13 +566,62 @@ async function copyWorkspaceTree(sourceRoot: string, destinationRoot: string) {
   }
 }
 
+function validateCounterfactualPlans(plans: unknown): AnyRecord[] {
+  if (!Array.isArray(plans) || plans.length < 1 || plans.length > 4) throw new OdinnRuntimeError("BUDGET_EXCEEDED", "counterfactual plans must contain 1-4 candidates");
+  const ids = new Set<string>();
+  return plans.map((plan, index) => {
+    if (!isPlainRecord(plan)) throw new OdinnRuntimeError("CAPSULE_INVALID", `counterfactual plan ${index + 1} must be an object`);
+    if (typeof plan.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(plan.id)) throw new OdinnRuntimeError("CAPSULE_INVALID", `counterfactual plan ${index + 1} has an unsafe id`);
+    if (ids.has(plan.id)) throw new OdinnRuntimeError("CAPSULE_INVALID", `duplicate counterfactual plan id: ${plan.id}`);
+    ids.add(plan.id);
+    if (typeof plan.title !== "string" || !plan.title.trim() || plan.title.length > 256 || typeof plan.summary !== "string" || !plan.summary.trim() || plan.summary.length > 4_096) throw new OdinnRuntimeError("CAPSULE_INVALID", `counterfactual plan ${plan.id} requires a bounded title and summary`);
+    return plan;
+  });
+}
+
 export class CounterfactualManager {
   [key: string]: any;
   constructor({ ledger, stateDir, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.stateDir = resolve(stateDir ?? ".odinn"); this.featureFlags = featureFlags; }
   async create({ sourceRunId, sourceStepId, plans = [], workspaceRoot = process.cwd() }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "counterfactual"); if (!plans.length || plans.length > 4) throw new OdinnRuntimeError("BUDGET_EXCEEDED", "counterfactual plans must contain 1-4 candidates"); const groupId = `cf_${randomUUID()}`; this.ledger.database.db.prepare("INSERT INTO counterfactual_groups(id, source_run_id, status, created_at) VALUES (?, ?, 'created', ?)").run(groupId, sourceRunId, now()); const candidates = [];
-    for (const plan of plans) { if (!plan?.id || !plan.title || !plan.summary) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual plans require id, title, and summary"); const runId = `run_${randomUUID()}`; const sourceRoot = resolve(workspaceRoot); const branchRoot = join(sourceRoot, `.odinn-worktrees`, groupId, plan.id); await copyWorkspaceTree(sourceRoot, branchRoot); this.ledger.ensureRun({ runId, parentRunId: sourceRunId, branchPointStepId: sourceStepId, objective: plan.summary, workspaceRoot: branchRoot }); this.ledger.database.db.prepare("INSERT INTO run_branches(id, source_run_id, source_step_id, child_run_id, label, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`branch_${randomUUID()}`, sourceRunId, sourceStepId, runId, plan.title, now()); this.ledger.database.db.prepare("INSERT INTO counterfactual_candidates(id, group_id, run_id, plan_json, status) VALUES (?, ?, ?, ?, 'created')").run(`candidate_${randomUUID()}`, groupId, runId, json(redact(plan))); candidates.push({ runId, plan, workspaceRoot: branchRoot }); }
-    this.ledger.appendEvent({ runId: sourceRunId, type: "branch-created", payload: { groupId, candidates: candidates.map((candidate) => ({ runId: candidate.runId, title: candidate.plan.title })) } }); return { groupId, candidates };
+    requireExperimental(this.featureFlags, "counterfactual");
+    const normalizedPlans = validateCounterfactualPlans(plans);
+    if (typeof sourceRunId !== "string" || !sourceRunId || typeof sourceStepId !== "string" || !sourceStepId) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual sourceRunId and sourceStepId are required");
+    const sourceRun = this.ledger.getRun(sourceRunId);
+    if (!sourceRun) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual source run not found", { sourceRunId });
+    const sourceRoot = resolve(workspaceRoot);
+    const expectedRoot = resolve(sourceRun.workspaceRoot);
+    if (sourceRoot !== expectedRoot) throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "counterfactual workspace must match the source run workspace", { expectedRoot, requestedRoot: sourceRoot });
+    const groupId = `cf_${randomUUID()}`;
+    const groupRoot = resolve(sourceRoot, ".odinn-worktrees", groupId);
+    const candidates: AnyRecord[] = [];
+    const createdRunIds: string[] = [];
+    this.ledger.database.db.prepare("INSERT INTO counterfactual_groups(id, source_run_id, status, created_at) VALUES (?, ?, 'created', ?)").run(groupId, sourceRunId, now());
+    try {
+      for (const plan of normalizedPlans) {
+        const runId = `run_${randomUUID()}`;
+        const branchRoot = resolve(groupRoot, plan.id);
+        if (!isWithin(groupRoot, branchRoot) || branchRoot === groupRoot) throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "counterfactual branch escaped its group directory", { planId: plan.id });
+        await copyWorkspaceTree(sourceRoot, branchRoot);
+        this.ledger.ensureRun({ runId, parentRunId: sourceRunId, branchPointStepId: sourceStepId, objective: plan.summary, workspaceRoot: branchRoot });
+        createdRunIds.push(runId);
+        this.ledger.database.db.prepare("INSERT INTO run_branches(id, source_run_id, source_step_id, child_run_id, label, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(`branch_${randomUUID()}`, sourceRunId, sourceStepId, runId, plan.title, now());
+        this.ledger.database.db.prepare("INSERT INTO counterfactual_candidates(id, group_id, run_id, plan_json, status) VALUES (?, ?, ?, ?, 'created')").run(`candidate_${randomUUID()}`, groupId, runId, json(redact(plan)));
+        candidates.push({ runId, plan, workspaceRoot: branchRoot });
+      }
+      this.ledger.appendEvent({ runId: sourceRunId, type: "branch-created", payload: { groupId, candidates: candidates.map((candidate) => ({ runId: candidate.runId, title: candidate.plan.title })) } });
+      return { groupId, candidates };
+    } catch (error) {
+      this.ledger.database.transaction((db: any) => {
+        db.prepare("DELETE FROM counterfactual_candidates WHERE group_id = ?").run(groupId);
+        for (const runId of createdRunIds) {
+          db.prepare("DELETE FROM run_branches WHERE child_run_id = ?").run(runId);
+          db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+        }
+        db.prepare("DELETE FROM counterfactual_groups WHERE id = ?").run(groupId);
+      });
+      await rm(groupRoot, { recursive: true, force: true });
+      throw error;
+    }
   }
   async execute(groupId: string, { executor, proof, capabilities, policy, workspaceRoot = this.ledger.workspaceRoot }: AnyRecord = {}) {
     requireExperimental(this.featureFlags, "counterfactual");
@@ -469,12 +663,14 @@ export class CounterfactualManager {
           if (!proof) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual plan includes a contract but no proof engine was supplied");
           const contract = { ...plan.contract, runId: row.run_id };
           proofResult = await proof.run(row.run_id, contract, { workspaceRoot: row.workspace_root });
-          if (proofResult.status === "failed") throw new OdinnRuntimeError("VERIFICATION_FAILED", `counterfactual plan ${plan.id} failed Proof verification`, { proof: proofResult });
+          if (proofResult.status === "failed" || proofResult.passed === false) throw new OdinnRuntimeError("VERIFICATION_FAILED", `counterfactual plan ${plan.id} failed Proof verification`, { proof: proofResult });
         }
-        this.ledger.database.db.prepare("UPDATE counterfactual_candidates SET status = 'completed' WHERE run_id = ?").run(row.run_id);
-        this.ledger.database.db.prepare("UPDATE runs SET status = ?, completed_at = ? WHERE id = ?").run(proofResult?.status ?? "completed-unverified", now(), row.run_id);
-        this.ledger.appendEvent({ runId: row.run_id, type: "counterfactual-completed", payload: { groupId, planId: plan.id, proof: proofResult?.status, taskCount: taskResults.length } });
-        results.push({ runId: row.run_id, planId: plan.id, status: proofResult?.status ?? "completed-unverified", tasks: taskResults, proof: proofResult });
+        const verified = proofResult && (proofResult.status === "passed" || proofResult.status === "verified" || proofResult.passed === true);
+        const resultStatus = verified ? "verified" : proofResult?.status ?? "completed-unverified";
+        this.ledger.database.db.prepare("UPDATE counterfactual_candidates SET status = ? WHERE run_id = ?").run(verified ? "verified" : "completed", row.run_id);
+        this.ledger.database.db.prepare("UPDATE runs SET status = ?, completed_at = ? WHERE id = ?").run(resultStatus, now(), row.run_id);
+        this.ledger.appendEvent({ runId: row.run_id, type: "counterfactual-completed", payload: { groupId, planId: plan.id, proof: resultStatus, taskCount: taskResults.length } });
+        results.push({ runId: row.run_id, planId: plan.id, status: resultStatus, tasks: taskResults, proof: proofResult });
       } catch (error) {
         const failure = error instanceof OdinnRuntimeError ? error : new OdinnRuntimeError("RUNTIME_ERROR", failureMessage(error));
         this.ledger.database.db.prepare("UPDATE counterfactual_candidates SET status = 'failed' WHERE run_id = ?").run(row.run_id);
@@ -528,7 +724,7 @@ async function syncWorkspace(source: string, destination: string) {
   }
 }
 
-export function createDifferentiatedRuntime({ stateDir = ".odinn", workspaceRoot = process.cwd(), featureFlags = {} }: AnyRecord = {}) {
+export function createDifferentiatedRuntime({ stateDir = ".odinn", workspaceRoot = process.cwd(), featureFlags = {}, proofOptions = {} }: AnyRecord = {}) {
   const ledger = createRunLedger({ stateDir, workspaceRoot, featureFlags });
-  return { ledger, proof: new ProofEngine({ ledger, featureFlags }), sentinel: new Sentinel({ ledger, featureFlags }), capabilities: new CapabilityBroker({ ledger, stateDir, featureFlags }), snapshots: new SnapshotManager({ ledger, featureFlags }), capsules: new CapsuleManager({ ledger, stateDir, featureFlags }), counterfactual: new CounterfactualManager({ ledger, stateDir, featureFlags }), darwin: new DarwinRouter({ ledger, featureFlags }) };
+  return { ledger, proof: new ProofEngine({ ledger, featureFlags, ...proofOptions }), sentinel: new Sentinel({ ledger, featureFlags }), capabilities: new CapabilityBroker({ ledger, stateDir, featureFlags }), snapshots: new SnapshotManager({ ledger, featureFlags }), capsules: new CapsuleManager({ ledger, stateDir, featureFlags }), counterfactual: new CounterfactualManager({ ledger, stateDir, featureFlags }), darwin: new DarwinRouter({ ledger, featureFlags }) };
 }

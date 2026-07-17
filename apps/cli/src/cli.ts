@@ -18,6 +18,108 @@ const configBaselines = new WeakMap<object, string | null>();
 if (rawArgs[0] === "--") rawArgs.shift();
 const [command, ...args] = rawArgs;
 
+const EXPERIMENTAL_HOME = [
+  {
+    id: "proof",
+    label: "Proof",
+    configKey: "experimental.proof",
+    description: "Verify a recorded run against operator-controlled file, HTTP, Git, or allowlisted command assertions.",
+    safeActions: [
+      "odinn experimental proof contract validate <contract.json|yml>",
+      "odinn experimental proof show <run-id> [--state .odinn]"
+    ],
+    activeActions: ["odinn experimental proof run <run-id> --contract <contract.json|yml> [--state .odinn]"]
+  },
+  {
+    id: "sentinel",
+    label: "Sentinel",
+    configKey: "experimental.sentinel",
+    description: "Evaluate tool input against explicit runtime invariants before execution.",
+    safeActions: ["odinn experimental sentinel validate <policy.json|yml>"],
+    activeActions: ["odinn experimental sentinel test <policy.json|yml> --tool <tool> --input-json <json> [--state .odinn]"]
+  },
+  {
+    id: "capabilities",
+    label: "Capability Tokens",
+    configKey: "experimental.capabilities",
+    description: "Issue, consume, inspect, and revoke short-lived tokens scoped to one run and tool.",
+    safeActions: [
+      "odinn experimental capabilities list <run-id> [--state .odinn]",
+      "odinn experimental capabilities revoke <capability-id> [--state .odinn]"
+    ],
+    activeActions: [
+      "odinn experimental capabilities issue --run <run-id> --step <step-id> --tool <tool> [--show-token] [--state .odinn]",
+      "odinn experimental capabilities use --token <token> --run <run-id> --tool <tool> [--state .odinn]"
+    ]
+  },
+  {
+    id: "rewind",
+    label: "Rewind",
+    configKey: "experimental.rewind",
+    description: "Capture workspace checkpoints and preview or explicitly apply a restore plan.",
+    safeActions: ["odinn experimental rewind restore <snapshot-id> [--state .odinn]"],
+    activeActions: [
+      "odinn experimental rewind checkpoint create <run-id> --path <path[,path]> [--state .odinn]",
+      "odinn experimental rewind restore <snapshot-id> --apply [--state .odinn]"
+    ]
+  },
+  {
+    id: "capsules",
+    label: "Capsules",
+    configKey: "experimental.capsules",
+    description: "Export, verify, inspect, and deliberately replay redacted content-addressed run archives.",
+    safeActions: [
+      "odinn experimental capsules inspect <run.odinn> [--state .odinn]",
+      "odinn experimental capsules verify <run.odinn> [--state .odinn]"
+    ],
+    activeActions: [
+      "odinn experimental capsules export <run-id> --output <run.odinn> [--state .odinn]",
+      "odinn experimental capsules replay <run.odinn> [--mode verification-only|tool-mocked|full] [--state .odinn]"
+    ]
+  },
+  {
+    id: "counterfactual",
+    label: "Counterfactuals",
+    configKey: "experimental.counterfactual",
+    description: "Create isolated candidate workspaces, compare their evidence, and preview selection before applying it.",
+    safeActions: [
+      "odinn experimental counterfactual compare <group-id> [--state .odinn]",
+      "odinn experimental counterfactual select <group-id> --run <run-id> [--state .odinn]"
+    ],
+    activeActions: [
+      "odinn experimental counterfactual run --source-run <run-id> --from <step-id> --plan-file <plan.json> [--execute] [--state .odinn]",
+      "odinn experimental counterfactual select <group-id> --run <run-id> --apply [--state .odinn]"
+    ]
+  },
+  {
+    id: "darwin",
+    label: "Darwin Routing",
+    configKey: "experimental.darwin",
+    description: "Record verified model outcomes and choose a route from measured reliability, speed, cost, and compliance.",
+    safeActions: ["odinn experimental darwin stats [--task-class <class>] [--state .odinn]"],
+    activeActions: [
+      "odinn experimental darwin observe --run <run-id> --provider <id> --model <id> --verified true|false [--state .odinn]",
+      "odinn experimental darwin choose --task-class <class> [--state .odinn]"
+    ]
+  },
+  {
+    id: "self-improvement",
+    label: "Self-improvement",
+    configKey: "selfImprovement",
+    description: "Learn from recorded failures, create auditable proposals, and keep application review-gated unless auto mode is explicitly enabled.",
+    safeActions: [
+      "odinn experimental self-improvement list [--state .odinn]",
+      "odinn experimental self-improvement propose --title <title> --rationale <text> [--state .odinn]"
+    ],
+    activeActions: [
+      "odinn experimental self-improvement set --enabled true --mode propose|auto [--state .odinn]",
+      "odinn experimental self-improvement learn [--state .odinn]",
+      "odinn experimental self-improvement decide --improvement <id> --decision approved|rejected|applied [--state .odinn]",
+      "odinn experimental self-improvement rollback --improvement <id> [--state .odinn]"
+    ]
+  }
+] as const;
+
 async function main() {
   switch (command) {
     case "init":
@@ -29,6 +131,10 @@ async function main() {
       break;
     case "config":
       await configCommand(args);
+      break;
+    case "experimental":
+    case "experiments":
+      await experimentalCommand(args);
       break;
     case "auth":
       await authCommand(args);
@@ -158,6 +264,10 @@ function usage() {
   odinn config security set --surface web|browser [--enabled true|false] [--allow-private-network true|false] [--allowed-domains a,b] [--blocked-domains a,b] [--require-approval true|false] [--state .odinn]
   odinn config experimental show [--state .odinn]
   odinn config experimental enable|disable <feature> [--state .odinn]
+  odinn experimental help [proof|sentinel|capabilities|rewind|capsules|counterfactual|darwin|self-improvement]
+  odinn experimental list|status [feature] [--state .odinn]
+  odinn experimental enable|disable <feature> [--state .odinn]
+  odinn experimental <feature> <action> [options]
   odinn config self-improvement show [--state .odinn]
   odinn config self-improvement set [--enabled true|false] [--mode disabled|propose|auto] [--interval-ms <ms>] [--max-changes <count>] [--state .odinn]
   odinn auth import openclaw [--provider openai] [--profile <id-or-email>] [--source <path>] [--state .odinn]
@@ -1017,6 +1127,212 @@ async function verifyConfiguredModel(state: any, config: any) {
   }
 }
 
+function normalizeExperimentalHomeFeature(value: any) {
+  const aliases: Record<string, string> = {
+    proof: "proof",
+    sentinel: "sentinel",
+    policy: "sentinel",
+    capability: "capabilities",
+    capabilities: "capabilities",
+    "capability-token": "capabilities",
+    "capability-tokens": "capabilities",
+    rewind: "rewind",
+    checkpoint: "rewind",
+    capsule: "capsules",
+    capsules: "capsules",
+    counterfactual: "counterfactual",
+    counterfactuals: "counterfactual",
+    darwin: "darwin",
+    routing: "darwin",
+    improve: "self-improvement",
+    improvement: "self-improvement",
+    "self-improvement": "self-improvement"
+  };
+  return aliases[String(value ?? "").trim().toLowerCase()];
+}
+
+function experimentalHomeEntry(value: any) {
+  const id = normalizeExperimentalHomeFeature(value);
+  return EXPERIMENTAL_HOME.find((entry) => entry.id === id);
+}
+
+function experimentalFeatureStatus(entry: any, config: any) {
+  const flags = normalizeExperimentalFlags(config.experimental);
+  const selfImprovement = normalizeSelfImprovementConfig(config.selfImprovement);
+  const selfManaged = entry.id === "self-improvement";
+  return {
+    id: entry.id,
+    label: entry.label,
+    enabled: selfManaged ? selfImprovement.enabled : (flags as any)[entry.id],
+    ...(selfManaged ? { mode: selfImprovement.mode, settings: selfImprovement } : {}),
+    configKey: entry.configKey,
+    entrypoint: `odinn experimental ${entry.id}`,
+    description: entry.description,
+    inspectionActions: [...entry.safeActions],
+    enabledActions: [...entry.activeActions],
+    guard: selfManaged
+      ? "proposal and review commands remain available; autonomous application requires enabled=true and mode=auto"
+      : entry.id === "capabilities"
+        ? `token issuance and consumption reject requests until ${entry.configKey}=true; list and revoke remain available for inspection and emergency cleanup`
+        : `active runtime actions reject requests until ${entry.configKey}=true`
+  };
+}
+
+async function experimentalStatus(args: any, requestedFeature: any = undefined, concise = false) {
+  const state = stateDir(args);
+  const config = await readConfig(state);
+  const selected = requestedFeature ? experimentalHomeEntry(requestedFeature) : undefined;
+  if (requestedFeature && !selected) throw new Error(`unknown experimental feature: ${requestedFeature}`);
+  const features = (selected ? [selected] : EXPERIMENTAL_HOME).map((entry) => experimentalFeatureStatus(entry, config));
+  const visible = concise
+    ? features.map(({ id, label, enabled, mode, configKey, entrypoint }: any) => ({ id, label, enabled, ...(mode ? { mode } : {}), configKey, entrypoint }))
+    : features;
+  return {
+    ok: true,
+    state,
+    configPath: join(state, "config.json"),
+    configured: existsSync(join(state, "config.json")),
+    warning: experimentalFeatureWarning(config.experimental),
+    disabledByDefault: true,
+    features: visible
+  };
+}
+
+function experimentalUsage(requestedFeature: any = undefined) {
+  if (requestedFeature) {
+    const entry = experimentalHomeEntry(requestedFeature);
+    if (!entry) throw new Error(`unknown experimental feature: ${requestedFeature}`);
+    console.log(`${entry.label} — ${entry.description}
+
+Configuration:
+  ${entry.configKey}
+
+Inspection and preview:
+  ${entry.safeActions.join("\n  ")}
+
+Enabled operations:
+  ${entry.activeActions.join("\n  ")}
+
+Status:
+  odinn experimental status ${entry.id} [--state .odinn]`);
+    return;
+  }
+  console.log(`Ódinn experimental systems
+
+All feature flags and autonomous self-improvement are disabled by default. Validation,
+inspection, proposals, and dry-run previews stay separate from mutating operations.
+
+Commands:
+  odinn experimental list [--state .odinn]
+  odinn experimental status [feature] [--state .odinn]
+  odinn experimental enable|disable <feature> [--state .odinn]
+  odinn experimental help <feature>
+  odinn experimental <feature> <action> [options]
+
+Systems:
+${EXPERIMENTAL_HOME.map((entry) => `  ${entry.id.padEnd(17)} ${entry.label}`).join("\n")}
+
+Use \`odinn experimental help <feature>\` for the real runtime actions behind a system.`);
+}
+
+async function setExperimentalFeatureFlag(state: any, config: any, feature: any, enabled: boolean) {
+  if (!EXPERIMENTAL_FEATURES.includes(feature)) throw new Error(`unknown experimental feature: ${feature}`);
+  config.experimental = { ...normalizeExperimentalFlags(config.experimental), [feature]: enabled };
+  await saveConfig(state, config);
+  console.error(experimentalFeatureWarning(config.experimental));
+  const behaviorWarning = feature === "capabilities" && enabled
+    ? "capability enforcement is now active: direct tool runs require a scoped token; use `odinn capability issue` before manual runs"
+    : undefined;
+  if (behaviorWarning) console.error(behaviorWarning);
+  await printJson({ ok: true, feature, enabled, warning: experimentalFeatureWarning(config.experimental), ...(behaviorWarning ? { behaviorWarning } : {}) });
+}
+
+async function toggleExperimentalFeature(requestedFeature: any, enabled: boolean, args: any) {
+  const feature = normalizeExperimentalHomeFeature(requestedFeature);
+  if (!feature) throw new Error(`unknown experimental feature: ${requestedFeature}`);
+  if (feature === "self-improvement") {
+    const state = stateDir(args);
+    const config = await readConfig(state);
+    const current = normalizeSelfImprovementConfig(config.selfImprovement);
+    const modeArgs = enabled && current.mode === "disabled" && !hasFlag(args, "--mode") ? ["--mode", "propose"] : [];
+    await configCommand(["self-improvement", "set", "--enabled", String(enabled), ...modeArgs, ...args]);
+    return;
+  }
+  const state = stateDir(args);
+  const config = await readConfig(state);
+  await setExperimentalFeatureFlag(state, config, feature, enabled);
+}
+
+async function dispatchExperimentalFeature(feature: any, args: any) {
+  switch (feature) {
+    case "proof": {
+      await proof(args);
+      return;
+    }
+    case "sentinel":
+      await policyCommand(args[0] === "policy" ? args.slice(1) : args);
+      return;
+    case "capabilities":
+      await capabilityCommand(args);
+      return;
+    case "rewind": {
+      const [action, ...rest] = args;
+      if (action === "checkpoint") { await rewindCommand("checkpoint", rest); return; }
+      if (action === "restore" || action === "preview") { await rewindCommand("rewind", rest); return; }
+      throw new Error("experimental rewind requires checkpoint create or restore");
+    }
+    case "capsules":
+      await capsuleCommand(args);
+      return;
+    case "counterfactual":
+      await counterfactualCommand(args);
+      return;
+    case "darwin":
+      await routingCommand(args);
+      return;
+    case "self-improvement":
+      if (args[0] === "set") { await configCommand(["self-improvement", "set", ...args.slice(1)]); return; }
+      if (args[0] === "config") { await configCommand(["self-improvement", "show", ...args.slice(1)]); return; }
+      await improve(args);
+      return;
+    default:
+      throw new Error(`unknown experimental feature: ${feature}`);
+  }
+}
+
+async function experimentalCommand(args: any) {
+  const [subcommand, ...rest] = args;
+  if (!subcommand || ["help", "--help", "-h"].includes(subcommand)) {
+    experimentalUsage(subcommand === "help" ? rest[0] : undefined);
+    return;
+  }
+  if (["list", "status", "show"].includes(subcommand)) {
+    const requested = rest[0] && !String(rest[0]).startsWith("--") ? rest[0] : undefined;
+    await printJson(await experimentalStatus(args, requested, subcommand === "list"));
+    return;
+  }
+  if (subcommand === "enable" || subcommand === "disable") {
+    if (!rest[0] || String(rest[0]).startsWith("--")) throw new Error(`experimental ${subcommand} requires a feature`);
+    await toggleExperimentalFeature(rest[0], subcommand === "enable", rest.slice(1));
+    return;
+  }
+  const feature = normalizeExperimentalHomeFeature(subcommand);
+  if (!feature) throw new Error(`unknown experimental feature: ${subcommand}`);
+  if (!rest[0] || ["help", "--help", "-h"].includes(rest[0])) {
+    experimentalUsage(feature);
+    return;
+  }
+  if (rest[0] === "status" || rest[0] === "show") {
+    await printJson(await experimentalStatus(rest.slice(1), feature));
+    return;
+  }
+  if (rest[0] === "enable" || rest[0] === "disable") {
+    await toggleExperimentalFeature(feature, rest[0] === "enable", rest.slice(1));
+    return;
+  }
+  await dispatchExperimentalFeature(feature, rest);
+}
+
 function classifyConnectionFailure(detail: any) {
   const message = String(detail ?? "");
   if (/\b(?:401|403)\b|unauthori[sz]ed|forbidden|invalid[^\n]*(?:token|credential)|authentication failed/i.test(message)) {
@@ -1070,15 +1386,7 @@ async function configCommand(args: any) {
     if (subcommand === "show" || !subcommand) { await printJson(normalizeExperimentalFlags(config.experimental)); return; }
     if (subcommand !== "enable" && subcommand !== "disable") throw new Error("config experimental requires show, enable, or disable");
     const feature = rest[0];
-    if (!EXPERIMENTAL_FEATURES.includes(feature)) throw new Error(`unknown experimental feature: ${feature}`);
-    config.experimental = { ...normalizeExperimentalFlags(config.experimental), [feature]: subcommand === "enable" };
-    await saveConfig(state, config);
-    console.error(experimentalFeatureWarning(config.experimental));
-    const behaviorWarning = feature === "capabilities" && subcommand === "enable"
-      ? "capability enforcement is now active: direct tool runs require a scoped token; use `odinn capability issue` before manual runs"
-      : undefined;
-    if (behaviorWarning) console.error(behaviorWarning);
-    await printJson({ ok: true, feature, enabled: config.experimental[feature], warning: experimentalFeatureWarning(config.experimental), ...(behaviorWarning ? { behaviorWarning } : {}) });
+    await setExperimentalFeatureFlag(state, config, feature, subcommand === "enable");
     return;
   }
   if (section === "provider") {
@@ -2318,6 +2626,7 @@ async function proof(args: any) {
   const { runtime, config } = runtimeFor(rest);
   try {
     if (subcommand === "run") {
+      if (!normalizeExperimentalFlags(config.experimental).proof) throw new Error("experimental.proof is disabled; enable it before running verification");
       const runId = rest.find((value: any) => !value.startsWith("--")); const path = option(rest, "--contract"); if (!runId || !path) throw new Error("proof run requires <run-id> and --contract");
       const contract = parseStructuredDocument(await readFile(resolveInvocationPath(path), "utf8"), path);
       if (contract.schemaVersion === 1) {
@@ -2419,7 +2728,19 @@ async function counterfactualCommand(args: any) {
       const auditStore = createAuditStore(join(stateDir(rest), config.auditLog ?? "audit.jsonl"));
       const registry = createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: stateDir(rest), config, auditStore });
       const result = await runtime.counterfactual.execute(created.groupId, {
-        proof: runtime.proof,
+        proof: {
+          run: async (runId: any, contract: any, { workspaceRoot = invocationRoot() }: any = {}) => {
+            if (contract?.schemaVersion === 1) {
+              if (!normalizeExperimentalFlags(config.experimental).proof) throw new Error("experimental.proof is disabled; counterfactual verification cannot run");
+              return new ProofVerifier({
+                runLedger: runtime.ledger,
+                allowedRoot: workspaceRoot,
+                allowedCommands: config.proof?.allowedCommands ?? []
+              }).verify({ ...contract, runId });
+            }
+            return runtime.proof.run(runId, contract, { workspaceRoot });
+          }
+        },
         capabilities: runtime.capabilities,
         policy: createDefaultPolicy(config.policy),
         workspaceRoot: invocationRoot(),
@@ -2523,6 +2844,7 @@ async function saveConfig(state: any, config: any) {
     experimental: normalizeExperimentalFlags(config.experimental),
     selfImprovement: normalizeSelfImprovementConfig(config.selfImprovement),
     runtime: config.runtime ?? {},
+    ...(config.proof ? { proof: config.proof } : {}),
     ...(config.defaultModel ? { defaultModel: config.defaultModel } : {})
   }, null, 2)}\n`;
   await withStateMutationLock(state, async () => {

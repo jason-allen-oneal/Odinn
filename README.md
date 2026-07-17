@@ -79,15 +79,15 @@ pnpm --silent odinn run events <run-id> --state .odinn
 pnpm --silent odinn run verify <run-id> --state .odinn
 ```
 
-This is the shared foundation for the experimental Proof, Rewind, Sentinel, Capsule, Darwin, Capability, and Counterfactual slices. They are disabled by default and must be enabled individually:
+This is the shared foundation for the experimental Proof, Rewind, Sentinel, Capsule, Darwin, Capability, and Counterfactual slices. They are disabled by default and must be enabled individually. The consolidated CLI home shows every gate, its safe inspection paths, and the real commands behind it:
 
 ```bash
-pnpm odinn config experimental enable proof
-pnpm odinn config experimental enable sentinel
-pnpm odinn config experimental enable capabilities
+pnpm odinn experimental status
+pnpm odinn experimental help proof
+pnpm odinn experimental enable proof
 ```
 
-Use `pnpm odinn config experimental show` to inspect the posture. Read the feature notes under [docs/features](docs/features/) before enabling them. See [the event-ledger architecture note](docs/architecture/event-ledger.md).
+The existing `config experimental` and feature-specific commands remain available for scripts. The local console also provides an **Experimental Lab** for live gate status, recent runtime-ledger records, and operator-invoked actions against the same authenticated APIs; it never enables a feature silently. Read the feature notes under [docs/features](docs/features/) before enabling them. See [the event-ledger architecture note](docs/architecture/event-ledger.md).
 
 ### Experimental runtime slices
 

@@ -193,9 +193,9 @@ test("guided onboarding presents choices without developer telemetry", async () 
   child.stderr.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
     stdout += chunk;
-    if (!answered && stdout.includes("4. Exit")) {
+    if (!answered && stdout.includes("7) Exit without changes")) {
       answered = true;
-      child.stdin.write("4\n");
+      child.stdin.write("7\n");
     }
   });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
@@ -205,9 +205,10 @@ test("guided onboarding presents choices without developer telemetry", async () 
   });
   assert.equal(exitCode, 0, stderr || stdout);
   assert.match(stdout, /Your private AI workspace/);
-  assert.match(stdout, /Your current setup/);
+  assert.match(stdout, /Current setup/);
   assert.match(stdout, /OpenAI \/ ChatGPT · gpt-test/);
-  assert.match(stdout, /Review and update my setup/);
+  assert.match(stdout, /Change AI or model/);
+  assert.match(stdout, /Review capabilities/);
   assert.doesNotMatch(stdout, /State:|Workspace:|backend-api|recorded runs/);
 });
 
@@ -231,10 +232,10 @@ test("guided onboarding preserves an existing setup when reviewing defaults", as
   let stderr = "";
   let step = 0;
   const prompts = [
-    ["Existing setup found [1]:", "2\n"],
-    ["AI connection [1]:", "1\n"],
-    ["Access level [1]:", "\n"],
-    ["Open Ódinn now? [Y/n]:", "n\n"]
+    ["What would you like to do?", "4\n"],
+    ["What should Ódinn be allowed to access?", "\n"],
+    ["Apply this setup?", "2\n"],
+    ["What would you like to do?", "7\n"]
   ];
   reviewed.stdout.setEncoding("utf8");
   reviewed.stderr.setEncoding("utf8");
@@ -251,9 +252,9 @@ test("guided onboarding preserves an existing setup when reviewing defaults", as
     reviewed.once("exit", (code) => { clearTimeout(timeout); resolve(code); });
   });
   assert.equal(exitCode, 0, stderr || stdout);
-  assert.match(stdout, /Keep current — OpenAI \/ ChatGPT · gpt-existing/);
-  assert.match(stdout, /Access level \[1\]/);
-  assert.match(stdout, /Start it whenever you’re ready/);
+  assert.match(stdout, /Keep current — Everyday assistant/);
+  assert.match(stdout, /Review your setup/);
+  assert.match(stdout, /No changes made/);
 
   const after = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
   assert.equal(after.defaultModel, before.defaultModel);

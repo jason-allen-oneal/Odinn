@@ -2,7 +2,7 @@ import { homedir, hostname, platform, release } from "node:os";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { access, chmod, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { connect as netConnect, isIP } from "node:net";
@@ -15,6 +15,7 @@ import { chromium } from "playwright-core";
 import { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags } from "./run-ledger.ts";
 import { toolSafetyDescriptor } from "./tool-safety.ts";
 import { CapabilityBroker, Sentinel } from "./differentiated-runtime.ts";
+import { withStateMutationLock } from "./state-mutation.ts";
 type AnyRecord = Record<string, any>;
 type NodeError = Error & { code?: string };
 export { JobSupervisor, createIsolatedTaskExecutor } from "./jobs.ts";
@@ -22,6 +23,7 @@ export { ExtensionRegistry, ExtensionExecutor } from "./extensions.ts";
 export { CapabilityBroker, CapsuleManager, CounterfactualManager, DarwinRouter, OdinnRuntimeError, ProofEngine, Sentinel, SnapshotManager, createDifferentiatedRuntime, parseStructuredDocument, validateContract, validatePolicy } from "./differentiated-runtime.ts";
 export { PROOF_CONTRACT_SCHEMA_VERSION, ProofVerifier, validateProofContract, validateVerificationContract, verifyContract, verifyProof } from "./proof.ts";
 export { createRunLedger, EXPERIMENTAL_FEATURES, experimentalFeatureWarning, normalizeExperimentalFlags, toolSafetyDescriptor };
+export { withStateMutationLock } from "./state-mutation.ts";
 
 export const PROVIDER_PRESETS = {
   openai: {
@@ -441,10 +443,9 @@ export async function exchangeOAuthCode(provider: any, { code, codeVerifier, red
   return requestOAuthToken(auth.tokenUrl, body);
 }
 
-export async function saveOAuthToken(provider: any, stateDir: any, token: any) {
+export async function saveOAuthToken(provider: any, stateDir: any, token: any, options: any = {}) {
   const auth = normalizeProviderAuth(provider.auth, "provider");
   const path = oauthTokenPath(provider, stateDir);
-  await mkdir(resolve(stateDir, "oauth"), { recursive: true, mode: 0o700 });
   const record: AnyRecord = {
     accessToken: modelString(token.access_token ?? token.accessToken, ""),
     refreshToken: modelString(token.refresh_token ?? token.refreshToken, ""),
@@ -455,9 +456,27 @@ export async function saveOAuthToken(provider: any, stateDir: any, token: any) {
     if (value) record[key] = value;
   }
   if (!record.accessToken && !record.refreshToken) throw new Error("OAuth token response contained no usable token");
-  await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-  await chmod(path, 0o600);
-  return { path, expiresAt: record.expiresAt };
+  return withStateMutationLock(resolve(stateDir), async () => {
+    await mkdir(resolve(stateDir, "oauth"), { recursive: true, mode: 0o700 });
+    if (typeof options.expectedTokenFingerprint === "string") {
+      const currentFingerprint = await readFile(path, "utf8").then(contentFingerprint).catch((error: unknown) => {
+        if ((error as NodeError | undefined)?.code === "ENOENT") return "missing";
+        throw error;
+      });
+      if (currentFingerprint !== options.expectedTokenFingerprint) {
+        throw new Error("OAuth credentials changed in another process while a refresh was running. The stale refresh was not written; retry the request.");
+      }
+    }
+    const temporary = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    try {
+      await writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+      await rename(temporary, path);
+      await chmod(path, 0o600);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+    return { path, expiresAt: record.expiresAt };
+  });
 }
 
 export function oauthTokenPath(provider: any, stateDir: any) {
@@ -473,8 +492,10 @@ async function resolveOAuthAccessToken(provider: any, stateDir: any) {
   const auth = normalizeProviderAuth(provider.auth, "provider");
   const path = oauthTokenPath(provider, stateDir);
   let token;
+  let tokenRaw;
   try {
-    token = JSON.parse(await readFile(path, "utf8"));
+    tokenRaw = await readFile(path, "utf8");
+    token = JSON.parse(tokenRaw);
   } catch (error) {
     if ((error as NodeError | undefined)?.code === "ENOENT") throw new Error("OAuth provider is not connected; run `odinn onboard --provider <name> --auth oauth`");
     throw error;
@@ -502,7 +523,7 @@ async function resolveOAuthAccessToken(provider: any, stateDir: any) {
       expires_at: Number(refreshed.expires_at) * 1000,
       baseUrl: copilotBase,
       enterpriseDomain: token.enterpriseDomain
-    });
+    }, { expectedTokenFingerprint: contentFingerprint(tokenRaw) });
     return refreshed.token;
   }
   const body = new URLSearchParams({
@@ -513,8 +534,17 @@ async function resolveOAuthAccessToken(provider: any, stateDir: any) {
   appendClientSecret(body, auth);
   const refreshed = await requestOAuthToken(token.tokenEndpoint || auth.tokenUrl, body);
   if (!modelString(refreshed.access_token, "")) throw new Error("OAuth refresh response contained no access token");
-  await saveOAuthToken(provider, stateDir, { ...refreshed, refresh_token: refreshed.refresh_token || token.refreshToken });
+  await saveOAuthToken(
+    provider,
+    stateDir,
+    { ...refreshed, refresh_token: refreshed.refresh_token || token.refreshToken },
+    { expectedTokenFingerprint: contentFingerprint(tokenRaw) }
+  );
   return refreshed.access_token;
+}
+
+function contentFingerprint(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function appendClientSecret(body: any, auth: any) {
@@ -2989,29 +3019,32 @@ async function applyImprovement(store: any, proposal: any, { stateDir, config, s
   if (!stateDir || proposal.action?.type !== "config.set" || proposal.action.path !== "runtime.modelRetries") {
     throw new Error("autonomous improvement action is not allowlisted");
   }
-  const configPath = join(stateDir, "config.json");
-  const snapshotPath = join(stateDir, "improvements", `${proposal.id}.config.json`);
-  mkdirSync(dirname(snapshotPath), { recursive: true, mode: 0o700 });
-  const original = readFileSync(configPath, "utf8");
-  writeFileSync(snapshotPath, original, { mode: 0o600 });
-  const next = { ...config, runtime: { ...(config.runtime ?? {}), modelRetries: proposal.action.value } };
-  const temporary = `${configPath}.${process.pid}.${Date.now()}.tmp`;
-  try {
-    writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-    renameSync(temporary, configPath);
-    Object.assign(config, next);
-    const event = await store.append({
-      id: prefixedId("imp_evt"), type: "improvement.applied", improvementId: proposal.id,
-      decision: "applied", note: `Applied ${proposal.action.path}: ${proposal.action.previousValue} -> ${proposal.action.value}`,
-      source: "autonomous-controller", action: proposal.action, snapshotPath
-    });
-    return { improvementId: proposal.id, action: proposal.action, eventId: event.id, snapshotPath };
-  } catch (error) {
-    const failure = error instanceof Error ? error : new Error(String(error));
-    if (settings.rollbackOnFailure) writeFileSync(configPath, original, { mode: 0o600 });
-    await store.append({ id: prefixedId("imp_evt"), type: "improvement.failed", improvementId: proposal.id, decision: "failed", note: failure.message, source: "autonomous-controller" });
-    throw error;
-  }
+  return withStateMutationLock(stateDir, async () => {
+    const configPath = join(stateDir, "config.json");
+    const snapshotPath = join(stateDir, "improvements", `${proposal.id}.config.json`);
+    mkdirSync(dirname(snapshotPath), { recursive: true, mode: 0o700 });
+    const original = readFileSync(configPath, "utf8");
+    const currentConfig = JSON.parse(original);
+    writeFileSync(snapshotPath, original, { mode: 0o600 });
+    const next = { ...currentConfig, runtime: { ...(currentConfig.runtime ?? {}), modelRetries: proposal.action.value } };
+    const temporary = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+      renameSync(temporary, configPath);
+      Object.assign(config, next);
+      const event = await store.append({
+        id: prefixedId("imp_evt"), type: "improvement.applied", improvementId: proposal.id,
+        decision: "applied", note: `Applied ${proposal.action.path}: ${proposal.action.previousValue} -> ${proposal.action.value}`,
+        source: "autonomous-controller", action: proposal.action, snapshotPath
+      });
+      return { improvementId: proposal.id, action: proposal.action, eventId: event.id, snapshotPath };
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      if (settings.rollbackOnFailure) writeFileSync(configPath, original, { mode: 0o600 });
+      await store.append({ id: prefixedId("imp_evt"), type: "improvement.failed", improvementId: proposal.id, decision: "failed", note: failure.message, source: "autonomous-controller" });
+      throw error;
+    }
+  });
 }
 
 async function rollbackImprovement(store: any, input: any = {}, { stateDir, config }: any) {
@@ -3022,15 +3055,17 @@ async function rollbackImprovement(store: any, input: any = {}, { stateDir, conf
   const stateRoot = resolve(stateDir);
   const snapshot = resolve(applied.snapshotPath);
   if (relative(stateRoot, snapshot).startsWith("..")) throw new Error("improvement snapshot escapes state directory");
-  const restored = JSON.parse(readFileSync(snapshot, "utf8"));
-  const configPath = join(stateRoot, "config.json");
-  const temporary = `${configPath}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(restored, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, configPath);
-  for (const key of Object.keys(config)) delete config[key];
-  Object.assign(config, restored);
-  const event = await store.append({ id: prefixedId("imp_evt"), type: "improvement.rolled-back", improvementId, decision: "rolled-back", note: "Restored captured configuration snapshot.", source: cleanString(input.source, "local") });
-  return { type: "improvement.rolled-back", improvementId, eventId: event.id };
+  return withStateMutationLock(stateRoot, async () => {
+    const restored = JSON.parse(readFileSync(snapshot, "utf8"));
+    const configPath = join(stateRoot, "config.json");
+    const temporary = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(restored, null, 2)}\n`, { mode: 0o600 });
+    renameSync(temporary, configPath);
+    for (const key of Object.keys(config)) delete config[key];
+    Object.assign(config, restored);
+    const event = await store.append({ id: prefixedId("imp_evt"), type: "improvement.rolled-back", improvementId, decision: "rolled-back", note: "Restored captured configuration snapshot.", source: cleanString(input.source, "local") });
+    return { type: "improvement.rolled-back", improvementId, eventId: event.id };
+  });
 }
 
 function reduceImprovements(records: any) {

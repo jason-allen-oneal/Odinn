@@ -33,11 +33,14 @@ export PATH="$HOME/.local/share/odinn/bin:$PATH"
 odinn onboard
 ```
 
-In a terminal, onboarding guides you through choosing an AI connection and an
-access level, then offers to open the chat console. On an existing install it
-shows the current setup first and lets you keep or review it. For automated or
-headless setup, pass explicit provider flags such as
-`odinn onboard --provider openai --auth api-key`.
+In a terminal, onboarding provides Quick, Guided, Blank Slate, and detected
+OpenClaw/Hermes import paths. Existing installs get separate Open, Repair,
+Change AI, Review capabilities, Advanced, and confirmed reset actions. Changes
+are staged and backed up, custom policies are preserved by default, and a real
+model response must succeed before a connected setup is accepted. For automated
+or headless setup, pass explicit provider flags such as
+`odinn onboard --provider openai --auth api-key`. Run
+`odinn onboard --verify --non-interactive` for a standalone capability check.
 
 On macOS, use `shasum -a 256 -c` instead of `sha256sum -c` when GNU coreutils is unavailable.
 

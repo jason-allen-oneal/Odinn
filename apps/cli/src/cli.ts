@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, relative, resolve } from "node:path";
-import { createInterface } from "node:readline/promises";
-import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract } from "@odinn/kernel";
+import { delimiter, join, relative, resolve } from "node:path";
+import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
+import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
+import { isPromptCancelled, TerminalPrompter } from "./onboarding/prompts.ts";
+import { decideGatewayAction, openBrowser, probeGateway } from "./onboarding/runtime.ts";
+import { ACCESS_PROFILES, accessProfileLabel, applyAccessProfile, capabilityDelta, identifyAccessProfile } from "./onboarding/state.ts";
 
 const rawArgs = process.argv.slice(2);
+const configBaselines = new WeakMap<object, string | null>();
 if (rawArgs[0] === "--") rawArgs.shift();
 const [command, ...args] = rawArgs;
 
@@ -145,7 +149,7 @@ function usage() {
   console.log(`Usage:
   odinn start [--state .odinn] [--port 18790] [--no-open]
   odinn init [--state .odinn]
-  odinn onboard [--provider <name>] [--auth api-key|oauth|device|cli] [--state .odinn]
+  odinn onboard [--provider <name>] [--auth api-key|oauth|device|cli] [--verify] [--state <directory>]
   odinn config provider add <name> [--auth api-key|oauth|device|cli] [--base-url <url>] [--model <model[,model]>] [--api-key-env <ENV>] [--authorization-url <url>] [--token-url <url>] [--client-id <id>] [--scope <scope[,scope]>] [--state .odinn]
   odinn config provider list [--state .odinn]
   odinn config provider catalog
@@ -271,7 +275,11 @@ function resolveInvocationPath(path: any) {
 }
 
 function stateDir(args: any) {
-  return resolveInvocationPath(option(args, "--state", ".odinn"));
+  const explicit = option(args, "--state", process.env.ODINN_STATE_DIR ?? "");
+  if (explicit) return resolveInvocationPath(explicit);
+  const projectState = resolveInvocationPath(".odinn");
+  if (existsSync(join(projectState, "config.json"))) return projectState;
+  return resolve(homedir(), ".odinn");
 }
 
 async function init(args: any) {
@@ -282,10 +290,21 @@ async function init(args: any) {
 
 async function onboard(args: any) {
   const state = stateDir(args);
-  const configPath = await ensureConfig(state);
+  await recoverInterruptedOnboardingTransactions(state);
   const provider = option(args, "--provider", "");
   if (!provider && shouldRunGuidedOnboarding(args)) {
-    await guidedOnboard(args, state, configPath);
+    await guidedOnboard(args, state, join(state, "config.json"));
+    return;
+  }
+  const configPath = await ensureConfig(state);
+  if (hasFlag(args, "--verify")) {
+    const result = await verifyConfiguredModel(state, await readConfig(state));
+    if (!result.ok) {
+      console.error(result.message);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(result.message);
     return;
   }
   if (provider) {
@@ -293,7 +312,7 @@ async function onboard(args: any) {
     const configured = normalizeModelConfig(await readConfig(state)).providers[provider];
     if (configured?.auth.mode === "oauth") await connectOAuth(state, provider, args);
     if (configured?.auth.mode === "device") await connectDeviceAuth(state, provider, args);
-    if (configured?.auth.mode === "cli") await connectCliAuth(provider);
+    if (configured?.auth.mode === "cli") await connectCliAuth(configured);
   }
   const current = await status(args);
   const store = createAuditStore(join(state, current.auditLog ?? "audit.jsonl"));
@@ -307,129 +326,552 @@ function shouldRunGuidedOnboarding(args: any) {
 }
 
 async function guidedOnboard(args: any, state: any, configPath: any) {
-  const terminal = createInterface({ input: process.stdin, output: process.stdout });
+  const prompts = new TerminalPrompter();
+  let draft: any;
   let startNow = false;
   try {
-    let current = await status(args);
-    console.log("\nÓdinn Forge");
-    console.log("Your private AI workspace. Let’s make it yours.\n");
-    if (!current.providers.length) {
-      console.log("We’ll connect an AI, choose what it may access, and then open your workspace.\n");
-      const connected = await guidedProviderSetup(terminal, state, args);
-      if (!connected) {
-        console.log("\nSetup paused. Nothing was changed.");
-        return;
+    prompts.intro("Ódinn Forge", "Your private AI workspace, configured one clear choice at a time.");
+    const existing = await readExistingOnboardingConfig(configPath, prompts);
+    if (existing === null && await fileExists(configPath)) return;
+    const discovery = await discoverOnboardingSources(args);
+
+    if (existing && Object.keys(existing.providers ?? {}).length > 0) {
+      while (true) {
+        const current = await status(withStateArgs(args, state));
+        const runtime = await probeGatewayForState(state, {
+          host: option(args, "--host", "127.0.0.1"),
+          port: Number.parseInt(option(args, "--port", "18790"), 10)
+        });
+        prompts.note(renderCurrentSetup({ ...current, runtime }), "Current setup");
+        const action = await prompts.select({
+          message: "What would you like to do?",
+          options: [
+            { value: "open", label: "Open Ódinn", hint: runtime.state === "healthy" ? "Already running" : "Start the local workspace" },
+            { value: "repair", label: "Repair connection", hint: "Run a real AI response test and fix failures" },
+            { value: "ai", label: "Change AI or model" },
+            { value: "access", label: "Review capabilities", hint: "See exactly what Ódinn may access" },
+            { value: "details", label: "Advanced settings", hint: "Paths, providers, and runtime details" },
+            { value: "reset", label: "Start setup over", hint: "Creates a backup first; chats and workspace files stay" },
+            { value: "exit", label: "Exit without changes" }
+          ],
+          initialValue: "open",
+          defaultValue: "open"
+        });
+
+        if (action === "exit") {
+          prompts.outro("No changes made.");
+          return;
+        }
+        if (action === "details") {
+          const store = createAuditStore(join(state, current.auditLog ?? "audit.jsonl"));
+          prompts.note(renderOnboardingDetails({ ...current, configPath, runs: await store.readRuns() }), "Technical details");
+          continue;
+        }
+        if (action === "open") {
+          startNow = await openOrStartExisting(prompts, args, state, runtime);
+          return;
+        }
+        if (action === "repair") {
+          const repaired = await repairConnection(prompts, state, existing);
+          if (repaired === "open") {
+            startNow = await openOrStartExisting(prompts, args, state);
+            return;
+          }
+          if (repaired === "change") {
+            draft = await createPreparedDraft(state);
+            const changed = await guidedProviderSetup(prompts, draft.draftState, args, current, discovery);
+            if (!changed) { await discardOnboardingDraft(draft); draft = undefined; continue; }
+            const committed = await reviewVerifyAndCommit(prompts, draft, state, true);
+            draft = undefined;
+            if (!committed) continue;
+            startNow = await chooseFinishAction(prompts, args, state);
+            return;
+          }
+          continue;
+        }
+        if (action === "ai" || action === "access") {
+          draft = await createPreparedDraft(state);
+          const draftCurrent = await status(withStateArgs(args, draft.draftState));
+          const changed = action === "ai"
+            ? await guidedProviderSetup(prompts, draft.draftState, args, draftCurrent, discovery)
+            : await guidedAccessSetup(prompts, draft.draftState, draftCurrent.policy ?? existing.policy);
+          if (!changed) { await discardOnboardingDraft(draft); draft = undefined; continue; }
+          const committed = await reviewVerifyAndCommit(prompts, draft, state, action === "ai");
+          draft = undefined;
+          if (!committed) continue;
+          startNow = await chooseFinishAction(prompts, args, state);
+          return;
+        }
+        if (action === "reset") {
+          const confirmed = await prompts.confirm({ message: "Back up the current setup and start again?", initialValue: false });
+          if (!confirmed) continue;
+          draft = await createPreparedDraft(state, true);
+          const configured = await runFreshSetup(prompts, draft.draftState, args, discovery, "guided");
+          if (!configured) { await discardOnboardingDraft(draft); draft = undefined; continue; }
+          const committed = await reviewVerifyAndCommit(prompts, draft, state, true);
+          draft = undefined;
+          if (!committed) continue;
+          startNow = await chooseFinishAction(prompts, args, state);
+          return;
+        }
       }
-      await guidedAccessSetup(terminal, state);
-      current = await status(args);
-      console.log(renderSetupComplete(current));
-      startNow = await askYesNo(terminal, "Open Ódinn now?", true);
-      if (!startNow) console.log(`\nStart it whenever you’re ready with: ${odinnCommand()} start`);
-      return;
     }
 
-    console.log(renderCurrentSetup(current));
-    const choice = await askChoice(terminal, "Existing setup found", [
-      "Keep these settings and open Ódinn (recommended)",
-      "Review and update my setup",
-      "Show technical details",
-      "Exit"
-    ], 1);
-    if (choice === 1) { startNow = true; return; }
-    if (choice === 2) {
-      const connected = await guidedProviderSetup(terminal, state, args, current);
-      if (!connected) return;
-      current = await status(args);
-      await guidedAccessSetup(terminal, state, current.allowedCapabilities);
-      current = await status(args);
-      console.log(renderSetupComplete(current));
-      startNow = await askYesNo(terminal, "Open Ódinn now?", true);
-      if (!startNow) console.log(`\nStart it whenever you’re ready with: ${odinnCommand()} start`);
+    prompts.note(
+      "Ódinn can read files, browse the public web, and use connected services when you allow it.\nYou remain in control, and risky browser actions require approval by default.",
+      "Before we begin"
+    );
+    const accepted = await prompts.confirm({ message: "Continue with setup?", initialValue: true });
+    if (!accepted) {
+      prompts.outro("Setup cancelled. Nothing was changed.");
       return;
     }
-    if (choice === 3) {
-      const store = createAuditStore(join(state, current.auditLog ?? "audit.jsonl"));
-      console.log(`\n${renderOnboardingDetails({ ...current, configPath, runs: await store.readRuns() })}`);
-      console.log(`\nRun ${odinnCommand()} onboard again when you want to review or change these settings.`);
+    const mode = await selectFreshSetupMode(prompts, discovery);
+    if (mode === "cancel") {
+      prompts.outro("Setup cancelled. Nothing was changed.");
       return;
     }
-    console.log("\nNo changes made. Run onboarding again whenever you want to adjust Ódinn.");
+    draft = await createPreparedDraft(state, mode === "blank");
+    const configured = await runFreshSetup(prompts, draft.draftState, args, discovery, mode);
+    if (!configured) {
+      prompts.outro("Setup paused. Nothing was changed.");
+      return;
+    }
+    const draftConfig = await readConfig(draft.draftState);
+    const committed = await reviewVerifyAndCommit(prompts, draft, state, Boolean(draftConfig.defaultModel));
+    draft = undefined;
+    if (!committed) return;
+    startNow = await chooseFinishAction(prompts, args, state);
+  } catch (error: any) {
+    if (isPromptCancelled(error)) {
+      prompts.outro("Setup cancelled. Nothing was changed.");
+      return;
+    }
+    throw error;
   } finally {
-    terminal.close();
-    if (startNow) await startGateway(args);
+    if (draft) await discardOnboardingDraft(draft);
+    prompts.close();
+    if (startNow) await startGateway(withStateArgs(args, state));
   }
 }
 
-async function guidedProviderSetup(terminal: any, state: any, args: any, current: any = undefined) {
-  console.log("Choose the AI behind Ódinn:\n");
+async function guidedProviderSetup(prompts: any, state: any, args: any, current: any = undefined, discovery: any = {}) {
   const currentProvider = current?.providers?.find((entry: any) => current.defaultModel?.startsWith(`${entry.name}:`)) ?? current?.providers?.[0];
-  const keepCurrent = currentProvider
-    ? [`Keep current — ${friendlyProviderName(currentProvider.name)} · ${friendlyModelName(current.defaultModel)}`]
-    : [];
-  const choices = [
-    ...keepCurrent,
-    "OpenAI / ChatGPT — sign in with your browser (recommended)",
-    "Ollama — use an AI model running on this computer",
-    "Advanced provider setup",
-    currentProvider ? "Back" : "Cancel"
-  ];
-  const choice = await askChoice(terminal, "AI connection", choices, 1);
-  if (currentProvider && choice === 1) return true;
-  const selected = currentProvider ? choice - 1 : choice;
-  if (selected === 1) {
-    console.log("\nYour browser will open so you can sign in. Ódinn never sees your password.\n");
+  const options: any[] = [];
+  if (currentProvider) options.push({
+    value: "keep",
+    label: `Keep ${friendlyProviderName(currentProvider.name)}`,
+    hint: `Current model: ${friendlyModelName(current.defaultModel)}`
+  });
+  if (discovery.openclaw?.profiles?.length) options.push({
+    value: "openclaw",
+    label: "Use my OpenClaw ChatGPT sign-in",
+    hint: `${discovery.openclaw.profiles.length} account${discovery.openclaw.profiles.length === 1 ? "" : "s"} found`
+  });
+  if (discovery.hermes) options.push({ value: "hermes", label: "Use my Hermes ChatGPT sign-in", hint: "Existing OAuth credentials found" });
+  options.push(
+    { value: "openai", label: "Sign in with ChatGPT", hint: "Opens your browser; Ódinn never sees your password" },
+    { value: "ollama", label: "Use a model on this computer", hint: "Requires Ollama to be running" },
+    { value: "more", label: "More AI providers", hint: "OpenRouter, Groq, Mistral, Copilot, and others" },
+    { value: "back", label: currentProvider ? "Back" : "Cancel" }
+  );
+  const selected = await prompts.select({
+    message: "Choose the AI behind Ódinn",
+    options,
+    initialValue: currentProvider ? "keep" : discovery.openclaw?.profiles?.length ? "openclaw" : "openai",
+    defaultValue: currentProvider ? "keep" : discovery.openclaw?.profiles?.length ? "openclaw" : "openai"
+  });
+  if (selected === "back") return false;
+  if (selected === "keep") return selectProviderModel(prompts, state, currentProvider.name);
+  if (selected === "openclaw") {
+    await importOpenClawProfileForOnboarding(prompts, state, discovery.openclaw);
+    return selectProviderModel(prompts, state, "openai");
+  }
+  if (selected === "hermes") {
+    await importFrameworkAuth("hermes", discovery.hermes.root, state, ["--keep-default"], false);
+    return selectProviderModel(prompts, state, "openai");
+  }
+  if (selected === "openai") {
+    prompts.note("Your browser will open for ChatGPT sign-in. Your password is handled by OpenAI, not Ódinn.");
     await addProvider(state, ["--auth", "oauth"], "openai");
     await connectOAuth(state, "openai", [...args, "--guided"]);
-    await selectProviderDefault(state, "openai");
-    return true;
+    return selectProviderModel(prompts, state, "openai");
   }
-  if (selected === 2) {
+  if (selected === "ollama") {
+    const progress = prompts.progress("Looking for local Ollama models…");
     const models = await discoverOllamaModels();
     if (!models.length) {
-      console.log("\nÓdinn could not find Ollama running on this computer.");
-      console.log("Open Ollama, install a model, and then run onboarding again.");
+      progress.fail("Ollama is not ready.");
+      prompts.note("Start Ollama and install at least one model, then choose this option again.", "Local model not found");
       return false;
     }
-    const modelChoice = await askChoice(terminal, "Which local model should Ódinn use?", models, 1);
-    const model = models[modelChoice - 1];
+    progress.succeed(`Found ${models.length} local model${models.length === 1 ? "" : "s"}.`);
+    const model = await prompts.select({
+      message: "Which local model should Ódinn use?",
+      options: models.map((name: any) => ({ value: name, label: name })),
+      initialValue: models[0],
+      defaultValue: models[0]
+    });
     await addProvider(state, ["--model", model], "ollama");
     await selectProviderDefault(state, "ollama", model);
     return true;
   }
-  if (selected === 3) {
-    console.log("\nAdvanced providers are configured from the command line:");
-    console.log(`  ${odinnCommand()} config provider catalog`);
-    console.log(`  ${odinnCommand()} onboard --provider <provider>`);
+  return guidedAdvancedProviderSetup(prompts, state, args);
+}
+
+async function guidedAccessSetup(prompts: any, state: any, currentPolicy: any = undefined) {
+  const config = await readConfig(state);
+  const before = currentPolicy ?? config.policy;
+  const currentId = identifyAccessProfile(before);
+  const options = [
+    { value: "keep", label: `Keep current — ${accessProfileLabel(currentId)}`, hint: currentId === "custom" ? "No capabilities will be added or removed" : undefined },
+    ...ACCESS_PROFILES.map((profile: any) => ({ value: profile.id, label: profile.label, hint: profile.hint })),
+    { value: "back", label: "Back" }
+  ];
+  const choice = await prompts.select({
+    message: "What should Ódinn be allowed to access?",
+    options,
+    initialValue: "keep",
+    defaultValue: "keep"
+  });
+  if (choice === "back") return false;
+  if (choice === "keep") return true;
+  const nextPolicy = applyAccessProfile(before, choice);
+  const delta = capabilityDelta(before, nextPolicy);
+  const changes = [
+    delta.added.length ? `Adds: ${delta.added.join(", ")}` : "Adds: nothing",
+    delta.removed.length ? `Removes: ${delta.removed.join(", ")}` : "Removes: nothing"
+  ].join("\n");
+  prompts.note(changes, "Capability changes");
+  if (!await prompts.confirm({ message: "Apply these capability changes?", initialValue: false })) return false;
+  config.policy = nextPolicy;
+  await saveConfig(state, config);
+  return true;
+}
+
+async function readExistingOnboardingConfig(configPath: any, prompts: any) {
+  if (!await fileExists(configPath)) return undefined;
+  try {
+    const config = JSON.parse(await readFile(configPath, "utf8"));
+    if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("configuration must be a JSON object");
+    if (config.version !== 1) throw new Error(`unsupported configuration version: ${config.version ?? "missing"}`);
+    createDefaultPolicy(config.policy);
+    normalizeModelConfig(config);
+    return config;
+  } catch (error: any) {
+    prompts.note(
+      `${error.message}\n\nÓdinn left the file untouched. Run ${odinnCommand()} doctor after correcting or restoring the configuration.`,
+      "This setup needs repair"
+    );
+    process.exitCode = 1;
+    return null;
+  }
+}
+
+async function discoverOnboardingSources(args: any) {
+  const discovery: any = {};
+  try {
+    const source = await readOpenClawAuthSource(args.filter((value: any) => value !== "--interactive"));
+    const profiles = listUsableOpenClawProfiles(source.profiles, "openai");
+    if (profiles.length) discovery.openclaw = { ...source, profiles };
+  } catch {
+    // Detection is optional. Explicit import commands still surface source errors.
+  }
+  try {
+    const root = process.env.HERMES_HOME ? resolve(process.env.HERMES_HOME) : join(homedir(), ".hermes");
+    const source = await readFrameworkAuth("hermes", root);
+    const tokens = source.value?.providers?.["openai-codex"]?.tokens;
+    if (tokens?.access_token || tokens?.refresh_token) discovery.hermes = { root, source: source.path };
+  } catch {
+    // Hermes is optional.
+  }
+  return discovery;
+}
+
+function listUsableOpenClawProfiles(profiles: any, providerName: any) {
+  return Object.entries(profiles ?? {})
+    .map(([id, profile]: any) => ({ id, ...(profile ?? {}) }))
+    .filter((profile: any) => (profile.provider ?? profile.id.split(":", 1)[0]) === providerName)
+    .filter((profile: any) => profile.type === "oauth" && (profile.access || profile.refresh));
+}
+
+async function selectFreshSetupMode(prompts: any, discovery: any) {
+  const options: any[] = [
+    { value: "quick", label: "Quick setup", hint: "Recommended — connect an AI and use safe everyday capabilities" },
+    { value: "guided", label: "Guided setup", hint: "Review the AI, model, and capabilities yourself" },
+    { value: "blank", label: "Blank slate", hint: "Chat-only permissions and no AI connection yet" }
+  ];
+  if (discovery.openclaw) options.push({ value: "openclaw", label: "Import my OpenClaw sign-in", hint: "Copies credentials; OpenClaw stays untouched" });
+  if (discovery.hermes) options.push({ value: "hermes", label: "Import my Hermes sign-in", hint: "Copies credentials; Hermes stays untouched" });
+  options.push({ value: "cancel", label: "Cancel" });
+  const mode = await prompts.select({
+    message: "How would you like to set up Ódinn?",
+    options,
+    initialValue: discovery.openclaw ? "openclaw" : "quick",
+    defaultValue: discovery.openclaw ? "openclaw" : "quick"
+  });
+  return mode;
+}
+
+async function runFreshSetup(prompts: any, state: any, args: any, discovery: any, mode: any) {
+  if (mode === "blank") {
+    const config = await readConfig(state);
+    config.policy = applyAccessProfile(config.policy, "chat-only");
+    await saveConfig(state, config);
+    return true;
+  }
+  if (mode === "openclaw") {
+    await importOpenClawProfileForOnboarding(prompts, state, discovery.openclaw);
+    await selectProviderModel(prompts, state, "openai");
+  } else if (mode === "hermes") {
+    await importFrameworkAuth("hermes", discovery.hermes.root, state, ["--keep-default"], false);
+    await selectProviderModel(prompts, state, "openai");
+  } else {
+    const connected = await guidedProviderSetup(prompts, state, args, undefined, discovery);
+    if (!connected) return false;
+  }
+  if (mode === "quick") {
+    const config = await readConfig(state);
+    config.policy = applyAccessProfile(config.policy, "balanced");
+    await saveConfig(state, config);
+    return true;
+  }
+  return guidedAccessSetup(prompts, state, (await readConfig(state)).policy);
+}
+
+async function createPreparedDraft(state: any, reset = false) {
+  const draft = await createOnboardingDraft(state);
+  if (reset) {
+    await rm(join(draft.draftState, "oauth"), { recursive: true, force: true });
+    await writeFile(join(draft.draftState, ".remove-oauth"), "confirmed\n", { mode: 0o600 });
+    await saveConfig(draft.draftState, initialConfig());
+  } else {
+    await ensureConfig(draft.draftState);
+  }
+  return draft;
+}
+
+async function importOpenClawProfileForOnboarding(prompts: any, state: any, source: any) {
+  if (!source?.profiles?.length) throw new Error("No usable OpenClaw ChatGPT sign-in was found");
+  const profile = source.profiles.length === 1
+    ? source.profiles[0]
+    : await prompts.select({
+        message: "Which OpenClaw account should Ódinn use?",
+        options: source.profiles.map((entry: any) => ({
+          value: entry,
+          label: entry.email || entry.id,
+          hint: entry.email ? entry.id : undefined
+        })),
+        initialValue: source.profiles[0],
+        defaultValue: source.profiles[0]
+      });
+  await addProvider(state, ["--auth", "oauth"], "openai");
+  const config = await readConfig(state);
+  const provider = normalizeModelConfig(config).providers.openai;
+  await saveOAuthToken(provider, state, {
+    access_token: profile.access,
+    refresh_token: profile.refresh,
+    expires_at: profile.expires,
+    ...(profile.tokenEndpoint ? { tokenEndpoint: profile.tokenEndpoint } : {})
+  });
+  prompts.note(`Found ${profile.email || profile.id}. The original OpenClaw credentials were not changed.`, "Sign-in imported");
+}
+
+async function selectProviderModel(prompts: any, state: any, providerName: any) {
+  const config = await readConfig(state);
+  const provider = normalizeModelConfig(config).providers[providerName];
+  if (!provider?.models?.length) throw new Error(`${friendlyProviderName(providerName)} has no configured models`);
+  const current = config.defaultModel?.startsWith(`${providerName}:`)
+    ? config.defaultModel.slice(providerName.length + 1)
+    : provider.models[0];
+  const model = await prompts.select({
+    message: `Which ${friendlyProviderName(providerName)} model should be the default?`,
+    options: provider.models.map((name: any, index: any) => ({
+      value: name,
+      label: name,
+      hint: index === 0 ? "Recommended for this connection" : undefined
+    })),
+    initialValue: provider.models.includes(current) ? current : provider.models[0],
+    defaultValue: provider.models.includes(current) ? current : provider.models[0]
+  });
+  await selectProviderDefault(state, providerName, model);
+  return true;
+}
+
+async function guidedAdvancedProviderSetup(prompts: any, state: any, args: any) {
+  const catalog: any[] = listProviderPresets().filter((entry: any) => !["openai", "ollama"].includes(entry.name));
+  const provider = await prompts.select({
+    message: "Choose another AI provider",
+    options: [
+      ...catalog.map((entry: any) => ({ value: entry, label: friendlyProviderName(entry.name), hint: entry.auth })),
+      { value: null, label: "Back" }
+    ],
+    defaultValue: null
+  });
+  if (!provider) return false;
+  let authMode = provider.auth.includes("device") ? "device" : provider.auth.includes("cli") ? "cli" : "api-key";
+  if (provider.auth.includes("oauth") && !provider.auth.startsWith("device") && !provider.auth.startsWith("cli")) {
+    authMode = await prompts.select({
+      message: `How should ${friendlyProviderName(provider.name)} connect?`,
+      options: [
+        { value: "oauth", label: "Sign in with a browser" },
+        { value: "api-key", label: "Use an existing API key environment variable", hint: provider.apiKeyEnv || "Provider-specific variable" },
+        { value: "back", label: "Back" }
+      ],
+      initialValue: "oauth",
+      defaultValue: "oauth"
+    });
+    if (authMode === "back") return false;
+  }
+  if (authMode === "api-key" && provider.apiKeyEnv && !process.env[provider.apiKeyEnv]) {
+    prompts.note(
+      `Set ${provider.apiKeyEnv} in the environment, then run onboarding again. Ódinn will not store an API key in config.json.`,
+      "API key required"
+    );
     return false;
   }
+  await addProvider(state, ["--auth", authMode], provider.name);
+  if (authMode === "oauth") await connectOAuth(state, provider.name, [...args, "--guided"]);
+  if (authMode === "device") await connectDeviceAuth(state, provider.name, args);
+  if (authMode === "cli") await connectCliAuth(normalizeModelConfig(await readConfig(state)).providers[provider.name]);
+  return selectProviderModel(prompts, state, provider.name);
+}
+
+async function reviewVerifyAndCommit(prompts: any, draft: any, targetState: any, shouldVerify: any) {
+  const config = await readConfig(draft.draftState);
+  const providerName = String(config.defaultModel ?? "").split(":", 1)[0];
+  prompts.note([
+    `AI: ${config.defaultModel ? `${friendlyProviderName(providerName)} · ${friendlyModelName(config.defaultModel)}` : "Not connected yet"}`,
+    `Access: ${accessProfileLabel(identifyAccessProfile(config.policy))}`,
+    `Workspace: ${invocationRoot()}`
+  ].join("\n"), "Review your setup");
+
+  if (shouldVerify) {
+    while (true) {
+      const progress = prompts.progress("Testing a real AI response…");
+      const verification = await verifyConfiguredModel(draft.draftState, config);
+      if (verification.ok) {
+        progress.succeed(verification.message);
+        break;
+      }
+      progress.fail(verification.message);
+      prompts.note("detail" in verification ? verification.detail : verification.message, "Technical detail");
+      const next = await prompts.select({
+        message: "The connection is not ready. What next?",
+        options: [
+          { value: "retry", label: "Try the connection test again" },
+          { value: "back", label: "Go back without applying changes" }
+        ],
+        initialValue: "retry",
+        defaultValue: "retry"
+      });
+      if (next === "back") return false;
+    }
+  }
+
+  if (!await prompts.confirm({ message: "Apply this setup?", initialValue: true })) return false;
+  const progress = prompts.progress("Saving your setup safely…");
+  const committed = await commitOnboardingDraft(draft);
+  await discardOnboardingDraft(draft);
+  progress.succeed("Setup saved.");
+  if (committed.backupPath) prompts.note("Your previous setup was backed up and can be restored if needed.");
+  prompts.outro("Ódinn is ready.");
+  return true;
+}
+
+async function repairConnection(prompts: any, state: any, config: any) {
+  while (true) {
+    const progress = prompts.progress("Testing a real AI response…");
+    const result = await verifyConfiguredModel(state, config);
+    if (result.ok) {
+      progress.succeed(result.message);
+      const open = await prompts.confirm({ message: "Open Ódinn now?", initialValue: true });
+      return open ? "open" : "back";
+    }
+    progress.fail(result.message);
+    prompts.note("detail" in result ? result.detail : result.message, "Technical detail");
+    const next = await prompts.select({
+      message: "How should we repair it?",
+      options: [
+        { value: "retry", label: "Try again" },
+        { value: "change", label: "Change AI or model" },
+        { value: "back", label: "Back" }
+      ],
+      initialValue: "change",
+      defaultValue: "change"
+    });
+    if (next !== "retry") return next;
+  }
+}
+
+async function chooseFinishAction(prompts: any, args: any, state: any) {
+  const runtime = await probeGatewayForState(state, {
+    host: option(args, "--host", "127.0.0.1"),
+    port: Number.parseInt(option(args, "--port", "18790"), 10)
+  });
+  const decision = decideGatewayAction(runtime);
+  const options: any[] = [];
+  if (decision.action === "open") options.push({ value: "open", label: "Open Ódinn in my browser", hint: "The local workspace is already running" });
+  if (decision.action === "start") options.push({ value: "start", label: "Start Ódinn and open my browser" });
+  options.push({ value: "later", label: "I’ll open it later", hint: `${odinnCommand()} start` });
+  if (decision.action === "blocked") prompts.note(decision.detail, "Local workspace needs attention");
+  const action = await prompts.select({
+    message: "What would you like to do next?",
+    options,
+    initialValue: options[0].value,
+    defaultValue: options[0].value
+  });
+  if (action === "open") {
+    const opened = await openBrowser(runtime.url);
+    prompts.note(opened.detail);
+  }
+  return action === "start";
+}
+
+async function openOrStartExisting(prompts: any, args: any, state: any, priorProbe: any = undefined) {
+  const probe = priorProbe ?? await probeGatewayForState(state, {
+    host: option(args, "--host", "127.0.0.1"),
+    port: Number.parseInt(option(args, "--port", "18790"), 10)
+  });
+  const decision = decideGatewayAction(probe);
+  if (decision.action === "open") {
+    const opened = await openBrowser(probe.url);
+    prompts.note(opened.detail);
+    return false;
+  }
+  if (decision.action === "start") return prompts.confirm({ message: "Ódinn is stopped. Start it now?", initialValue: true });
+  prompts.note(decision.detail, "Ódinn was not started");
   return false;
 }
 
-async function guidedAccessSetup(terminal: any, state: any, currentCapabilities: any = []) {
-  console.log("\nWhat should Ódinn be allowed to do?\n");
-  const currentChoice = currentCapabilities.includes("web.read") || currentCapabilities.includes("browser.read")
-    ? 1
-    : currentCapabilities.includes("memory.read") || currentCapabilities.includes("workspace.readText") ? 2 : 3;
-  const choice = await askChoice(terminal, "Access level", [
-    "Balanced — memory, public web, and browser actions with approval (recommended)",
-    "Private — chat, memory, and local workspace files only",
-    "Chat only — no memory, web, browser, or local files"
-  ], currentChoice);
-  const config = await readConfig(state);
-  const policy = createDefaultPolicy(config.policy);
-  const profiles: any = {
-    1: createDefaultPolicy().allowedCapabilities,
-    2: ["job.healthcheck", "text.echo", "workspace.readText", "model.chat", "agent.run", "session.read", "session.write", "memory.read", "memory.write", "goal.read", "goal.write"],
-    3: ["job.healthcheck", "text.echo", "model.chat", "session.read", "session.write"]
+function withStateArgs(args: any, state: any) {
+  const output = [...args];
+  const index = output.indexOf("--state");
+  if (index >= 0) output.splice(index, 2, "--state", state);
+  else output.push("--state", state);
+  return output;
+}
+
+function initialConfig() {
+  return {
+    version: 1,
+    policy: createDefaultPolicy(),
+    auditLog: "audit.jsonl",
+    providers: {},
+    defaultModel: "",
+    experimental: normalizeExperimentalFlags(),
+    selfImprovement: normalizeSelfImprovementConfig()
   };
-  policy.allowedCapabilities = profiles[choice];
-  policy.security.web.enabled = choice === 1;
-  policy.security.web.allowPrivateNetwork = false;
-  policy.security.browser.enabled = choice === 1;
-  policy.security.browser.allowPrivateNetwork = false;
-  policy.security.browser.requireApproval = true;
-  config.policy = policy;
-  await saveConfig(state, config);
+}
+
+async function fileExists(path: any) {
+  try {
+    await access(path);
+    return true;
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 async function discoverOllamaModels() {
@@ -451,38 +893,26 @@ async function selectProviderDefault(state: any, providerName: any, requestedMod
   await saveConfig(state, config);
 }
 
-async function askChoice(terminal: any, label: any, choices: any, defaultChoice: any) {
-  choices.forEach((choice: any, index: any) => console.log(`  ${index + 1}. ${choice}`));
-  while (true) {
-    const answer = (await terminal.question(`\n${label} [${defaultChoice}]: `)).trim();
-    const selected = answer ? Number.parseInt(answer, 10) : defaultChoice;
-    if (Number.isInteger(selected) && selected >= 1 && selected <= choices.length) {
-      console.log("");
-      return selected;
-    }
-    console.log(`Please enter a number from 1 to ${choices.length}.`);
-  }
-}
-
-async function askYesNo(terminal: any, label: any, defaultValue: any) {
-  while (true) {
-    const answer = (await terminal.question(`${label} ${defaultValue ? "[Y/n]" : "[y/N]"}: `)).trim().toLowerCase();
-    if (!answer) return defaultValue;
-    if (["y", "yes"].includes(answer)) return true;
-    if (["n", "no"].includes(answer)) return false;
-    console.log("Please answer yes or no.");
-  }
-}
-
 function odinnCommand() {
   return process.env.npm_lifecycle_event === "odinn" ? "pnpm odinn" : "odinn";
 }
 
 async function startGateway(args: any) {
   const stateDir = stateDirForStart(args);
+  await recoverInterruptedOnboardingTransactions(stateDir);
   const host = option(args, "--host", "127.0.0.1");
   const port = Number.parseInt(option(args, "--port", "18790"), 10);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("--port must be between 0 and 65535");
+  if (port > 0) {
+    const existing = await probeGatewayForState(stateDir, { host, port });
+    const decision = decideGatewayAction(existing);
+    if (decision.action === "open") {
+      console.log(`Ódinn Forge is already running at ${existing.url}`);
+      if (!hasFlag(args, "--no-open")) console.log((await openBrowser(existing.url)).detail);
+      return;
+    }
+    if (decision.action === "blocked") throw new Error(decision.detail);
+  }
   const { createGatewayServer } = await import("@odinn/gateway");
   const server: any = await createGatewayServer({ stateDir, workspaceRoot: invocationRoot() });
   await new Promise<void>((resolveListen, rejectListen) => {
@@ -493,7 +923,7 @@ async function startGateway(args: any) {
   const url = `http://${host === "::1" ? "[::1]" : host}:${actualPort}/`;
   console.log(`Ódinn Forge is running at ${url}`);
   console.log("Press Ctrl+C to stop.");
-  if (!hasFlag(args, "--no-open")) openAuthorizationUrl(url);
+  if (!hasFlag(args, "--no-open")) console.log((await openBrowser(url)).detail);
   const shutdown = () => server.close((error: any) => {
     if (error) console.error(error.message);
     process.exitCode = error ? 1 : 0;
@@ -503,11 +933,26 @@ async function startGateway(args: any) {
 }
 
 function stateDirForStart(args: any) {
-  return resolveInvocationPath(option(args, "--state", ".odinn"));
+  return stateDir(args);
+}
+
+async function probeGatewayForState(state: any, options: any) {
+  const probe: any = await probeGateway(options);
+  if (probe.state !== "healthy" || resolve(probe.health.stateDir) === resolve(state)) return probe;
+  return {
+    state: "occupied",
+    reason: "unhealthy-odinn",
+    host: probe.host,
+    port: probe.port,
+    url: probe.url,
+    statusCode: probe.statusCode,
+    detail: `Another Ódinn workspace is already using ${probe.url}. Stop it or choose another port before starting this workspace.`
+  };
 }
 
 async function status(args: any) {
   const state = stateDir(args);
+  await recoverInterruptedOnboardingTransactions(state);
   const config = await readConfig(state);
   const models = listConfiguredModels(normalizeModelConfig(config));
   return {
@@ -517,6 +962,7 @@ async function status(args: any) {
     auditLog: config.auditLog ?? "audit.jsonl",
     tools: Array.from(createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config }).keys()),
     allowedCapabilities: config.policy.allowedCapabilities,
+    policy: createDefaultPolicy(config.policy),
     security: createDefaultPolicy(config.policy).security,
     experimental: {
       flags: normalizeExperimentalFlags(config.experimental),
@@ -526,6 +972,69 @@ async function status(args: any) {
     models,
     providers: await summarizeProviders(config, state)
   };
+}
+
+async function verifyConfiguredModel(state: any, config: any) {
+  const normalized = normalizeModelConfig(config);
+  if (!normalized.defaultModel) {
+    return { ok: false, kind: "missing-model", message: "No AI model is selected. Choose an AI connection first." };
+  }
+  const auditStore = createAuditStore(join(state, "onboarding-verification.jsonl"));
+  const policy = createDefaultPolicy({
+    ...config.policy,
+    allowedCapabilities: Array.from(new Set([...(config.policy?.allowedCapabilities ?? []), "model.chat"]))
+  });
+  try {
+    const result: any = await runTask({
+      task: {
+        id: `onboarding_verify_${randomUUID()}`,
+        tool: "model.chat",
+        actor: "onboarding",
+        reason: "verify the configured AI connection",
+        input: {
+          model: normalized.defaultModel,
+          retries: 0,
+          timeoutMs: 20_000,
+          messages: [{ role: "user", content: "Reply with exactly ODINN_CAPABILITY_OK." }]
+        }
+      },
+      auditStore,
+      policy,
+      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore })
+    });
+    const content = String(result?.output?.content ?? "").trim();
+    if (!content) throw new Error("AI provider returned an empty response");
+    return {
+      ok: true,
+      kind: "ready",
+      message: `AI connection verified with ${friendlyModelName(normalized.defaultModel)}.`,
+      response: content
+    };
+  } catch (error: any) {
+    const detail = String(error?.message ?? error);
+    const classified = classifyConnectionFailure(detail);
+    return { ok: false, ...classified, detail };
+  }
+}
+
+function classifyConnectionFailure(detail: any) {
+  const message = String(detail ?? "");
+  if (/\b(?:401|403)\b|unauthori[sz]ed|forbidden|invalid[^\n]*(?:token|credential)|authentication failed/i.test(message)) {
+    return { kind: "authentication", message: "The AI provider reports: sign-in rejected. Reconnect the account and try again." };
+  }
+  if (/\b429\b|usage limit|quota|rate.?limit|too many requests/i.test(message)) {
+    return { kind: "usage-limit", message: "AI connection failed: usage limit reached. Use another account or wait for the limit to reset." };
+  }
+  if (/timed?\s*out|timeout|abort/i.test(message)) {
+    return { kind: "timeout", message: "The AI provider did not respond in time. Check the connection and try again." };
+  }
+  if (/ECONNREFUSED|ENOTFOUND|fetch failed|network|offline|socket/i.test(message)) {
+    return { kind: "offline", message: "The AI provider could not be reached. Start the local model or check the internet connection." };
+  }
+  if (/\b404\b|model[^\n]*(?:not found|unavailable|does not exist)|unknown model/i.test(message)) {
+    return { kind: "model-unavailable", message: "That AI model is not available for this account. Choose another model and try again." };
+  }
+  return { kind: "provider-error", message: `The AI connection test failed: ${message || "unknown provider error"}` };
 }
 
 async function configCommand(args: any) {
@@ -1021,18 +1530,30 @@ async function summarizeProviders(config: any, state: any) {
     configured: ["oauth", "device"].includes(provider.auth?.mode)
       ? await oauthTokenExists(provider, state)
       : provider.auth?.mode === "cli"
-        ? Boolean(process.env[provider.auth.commandEnv || "ODINN_ANTIGRAVITY_CLI"] || "agy")
+        ? commandAvailable(process.env[provider.auth.commandEnv || "ODINN_ANTIGRAVITY_CLI"] || "agy")
       : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv])
   })));
 }
 
 async function oauthTokenExists(provider: any, state: any) {
   try {
-    await access(oauthTokenPath(provider, state));
-    return true;
+    const token = JSON.parse(await readFile(oauthTokenPath(provider, state), "utf8"));
+    return Boolean(token.refreshToken || (token.accessToken && (!token.expiresAt || token.expiresAt > Date.now() + 60_000)));
   } catch {
     return false;
   }
+}
+
+function commandAvailable(command: any) {
+  const executable = String(command ?? "").trim().split(/\s+/u, 1)[0];
+  if (!executable) return false;
+  if (executable.includes("/") || executable.includes("\\")) return existsSync(executable);
+  const extensions = process.platform === "win32"
+    ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
+    : [""];
+  return (process.env.PATH ?? "").split(delimiter).some((directory) => {
+    return extensions.some((extension) => existsSync(join(directory, `${executable}${extension}`)));
+  });
 }
 
 async function connectOAuth(state: any, name: any, args: any) {
@@ -1960,33 +2481,41 @@ async function show(args: any) {
 async function readConfig(state: any) {
   const path = join(state, "config.json");
   try {
-    return JSON.parse(await readFile(path, "utf8"));
+    const raw = await readFile(path, "utf8");
+    const config = JSON.parse(raw);
+    if (config && typeof config === "object") configBaselines.set(config, contentFingerprint(raw));
+    return config;
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
-    return { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: normalizeExperimentalFlags(), selfImprovement: normalizeSelfImprovementConfig() };
+    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: normalizeExperimentalFlags(), selfImprovement: normalizeSelfImprovementConfig() };
+    configBaselines.set(config, null);
+    return config;
   }
 }
 
 async function ensureConfig(state: any) {
-  const configPath = join(state, "config.json");
-  await mkdir(state, { recursive: true });
-  await writeFile(configPath, `${JSON.stringify({
-    version: 1,
-    policy: createDefaultPolicy(),
-    auditLog: "audit.jsonl",
-    providers: {},
-    defaultModel: "",
-    experimental: normalizeExperimentalFlags(),
-    selfImprovement: normalizeSelfImprovementConfig()
-  }, null, 2)}\n`, { flag: "wx" }).catch((error: any) => {
-    if (error?.code !== "EEXIST") throw error;
+  return withStateMutationLock(state, async () => {
+    const configPath = join(state, "config.json");
+    await mkdir(state, { recursive: true, mode: 0o700 });
+    await chmod(state, 0o700);
+    await writeFile(configPath, `${JSON.stringify({
+      version: 1,
+      policy: createDefaultPolicy(),
+      auditLog: "audit.jsonl",
+      providers: {},
+      defaultModel: "",
+      experimental: normalizeExperimentalFlags(),
+      selfImprovement: normalizeSelfImprovementConfig()
+    }, null, 2)}\n`, { flag: "wx", mode: 0o600 }).catch((error: any) => {
+      if (error?.code !== "EEXIST") throw error;
+    });
+    await chmod(configPath, 0o600);
+    return configPath;
   });
-  return configPath;
 }
 
 async function saveConfig(state: any, config: any) {
-  await mkdir(state, { recursive: true });
-  await writeFile(join(state, "config.json"), `${JSON.stringify({
+  const serialized = `${JSON.stringify({
     version: config.version ?? 1,
     policy: config.policy ?? createDefaultPolicy(),
     auditLog: config.auditLog ?? "audit.jsonl",
@@ -1995,7 +2524,27 @@ async function saveConfig(state: any, config: any) {
     selfImprovement: normalizeSelfImprovementConfig(config.selfImprovement),
     runtime: config.runtime ?? {},
     ...(config.defaultModel ? { defaultModel: config.defaultModel } : {})
-  }, null, 2)}\n`);
+  }, null, 2)}\n`;
+  await withStateMutationLock(state, async () => {
+    await mkdir(state, { recursive: true, mode: 0o700 });
+    await chmod(state, 0o700);
+    const expected = config && typeof config === "object" ? configBaselines.get(config) : undefined;
+    if (expected !== undefined) {
+      const current = await readFile(join(state, "config.json"), "utf8").then(contentFingerprint).catch((error: any) => {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      });
+      if (current !== expected) {
+        throw new Error("Odinn configuration changed in another process. Your stale changes were not written; reload the configuration and try again.");
+      }
+    }
+    await atomicWrite(join(state, "config.json"), serialized, 0o600);
+    if (config && typeof config === "object") configBaselines.set(config, contentFingerprint(serialized));
+  });
+}
+
+function contentFingerprint(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function renderOnboardingSummary({ providers, defaultModel }: any) {
@@ -2011,7 +2560,7 @@ function renderOnboardingSummary({ providers, defaultModel }: any) {
     "Ódinn is ready.",
     "",
     `AI: ${friendlyProviderName(provider.name)} · ${friendlyModelName(defaultModel)}`,
-    `Connection: ${provider.configured ? "Ready" : "Needs attention"}`,
+    `Connection: ${provider.configured ? "Credentials found — run onboarding verification to test them" : "Needs attention"}`,
     "",
     `Start Ódinn: ${odinnCommand()} start`,
     `Change this setup later: ${odinnCommand()} onboard`
@@ -2021,10 +2570,10 @@ function renderOnboardingSummary({ providers, defaultModel }: any) {
 function renderCurrentSetup(current: any) {
   const provider = current.providers.find((entry: any) => current.defaultModel?.startsWith(`${entry.name}:`)) ?? current.providers[0];
   return [
-    "Your current setup",
     `  AI: ${friendlyProviderName(provider?.name)} · ${friendlyModelName(current.defaultModel)}`,
-    `  Connection: ${provider?.configured ? "Ready" : "Needs attention"}`,
-    `  Access: ${friendlyAccessName(current.allowedCapabilities)}`,
+    `  Credentials: ${provider?.configured ? "Found" : "Need attention"}`,
+    `  Access: ${friendlyAccessName(current.policy ?? current.allowedCapabilities)}`,
+    ...(current.runtime ? [`  Local workspace: ${current.runtime.state === "healthy" ? "Running" : current.runtime.state === "stopped" ? "Stopped" : "Needs attention"}`] : []),
     ""
   ].join("\n");
 }
@@ -2034,7 +2583,7 @@ function renderSetupComplete(current: any) {
   return [
     "\nYou’re ready.",
     `  AI: ${friendlyProviderName(provider?.name)} · ${friendlyModelName(current.defaultModel)}`,
-    `  Access: ${friendlyAccessName(current.allowedCapabilities)}`,
+    `  Access: ${friendlyAccessName(current.policy ?? current.allowedCapabilities)}`,
     ""
   ].join("\n");
 }
@@ -2051,10 +2600,11 @@ function friendlyModelName(model: any) {
   return name || "No model selected";
 }
 
-function friendlyAccessName(capabilities: any = []) {
-  if (capabilities.includes("web.read") || capabilities.includes("browser.read")) return "Balanced";
-  if (capabilities.includes("memory.read") || capabilities.includes("workspace.readText")) return "Private";
-  return "Chat only";
+function friendlyAccessName(policyOrCapabilities: any = []) {
+  const policy = Array.isArray(policyOrCapabilities)
+    ? createDefaultPolicy({ allowedCapabilities: policyOrCapabilities })
+    : policyOrCapabilities;
+  return accessProfileLabel(identifyAccessProfile(policy));
 }
 
 function renderOnboardingDetails({ state, workspaceRoot, configPath, tools, allowedCapabilities, providers, defaultModel, runs }: any) {

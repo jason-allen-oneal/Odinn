@@ -1,6 +1,6 @@
 {
   "name": "odinn",
-  "version": "0.3.0-beta.1",
+  "version": "0.3.0-beta.2",
   "private": true,
   "description": "Ódinn Forge cross-platform personal AI agent runtime",
   "type": "module",
@@ -19,7 +19,7 @@
     "test:platform": "node --test --test-reporter=spec tests/platform.test.ts",
     "test:integration": "node --test --test-reporter=spec tests/integration.test.ts",
     "build": "node scripts/ci/run.ts build",
-    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm smoke:onboarding && pnpm build",
     "odinn": "node ./apps/cli/src/cli.ts",
     "onboard": "pnpm --filter @odinn/cli start -- onboard",
     "tui": "pnpm --filter @odinn/cli start -- tui",

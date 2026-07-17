@@ -3,7 +3,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { access, chmod, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, runTask as executeTask, toolSafetyDescriptor, validatePolicy } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, runTask as executeTask, toolSafetyDescriptor, validatePolicy, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
@@ -986,13 +986,20 @@ async function readConfig(state: any) {
     return config;
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
-    await mkdir(state, { recursive: true });
-    const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig() };
-    await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 }).catch((writeError: any) => {
-      if (writeError?.code !== "EEXIST") throw writeError;
+    return withStateMutationLock(state, async () => {
+      try {
+        const existing = JSON.parse(await readFile(path, "utf8"));
+        await chmod(path, 0o600);
+        return existing;
+      } catch (readError: any) {
+        if (readError?.code !== "ENOENT") throw readError;
+      }
+      await mkdir(state, { recursive: true });
+      const config = { version: 1, policy: createDefaultPolicy(), auditLog: "audit.jsonl", providers: {}, defaultModel: "", experimental: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: false, counterfactual: false }, selfImprovement: normalizeSelfImprovementConfig() };
+      await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+      await chmod(path, 0o600);
+      return config;
     });
-    await chmod(path, 0o600);
-    return config;
   }
 }
 

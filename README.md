@@ -50,7 +50,13 @@ After installing a release, the normal path is shorter:
 odinn onboard
 ```
 
-Onboarding asks which AI to use, explains the access choices in plain language, and can open the chat console when setup is complete. Existing installs can keep their current settings or review them without rebuilding the configuration. Use `odinn start --no-open` on headless machines. See [Getting started](docs/getting-started.md) for scripted provider, local-model, and troubleshooting examples.
+Onboarding offers Quick, Guided, Blank Slate, and detected OpenClaw/Hermes import paths. Existing installs get separate Open, Repair, Change AI, Review capabilities, Advanced, and confirmed reset actions. Changes are staged, backed up, and verified with a real model response before they are committed; custom capability policies remain untouched unless explicitly changed. Use `odinn start --no-open` on headless machines. See [Getting started](docs/getting-started.md) for scripted provider, local-model, and troubleshooting examples.
+
+Verify the configured account and model through the same runtime path used by chat:
+
+```bash
+pnpm odinn onboard --verify --non-interactive
+```
 
 For a deterministic smoke test:
 

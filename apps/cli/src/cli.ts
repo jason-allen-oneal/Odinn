@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 
@@ -127,7 +128,7 @@ function quickUsage(unknownCommand: string | undefined = undefined) {
   console.log(`Ódinn Forge — local-first agent runtime
 
 Get started:
-  odinn onboard --provider openai   Connect a model provider
+  odinn onboard                     Guided setup
   odinn start                       Open the local chat console
 
 Common commands:
@@ -283,6 +284,10 @@ async function onboard(args: any) {
   const state = stateDir(args);
   const configPath = await ensureConfig(state);
   const provider = option(args, "--provider", "");
+  if (!provider && shouldRunGuidedOnboarding(args)) {
+    await guidedOnboard(args, state, configPath);
+    return;
+  }
   if (provider) {
     await addProvider(state, args, provider);
     const configured = normalizeModelConfig(await readConfig(state)).providers[provider];
@@ -293,7 +298,184 @@ async function onboard(args: any) {
   const current = await status(args);
   const store = createAuditStore(join(state, current.auditLog ?? "audit.jsonl"));
   const runs = await store.readRuns();
-  console.log(renderOnboarding({ ...current, configPath, runs }));
+  console.log(renderOnboardingSummary({ ...current, configPath, runs }));
+}
+
+function shouldRunGuidedOnboarding(args: any) {
+  if (hasFlag(args, "--non-interactive")) return false;
+  return hasFlag(args, "--interactive") || Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+async function guidedOnboard(args: any, state: any, configPath: any) {
+  const terminal = createInterface({ input: process.stdin, output: process.stdout });
+  let startNow = false;
+  try {
+    let current = await status(args);
+    console.log("\nÓdinn Forge");
+    console.log("Your private AI workspace. Let’s make it yours.\n");
+    if (!current.providers.length) {
+      console.log("We’ll connect an AI, choose what it may access, and then open your workspace.\n");
+      const connected = await guidedProviderSetup(terminal, state, args);
+      if (!connected) {
+        console.log("\nSetup paused. Nothing was changed.");
+        return;
+      }
+      await guidedAccessSetup(terminal, state);
+      current = await status(args);
+      console.log(renderSetupComplete(current));
+      startNow = await askYesNo(terminal, "Open Ódinn now?", true);
+      if (!startNow) console.log(`\nStart it whenever you’re ready with: ${odinnCommand()} start`);
+      return;
+    }
+
+    console.log(renderCurrentSetup(current));
+    const choice = await askChoice(terminal, "Existing setup found", [
+      "Keep these settings and open Ódinn (recommended)",
+      "Review and update my setup",
+      "Show technical details",
+      "Exit"
+    ], 1);
+    if (choice === 1) { startNow = true; return; }
+    if (choice === 2) {
+      const connected = await guidedProviderSetup(terminal, state, args, current);
+      if (!connected) return;
+      current = await status(args);
+      await guidedAccessSetup(terminal, state, current.allowedCapabilities);
+      current = await status(args);
+      console.log(renderSetupComplete(current));
+      startNow = await askYesNo(terminal, "Open Ódinn now?", true);
+      if (!startNow) console.log(`\nStart it whenever you’re ready with: ${odinnCommand()} start`);
+      return;
+    }
+    if (choice === 3) {
+      const store = createAuditStore(join(state, current.auditLog ?? "audit.jsonl"));
+      console.log(`\n${renderOnboardingDetails({ ...current, configPath, runs: await store.readRuns() })}`);
+      console.log(`\nRun ${odinnCommand()} onboard again when you want to review or change these settings.`);
+      return;
+    }
+    console.log("\nNo changes made. Run onboarding again whenever you want to adjust Ódinn.");
+  } finally {
+    terminal.close();
+    if (startNow) await startGateway(args);
+  }
+}
+
+async function guidedProviderSetup(terminal: any, state: any, args: any, current: any = undefined) {
+  console.log("Choose the AI behind Ódinn:\n");
+  const currentProvider = current?.providers?.find((entry: any) => current.defaultModel?.startsWith(`${entry.name}:`)) ?? current?.providers?.[0];
+  const keepCurrent = currentProvider
+    ? [`Keep current — ${friendlyProviderName(currentProvider.name)} · ${friendlyModelName(current.defaultModel)}`]
+    : [];
+  const choices = [
+    ...keepCurrent,
+    "OpenAI / ChatGPT — sign in with your browser (recommended)",
+    "Ollama — use an AI model running on this computer",
+    "Advanced provider setup",
+    currentProvider ? "Back" : "Cancel"
+  ];
+  const choice = await askChoice(terminal, "AI connection", choices, 1);
+  if (currentProvider && choice === 1) return true;
+  const selected = currentProvider ? choice - 1 : choice;
+  if (selected === 1) {
+    console.log("\nYour browser will open so you can sign in. Ódinn never sees your password.\n");
+    await addProvider(state, ["--auth", "oauth"], "openai");
+    await connectOAuth(state, "openai", [...args, "--guided"]);
+    await selectProviderDefault(state, "openai");
+    return true;
+  }
+  if (selected === 2) {
+    const models = await discoverOllamaModels();
+    if (!models.length) {
+      console.log("\nÓdinn could not find Ollama running on this computer.");
+      console.log("Open Ollama, install a model, and then run onboarding again.");
+      return false;
+    }
+    const modelChoice = await askChoice(terminal, "Which local model should Ódinn use?", models, 1);
+    const model = models[modelChoice - 1];
+    await addProvider(state, ["--model", model], "ollama");
+    await selectProviderDefault(state, "ollama", model);
+    return true;
+  }
+  if (selected === 3) {
+    console.log("\nAdvanced providers are configured from the command line:");
+    console.log(`  ${odinnCommand()} config provider catalog`);
+    console.log(`  ${odinnCommand()} onboard --provider <provider>`);
+    return false;
+  }
+  return false;
+}
+
+async function guidedAccessSetup(terminal: any, state: any, currentCapabilities: any = []) {
+  console.log("\nWhat should Ódinn be allowed to do?\n");
+  const currentChoice = currentCapabilities.includes("web.read") || currentCapabilities.includes("browser.read")
+    ? 1
+    : currentCapabilities.includes("memory.read") || currentCapabilities.includes("workspace.readText") ? 2 : 3;
+  const choice = await askChoice(terminal, "Access level", [
+    "Balanced — memory, public web, and browser actions with approval (recommended)",
+    "Private — chat, memory, and local workspace files only",
+    "Chat only — no memory, web, browser, or local files"
+  ], currentChoice);
+  const config = await readConfig(state);
+  const policy = createDefaultPolicy(config.policy);
+  const profiles: any = {
+    1: createDefaultPolicy().allowedCapabilities,
+    2: ["job.healthcheck", "text.echo", "workspace.readText", "model.chat", "agent.run", "session.read", "session.write", "memory.read", "memory.write", "goal.read", "goal.write"],
+    3: ["job.healthcheck", "text.echo", "model.chat", "session.read", "session.write"]
+  };
+  policy.allowedCapabilities = profiles[choice];
+  policy.security.web.enabled = choice === 1;
+  policy.security.web.allowPrivateNetwork = false;
+  policy.security.browser.enabled = choice === 1;
+  policy.security.browser.allowPrivateNetwork = false;
+  policy.security.browser.requireApproval = true;
+  config.policy = policy;
+  await saveConfig(state, config);
+}
+
+async function discoverOllamaModels() {
+  try {
+    const response = await fetch("http://127.0.0.1:11434/api/tags", { signal: AbortSignal.timeout(2_000) });
+    if (!response.ok) return [];
+    const payload: any = await response.json();
+    return (payload.models ?? []).map((model: any) => String(model.name ?? "").trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function selectProviderDefault(state: any, providerName: any, requestedModel: any = "") {
+  const config = await readConfig(state);
+  const provider = normalizeModelConfig(config).providers[providerName];
+  const model = requestedModel || provider?.models?.[0];
+  if (model) config.defaultModel = `${providerName}:${model}`;
+  await saveConfig(state, config);
+}
+
+async function askChoice(terminal: any, label: any, choices: any, defaultChoice: any) {
+  choices.forEach((choice: any, index: any) => console.log(`  ${index + 1}. ${choice}`));
+  while (true) {
+    const answer = (await terminal.question(`\n${label} [${defaultChoice}]: `)).trim();
+    const selected = answer ? Number.parseInt(answer, 10) : defaultChoice;
+    if (Number.isInteger(selected) && selected >= 1 && selected <= choices.length) {
+      console.log("");
+      return selected;
+    }
+    console.log(`Please enter a number from 1 to ${choices.length}.`);
+  }
+}
+
+async function askYesNo(terminal: any, label: any, defaultValue: any) {
+  while (true) {
+    const answer = (await terminal.question(`${label} ${defaultValue ? "[Y/n]" : "[y/N]"}: `)).trim().toLowerCase();
+    if (!answer) return defaultValue;
+    if (["y", "yes"].includes(answer)) return true;
+    if (["n", "no"].includes(answer)) return false;
+    console.log("Please answer yes or no.");
+  }
+}
+
+function odinnCommand() {
+  return process.env.npm_lifecycle_event === "odinn" ? "pnpm odinn" : "odinn";
 }
 
 async function startGateway(args: any) {
@@ -908,7 +1090,8 @@ async function connectOAuth(state: any, name: any, args: any) {
   const redirectUri = provider.auth.redirectUri || `http://127.0.0.1:${port}/oauth/callback`;
   const authRequest = createOAuthAuthorizationRequest(provider, { redirectUri });
   const timeoutMs = Number.parseInt(option(args, "--oauth-timeout-ms", "120000"), 10);
-  console.log(`Open this URL to connect ${name}:\n\n${authRequest.authorizationUrl}\n`);
+  if (hasFlag(args, "--guided")) console.log("Waiting for sign-in to finish…");
+  else console.log(`Open this URL to connect ${name}:\n\n${authRequest.authorizationUrl}\n`);
   if (!hasFlag(args, "--no-open")) openAuthorizationUrl(authRequest.authorizationUrl);
   try {
     const result = await withTimeout(callback, Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 120_000, "OAuth authorization timed out");
@@ -918,7 +1101,7 @@ async function connectOAuth(state: any, name: any, args: any) {
       redirectUri
     });
     const saved = await saveOAuthToken(provider, state, token);
-    console.log(`OAuth connected for ${name}. Token stored at ${saved.path}.`);
+    console.log(hasFlag(args, "--guided") ? "Sign-in complete." : `OAuth connected for ${name}. Token stored at ${saved.path}.`);
   } finally {
     await new Promise((resolveClose: any) => server.close(() => resolveClose()));
   }
@@ -1815,31 +1998,80 @@ async function saveConfig(state: any, config: any) {
   }, null, 2)}\n`);
 }
 
-function renderOnboarding({ state, workspaceRoot, configPath, tools, allowedCapabilities, providers, defaultModel, runs }: any) {
+function renderOnboardingSummary({ providers, defaultModel }: any) {
+  if (!providers.length) {
+    return [
+      "Ódinn needs an AI connection before it can start.",
+      "",
+      `Run ${odinnCommand()} onboard in a terminal to choose ChatGPT or a local model.`
+    ].join("\n");
+  }
+  const provider = providers.find((entry: any) => defaultModel?.startsWith(`${entry.name}:`)) ?? providers[0];
+  return [
+    "Ódinn is ready.",
+    "",
+    `AI: ${friendlyProviderName(provider.name)} · ${friendlyModelName(defaultModel)}`,
+    `Connection: ${provider.configured ? "Ready" : "Needs attention"}`,
+    "",
+    `Start Ódinn: ${odinnCommand()} start`,
+    `Change this setup later: ${odinnCommand()} onboard`
+  ].join("\n");
+}
+
+function renderCurrentSetup(current: any) {
+  const provider = current.providers.find((entry: any) => current.defaultModel?.startsWith(`${entry.name}:`)) ?? current.providers[0];
+  return [
+    "Your current setup",
+    `  AI: ${friendlyProviderName(provider?.name)} · ${friendlyModelName(current.defaultModel)}`,
+    `  Connection: ${provider?.configured ? "Ready" : "Needs attention"}`,
+    `  Access: ${friendlyAccessName(current.allowedCapabilities)}`,
+    ""
+  ].join("\n");
+}
+
+function renderSetupComplete(current: any) {
+  const provider = current.providers.find((entry: any) => current.defaultModel?.startsWith(`${entry.name}:`)) ?? current.providers[0];
+  return [
+    "\nYou’re ready.",
+    `  AI: ${friendlyProviderName(provider?.name)} · ${friendlyModelName(current.defaultModel)}`,
+    `  Access: ${friendlyAccessName(current.allowedCapabilities)}`,
+    ""
+  ].join("\n");
+}
+
+function friendlyProviderName(name: any) {
+  if (name === "openai") return "OpenAI / ChatGPT";
+  if (name === "ollama") return "Ollama (local)";
+  if (!name) return "Not connected";
+  return String(name).split(/[-_]/u).map((part) => part ? `${part[0].toUpperCase()}${part.slice(1)}` : part).join(" ");
+}
+
+function friendlyModelName(model: any) {
+  const name = String(model ?? "").split(":").slice(1).join(":") || String(model ?? "");
+  return name || "No model selected";
+}
+
+function friendlyAccessName(capabilities: any = []) {
+  if (capabilities.includes("web.read") || capabilities.includes("browser.read")) return "Balanced";
+  if (capabilities.includes("memory.read") || capabilities.includes("workspace.readText")) return "Private";
+  return "Chat only";
+}
+
+function renderOnboardingDetails({ state, workspaceRoot, configPath, tools, allowedCapabilities, providers, defaultModel, runs }: any) {
   const providerLines = providers.length
     ? providers.map((provider: any) => `  - ${provider.name} [${provider.authMode}]: ${provider.models.join(", ")} (${provider.baseUrl})${provider.configured ? "" : provider.authMode === "oauth" ? " [not connected]" : provider.apiKeyEnv ? " [credential missing]" : ""}`)
     : ["  - none"];
   return [
-    "Ódinn Forge is ready",
-    "",
+    "Technical details",
     `State: ${state}`,
     `Workspace: ${workspaceRoot}`,
     "",
     "Configured providers:",
     ...providerLines,
     `Default model: ${defaultModel || "(none)"}`,
-    "",
-    providers.length ? "Next step:" : "Connect a provider:",
-    ...(providers.length
-      ? ["  odinn start"]
-      : ["  odinn onboard --provider openai", "  odinn onboard --provider ollama --model <installed-model>"]),
-    "",
-    "Then open the chat console:",
-    "  odinn start",
-    "",
     `${tools.length} tools · ${allowedCapabilities.length} allowed capabilities · ${runs.length} recorded runs`,
     `Config: ${configPath}`,
-    "Use `odinn status` for details or `odinn help --all` for advanced commands."
+    `More commands: ${odinnCommand()} help --all`
   ].join("\n");
 }
 

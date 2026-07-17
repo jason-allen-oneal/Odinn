@@ -161,8 +161,8 @@ test("CLI onboarding and TUI expose a local beta entrypoint", async () => {
     encoding: "utf8"
   });
   assert.equal(onboard.status, 0, onboard.stderr || onboard.stdout);
-  assert.match(onboard.stdout, /Ódinn Forge is ready/);
-  assert.match(onboard.stdout, /odinn start/);
+  assert.match(onboard.stdout, /needs an AI connection/);
+  assert.match(onboard.stdout, /onboard in a terminal/);
 
   const tui = spawnSync("node", ["apps/cli/src/cli.ts", "tui", "--state", state], {
     cwd: root,
@@ -171,6 +171,94 @@ test("CLI onboarding and TUI expose a local beta entrypoint", async () => {
   assert.equal(tui.status, 0, tui.stderr || tui.stdout);
   assert.match(tui.stdout, /Odinn Forge TUI/);
   assert.match(tui.stdout, /Recent runs/);
+});
+
+test("guided onboarding presents choices without developer telemetry", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-guided-"));
+  const configured = spawnSync("node", [
+    "apps/cli/src/cli.ts", "onboard", "--state", state,
+    "--provider", "openai", "--auth", "api-key", "--model", "gpt-test"
+  ], { cwd: root, encoding: "utf8", env: { ...process.env, OPENAI_API_KEY: "test-key" } });
+  assert.equal(configured.status, 0, configured.stderr || configured.stdout);
+
+  const child = spawn("node", ["apps/cli/src/cli.ts", "onboard", "--interactive", "--state", state], {
+    cwd: root,
+    env: { ...process.env, OPENAI_API_KEY: "test-key" },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  let answered = false;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    if (!answered && stdout.includes("4. Exit")) {
+      answered = true;
+      child.stdin.write("4\n");
+    }
+  });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exitCode = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("guided onboarding timed out")); }, 5_000);
+    child.once("exit", (code) => { clearTimeout(timeout); resolve(code); });
+  });
+  assert.equal(exitCode, 0, stderr || stdout);
+  assert.match(stdout, /Your private AI workspace/);
+  assert.match(stdout, /Your current setup/);
+  assert.match(stdout, /OpenAI \/ ChatGPT · gpt-test/);
+  assert.match(stdout, /Review and update my setup/);
+  assert.doesNotMatch(stdout, /State:|Workspace:|backend-api|recorded runs/);
+});
+
+test("guided onboarding preserves an existing setup when reviewing defaults", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-existing-"));
+  const configured = spawnSync("node", [
+    "apps/cli/src/cli.ts", "onboard", "--state", state,
+    "--provider", "openai", "--auth", "api-key", "--model", "gpt-existing"
+  ], { cwd: root, encoding: "utf8", env: { ...process.env, OPENAI_API_KEY: "test-key" } });
+  assert.equal(configured.status, 0, configured.stderr || configured.stdout);
+  const before = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
+
+  const reviewed = spawn("node", [
+    "apps/cli/src/cli.ts", "onboard", "--interactive", "--state", state
+  ], {
+    cwd: root,
+    env: { ...process.env, OPENAI_API_KEY: "test-key" },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  let step = 0;
+  const prompts = [
+    ["Existing setup found [1]:", "2\n"],
+    ["AI connection [1]:", "1\n"],
+    ["Access level [1]:", "\n"],
+    ["Open Ódinn now? [Y/n]:", "n\n"]
+  ];
+  reviewed.stdout.setEncoding("utf8");
+  reviewed.stderr.setEncoding("utf8");
+  reviewed.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    if (step < prompts.length && stdout.includes(prompts[step][0])) {
+      reviewed.stdin.write(prompts[step][1]);
+      step += 1;
+    }
+  });
+  reviewed.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exitCode = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { reviewed.kill("SIGKILL"); reject(new Error("existing onboarding timed out")); }, 5_000);
+    reviewed.once("exit", (code) => { clearTimeout(timeout); resolve(code); });
+  });
+  assert.equal(exitCode, 0, stderr || stdout);
+  assert.match(stdout, /Keep current — OpenAI \/ ChatGPT · gpt-existing/);
+  assert.match(stdout, /Access level \[1\]/);
+  assert.match(stdout, /Start it whenever you’re ready/);
+
+  const after = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
+  assert.equal(after.defaultModel, before.defaultModel);
+  assert.deepEqual(after.providers, before.providers);
+  assert.deepEqual(after.policy, before.policy);
 });
 
 test("CLI start launches the local chat console", async () => {
@@ -240,7 +328,8 @@ test("CLI onboarding configures a provider without storing a secret", async () =
     "gpt-test"
   ], { cwd: root, encoding: "utf8" });
   assert.equal(onboard.status, 0, onboard.stderr || onboard.stdout);
-  assert.match(onboard.stdout, /Default model: openai:gpt-test/);
+  assert.match(onboard.stdout, /AI: OpenAI \/ ChatGPT · gpt-test/);
+  assert.match(onboard.stdout, /Connection: Needs attention/);
   const config = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
   assert.equal(config.providers.openai.models[0], "gpt-test");
   assert.equal(config.providers.openai.apiKeyEnv, "OPENAI_API_KEY");

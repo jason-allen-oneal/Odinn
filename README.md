@@ -39,8 +39,7 @@ Requirements: Node.js 24+ and Corepack.
 corepack enable
 pnpm install
 pnpm check
-pnpm odinn onboard --provider openai
-pnpm gui:start
+pnpm odinn onboard
 ```
 
 Open [http://127.0.0.1:18790/](http://127.0.0.1:18790/).
@@ -48,11 +47,10 @@ Open [http://127.0.0.1:18790/](http://127.0.0.1:18790/).
 After installing a release, the normal path is shorter:
 
 ```bash
-odinn onboard --provider openai
-odinn start
+odinn onboard
 ```
 
-`odinn start` launches the local gateway and opens the chat console. Use `--no-open` on headless machines. See [Getting started](docs/getting-started.md) for provider, local-model, and troubleshooting examples.
+Onboarding asks which AI to use, explains the access choices in plain language, and can open the chat console when setup is complete. Existing installs can keep their current settings or review them without rebuilding the configuration. Use `odinn start --no-open` on headless machines. See [Getting started](docs/getting-started.md) for scripted provider, local-model, and troubleshooting examples.
 
 For a deterministic smoke test:
 
@@ -105,10 +103,10 @@ The authenticated gateway exposes the same experimental surfaces through `/runti
 The normal provider path is intentionally short:
 
 ```bash
-pnpm odinn onboard --provider openai
+pnpm odinn onboard
 ```
 
-That uses the ChatGPT/Codex OAuth flow. API-key setup is explicit:
+Choose OpenAI / ChatGPT in the guided setup to sign in through the browser. API-key setup remains available for scripted and advanced installs:
 
 ```bash
 export OPENAI_API_KEY="..."

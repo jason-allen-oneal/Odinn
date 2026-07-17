@@ -30,13 +30,14 @@ cd "odinn-$tag"
 corepack enable
 ./scripts/install.sh --prefix "$HOME/.local/share/odinn"
 export PATH="$HOME/.local/share/odinn/bin:$PATH"
-odinn onboard --provider openai
-odinn start
+odinn onboard
 ```
 
-`odinn onboard` without `--provider` creates local state for diagnostics and
-built-in tools, but it does not configure a model. The chat console needs a
-configured provider before it can return agent responses.
+In a terminal, onboarding guides you through choosing an AI connection and an
+access level, then offers to open the chat console. On an existing install it
+shows the current setup first and lets you keep or review it. For automated or
+headless setup, pass explicit provider flags such as
+`odinn onboard --provider openai --auth api-key`.
 
 On macOS, use `shasum -a 256 -c` instead of `sha256sum -c` when GNU coreutils is unavailable.
 

@@ -5,15 +5,18 @@
 For release downloads, checksum verification, privacy expectations, and beta support, start with the [public beta guide](public-beta.md).
 
 ```bash
-odinn onboard --provider openai
-odinn start
+odinn onboard
 ```
 
-The first command opens the provider sign-in flow. The second starts the private local gateway and opens the chat console at `http://127.0.0.1:18790/`.
+Onboarding walks through the AI connection and access level in plain language, then offers to open the private local chat console. If you choose not to open it immediately, run `odinn start` later.
+
+Running onboarding again does not discard an existing setup. It shows the current AI, connection health, and access level first. You can keep those settings and open Ódinn, review them with the current choices preselected, or show technical details.
 
 ## Other provider paths
 
-Use an OpenAI API key instead of OAuth:
+These explicit commands are intended for scripts, headless systems, and advanced configuration.
+
+Use an OpenAI API key instead of browser sign-in:
 
 ```bash
 export OPENAI_API_KEY="..."

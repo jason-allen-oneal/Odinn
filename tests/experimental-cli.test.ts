@@ -18,7 +18,11 @@ async function fixture() {
 }
 
 function invoke(workspace: string, args: string[]) {
-  return spawnSync(process.execPath, [cli, ...args], { cwd: workspace, encoding: "utf8" });
+  return spawnSync(process.execPath, [cli, ...args], {
+    cwd: workspace,
+    encoding: "utf8",
+    env: { ...process.env, INIT_CWD: workspace }
+  });
 }
 
 function expectOk(result: ReturnType<typeof invoke>) {

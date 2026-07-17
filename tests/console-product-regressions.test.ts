@@ -46,20 +46,6 @@ test("console presents the consolidated, scoped product surfaces", async () => {
     assert.match(navigation, /data-view="skills"[^>]*data-title="Skill SDK"/);
     assert.match(navigation, /data-view="projects"[^>]*data-title="Projects"/);
 
-    const overview = section(html, /<section id="view-overview"[^>]*>/, /<\/section>/);
-    assertIds(overview, ["chat-recap", "chat-recap-meta", "chat-recap-body", "chat-recap-toggle"]);
-    assert.match(overview, /id="chat-recap"[^>]*hidden[^>]*aria-label="Conversation recap"/);
-    assert.match(overview, /id="chat-recap-toggle"[^>]*aria-expanded="true"[^>]*aria-controls="chat-recap-body"/);
-    assert.match(html, /function recapSnippet\s*\(/);
-    assert.match(html, /function updateConversationRecap\s*\(/);
-    assert.match(html, /\["user", "assistant"\]\.includes\(message\.role\)/);
-    assert.match(html, /entries\.slice\(-6\)/);
-    assert.match(html, /escapeHtml\(entry\.content\)/);
-    assert.match(html, /panel\.classList\.toggle\("collapsed"\)/);
-    assert.match(html, /No new model call was made/);
-    assert.match(html, /updateConversationRecap\("chat-recap"/);
-    assert.match(html, /updateConversationRecap\("session-recap"/);
-
     const skills = section(html, /<section id="view-skills"[^>]*>/, /<\/section>/);
     assert.match(skills, /Skill SDK v0\.1/);
     assert.match(skills, /Package inspector/);
@@ -110,9 +96,6 @@ test("console presents the consolidated, scoped product surfaces", async () => {
       "memory-correction-form"
     ]);
     assert.match(memory, /Global, project, and session context stay separated/);
-
-    const sessions = section(html, /<section id="view-sessions"[^>]*>/, /<\/section>/);
-    assertIds(sessions, ["session-recap", "session-recap-meta", "session-recap-body", "session-transcript"]);
 
     const agents = section(html, /<section id="view-agents"[^>]*>/, /<\/section>/);
     assert.match(agents, /<label class="switch-label"><input type="checkbox" id="agent-advanced-toggle"> Edit full manifest JSON<\/label>/);

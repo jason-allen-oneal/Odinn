@@ -6,6 +6,8 @@ The local console at `http://127.0.0.1:18790/` is an authenticated view over the
 
 Projects group related sessions and goals through `/projects`. Sessions default to the built-in Workspace project and can be reassigned. Goals must belong to a project or a specific session; session-scoped goals also inherit that session's project. Sessions remain durable conversation records exposed through `/sessions` and `/sessions/<id>`.
 
+Chat and the selected session transcript include a local Reader recap. It shows recent user and assistant messages plus request/response totals, so a reader can recover the conversation state without another model call. The recap is extractive rather than generated and never claims context that is not present in the current conversation.
+
 Usage and Audit share one accounting function over the signed audit journal. Both report distinct run IDs, completed `model.chat`/`agent.run` executions, recorded token counts, and semantic failed-or-denied outcomes. Usage is operational telemetry, not a provider invoice.
 
 ## Cron Jobs

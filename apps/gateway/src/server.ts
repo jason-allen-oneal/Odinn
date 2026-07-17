@@ -2031,8 +2031,77 @@ function renderConsoleHtml() {
       margin: -14px;
     }
     .chat-column {
-      grid-template-rows: 1fr auto;
+      grid-template-rows: auto 1fr auto;
       gap: 0;
+    }
+    .chat-recap {
+      width: min(100%, 860px);
+      margin: 10px auto 0;
+      padding: 12px 14px;
+      border: 1px solid #2b4f4b;
+      border-radius: 12px;
+      background: linear-gradient(145deg, rgba(22, 42, 40, .94), rgba(17, 22, 30, .96));
+    }
+    .session-recap {
+      width: 100%;
+      margin: 0 0 12px;
+    }
+    .chat-recap-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .chat-recap-head strong {
+      display: block;
+      margin-top: 3px;
+    }
+    .chat-recap-body {
+      margin-top: 10px;
+    }
+    .chat-recap-lead,
+    .chat-recap-note {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+    .chat-recap-list {
+      display: grid;
+      gap: 7px;
+      margin: 10px 0 0;
+      padding: 0;
+      list-style: none;
+    }
+    .chat-recap-turn {
+      display: grid;
+      grid-template-columns: 86px minmax(0, 1fr);
+      gap: 10px;
+      padding-top: 7px;
+      border-top: 1px solid rgba(116, 166, 153, .16);
+    }
+    .chat-recap-turn:first-child {
+      padding-top: 0;
+      border-top: 0;
+    }
+    .chat-recap-role {
+      color: var(--accent);
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    .chat-recap-text {
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+    .chat-recap-note {
+      margin-top: 9px;
+      font-size: 10px;
+    }
+    .chat-recap.collapsed .chat-recap-body {
+      display: none;
     }
     .chat-thread {
       border: 0;
@@ -2708,6 +2777,7 @@ function renderConsoleHtml() {
       .session-filters { grid-template-columns: 1fr; }
       .filter-grid { grid-template-columns: 1fr 1fr; }
       .summary-bar { align-items: flex-start; flex-direction: column; gap: 10px; }
+      .chat-recap-turn { grid-template-columns: 1fr; gap: 3px; }
     }
   </style>
 </head>
@@ -2812,6 +2882,13 @@ function renderConsoleHtml() {
       <section id="view-overview" class="view active">
         <div class="chat-shell">
           <div class="chat-column">
+            <aside id="chat-recap" class="chat-recap" hidden aria-label="Conversation recap">
+              <div class="chat-recap-head">
+                <div><div class="section-kicker">Reader recap</div><strong>What has happened so far</strong></div>
+                <div class="row"><span class="chip" id="chat-recap-meta">0 turns</span><button class="secondary" id="chat-recap-toggle" type="button" aria-expanded="true" aria-controls="chat-recap-body">Collapse</button></div>
+              </div>
+              <div id="chat-recap-body" class="chat-recap-body"></div>
+            </aside>
             <div id="chat-thread" class="chat-thread"></div>
             <div class="composer">
               <textarea id="chat-input" placeholder="Message Ódinn Forge..."></textarea>
@@ -2903,7 +2980,7 @@ function renderConsoleHtml() {
         <div class="page oc-page">
           <div class="page-head"><div><div class="section-kicker">Conversation archive</div><h1>Sessions</h1><p>Active sessions and defaults.</p></div><div class="row"><button id="create-session" type="button">New Session</button><button class="secondary" id="refresh-sessions" type="button">Refresh</button></div></div>
           <div class="panel table-panel"><div class="panel-head"><div><h2>Sessions <span class="count-badge" id="session-count-badge">0</span></h2><span class="muted" id="session-page-count">Loading</span></div></div><div class="session-filters"><input id="session-query" placeholder="Filter title, source, or ID"><select id="session-project-filter"><option value="all">All projects</option></select><select id="session-status-filter"><option value="all">All statuses</option><option value="open">Open</option><option value="closed">Closed</option></select><select id="session-group"><option value="none">No grouping</option><option value="project">Group by project</option><option value="source">Group by source</option><option value="status">Group by status</option></select></div><div class="data-table session-table"><div class="data-row data-head"><span>Session</span><span>Project</span><span>Kind</span><span>Status</span><span>Runtime</span><span>Updated</span><span>Messages</span><span>Actions</span></div><div id="session-list"></div></div></div>
-          <div class="panel stack session-detail"><div class="panel-head"><h2>Selected transcript</h2><span class="chip" id="selected-session-route">No session selected</span></div><div id="session-transcript" class="timeline"><div class="empty-state"><strong>Select a session</strong><span>Its messages and model route will appear here.</span></div></div></div>
+          <div class="panel stack session-detail"><div class="panel-head"><h2>Selected transcript</h2><span class="chip" id="selected-session-route">No session selected</span></div><div id="session-recap" class="chat-recap session-recap" hidden aria-label="Conversation recap"><div class="chat-recap-head"><div><div class="section-kicker">Reader recap</div><strong>What has happened so far</strong></div><span class="chip" id="session-recap-meta">0 turns</span></div><div id="session-recap-body" class="chat-recap-body"></div></div><div id="session-transcript" class="timeline"><div class="empty-state"><strong>Select a session</strong><span>Its messages and model route will appear here.</span></div></div></div>
         </div>
       </section>
 
@@ -3568,9 +3645,52 @@ function renderConsoleHtml() {
       return '<div class="provider-card"><div class="provider-head"><strong>' + escapeHtml(provider.name) + '</strong><span class="chip ' + (configured ? "ok" : "warn") + '">' + (configured ? "ready" : "auth required") + '</span></div><div class="chip-row"><span class="chip">' + escapeHtml(auth) + '</span><span class="chip">' + escapeHtml(provider.type || "provider") + '</span><span class="chip">' + escapeHtml((provider.models || []).length + " models") + '</span></div><div class="muted">' + escapeHtml(provider.baseUrl || "managed transport") + '</div></div>';
     }
 
+    function recapSnippet(value, limit = 180) {
+      const text = String(value || "").replace(/\s+/g, " ").trim();
+      if (!text) return "";
+      return text.length > limit ? text.slice(0, limit - 1).trimEnd() + "…" : text;
+    }
+
+    function updateConversationRecap(panelId, metaId, bodyId, messages) {
+      const panel = $(panelId);
+      if (!panel) return;
+      const entries = (messages || [])
+        .filter((message) => ["user", "assistant"].includes(message.role) && String(message.content || "").trim())
+        .map((message) => ({
+          role: message.role === "user" ? "You" : "Ódinn Forge",
+          content: recapSnippet(message.content)
+        }));
+      if (!entries.length) {
+        panel.hidden = true;
+        panel.classList.remove("collapsed");
+        const body = $(bodyId);
+        if (body) body.innerHTML = "";
+        return;
+      }
+      const userCount = entries.filter((entry) => entry.role === "You").length;
+      const assistantCount = entries.length - userCount;
+      const visible = entries.slice(-6);
+      const omitted = entries.length - visible.length;
+      const meta = [
+        userCount + " request" + (userCount === 1 ? "" : "s"),
+        assistantCount + " response" + (assistantCount === 1 ? "" : "s")
+      ].join(" · ");
+      $(metaId).textContent = meta;
+      $(bodyId).innerHTML =
+        '<div class="chat-recap-lead">' + escapeHtml(omitted
+          ? "Showing the latest " + visible.length + " messages; " + omitted + " earlier messages are included in the totals."
+          : "A local extract from the current conversation so far.") + '</div>' +
+        '<ul class="chat-recap-list">' + visible.map((entry) =>
+          '<li class="chat-recap-turn"><span class="chat-recap-role">' + escapeHtml(entry.role) + '</span><span class="chat-recap-text">' + escapeHtml(entry.content) + '</span></li>'
+        ).join("") + '</ul>' +
+        '<div class="chat-recap-note">No new model call was made; this recap only reflects the current conversation messages.</div>';
+      panel.hidden = false;
+    }
+
     function renderSessionTranscript(detail) {
       const messages = detail?.messages || [];
       $("selected-session-route").textContent = detail?.session?.title || "Selected session";
+      updateConversationRecap("session-recap", "session-recap-meta", "session-recap-body", messages);
       $("session-transcript").innerHTML = messages.length
         ? messages.map((message) => '<div class="timeline-row"><span class="timeline-dot"></span><div class="item"><div class="item-line"><strong>' + escapeHtml(message.role || "message") + '</strong><span class="chip">' + escapeHtml([message.provider, message.model].filter(Boolean).join(":") || "unrouted") + '</span></div><div class="markdown-body">' + renderMarkdown(message.content) + '</div></div></div>').join("")
         : '<div class="empty-state"><strong>No messages yet</strong><span>Send the first message from Chat.</span></div>';
@@ -3640,9 +3760,11 @@ function renderConsoleHtml() {
         state.messages = [];
         $("chat-title").textContent = "New chat";
         $("chat-subtitle").textContent = "Local beta adapter";
+        renderChatMessages(state.messages);
       }
       if (state.selectedSessionId === sessionId) {
         state.selectedSessionId = "";
+        updateConversationRecap("session-recap", "session-recap-meta", "session-recap-body", []);
         $("session-transcript").innerHTML = '<div class="empty-state"><strong>Select a session</strong><span>Its messages and model route will appear here.</span></div>';
       }
       await refreshSessions();
@@ -3651,6 +3773,7 @@ function renderConsoleHtml() {
 
     function renderChatMessages(messages) {
       if (!messages.length) {
+        updateConversationRecap("chat-recap", "chat-recap-meta", "chat-recap-body", []);
         const configured = state.status?.models?.length;
         $("chat-thread").innerHTML = '<div class="chat-empty">' +
           '<div class="chat-avatar"><img src="/odinn-logo.png" alt=""></div>' +
@@ -3670,6 +3793,7 @@ function renderConsoleHtml() {
           '</div>';
         return;
       }
+      updateConversationRecap("chat-recap", "chat-recap-meta", "chat-recap-body", messages);
       $("chat-thread").innerHTML = messages.map((message) => {
         const route = message.provider && message.model
           ? '<span class="chip ok">' + escapeHtml(message.provider + ":" + message.model) + '</span>'
@@ -4399,6 +4523,12 @@ function renderConsoleHtml() {
     }
     $("chat-session-list").addEventListener("click", handleChatRailClick);
     $("pinned-chat-list").addEventListener("click", handleChatRailClick);
+    $("chat-recap-toggle").addEventListener("click", (event) => {
+      const panel = $("chat-recap");
+      const collapsed = panel.classList.toggle("collapsed");
+      event.currentTarget.textContent = collapsed ? "Expand" : "Collapse";
+      event.currentTarget.setAttribute("aria-expanded", String(!collapsed));
+    });
     $("chat-thread").addEventListener("click", (event) => {
       const prompt = event.target.closest("[data-chat-prompt]");
       if (!prompt) return;

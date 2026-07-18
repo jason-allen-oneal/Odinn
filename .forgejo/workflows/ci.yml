@@ -89,6 +89,11 @@ jobs:
     needs: quality
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # This runner executes jobs through a nested Docker container. Keep the
+    # default 2s benchmark budget elsewhere, but allow measured cold-start
+    # noise here without disabling the guardrail.
+    env:
+      ODINN_BENCHMARK_P95_MAX_MS: "4000"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

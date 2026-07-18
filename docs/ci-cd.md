@@ -100,8 +100,11 @@ node scripts/ci/audit.ts high
 ```
 
 `benchmark:ci` measures twenty cold packaged-gateway protocol runs and fails
-when p95 exceeds the 2-second budget. Set `ODINN_BENCHMARK_P95_MAX_MS` only
-when diagnosing a slower host; do not use it to hide a release regression.
+when p95 exceeds the 2-second budget. The local Forgejo integration runner
+executes inside nested Docker and uses a documented 4-second cold-start
+allowance; all other workflows retain the 2-second default. Set
+`ODINN_BENCHMARK_P95_MAX_MS` only when diagnosing a slower host; do not use it
+to hide a release regression.
 
 To inspect release output without publishing:
 

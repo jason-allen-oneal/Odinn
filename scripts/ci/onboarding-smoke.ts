@@ -25,8 +25,12 @@ const result: any = await new Promise((resolve: any, reject: any) => {
 });
 assert.equal(result.code, 0, result.stderr || result.stdout);
 assert.match(result.stdout, /needs an AI connection|setup required/i);
-assert.equal((await stat(state)).mode & 0o777, 0o700);
-assert.equal((await stat(join(state, "config.json"))).mode & 0o777, 0o600);
+assert.equal((await stat(state)).isDirectory(), true);
+assert.equal((await stat(join(state, "config.json"))).isFile(), true);
+if (process.platform !== "win32") {
+  assert.equal((await stat(state)).mode & 0o777, 0o700);
+  assert.equal((await stat(join(state, "config.json"))).mode & 0o777, 0o600);
+}
 const config = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
 assert.deepEqual(config.providers, {});
 assert.equal(config.policy.security.web.allowPrivateNetwork, false);

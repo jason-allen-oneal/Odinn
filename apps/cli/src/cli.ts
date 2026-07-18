@@ -120,6 +120,22 @@ const EXPERIMENTAL_HOME = [
   }
 ] as const;
 
+function betaBoundaryText() {
+  return `Beta 3 boundary
+
+  verified local behavior: the supported local operator path, audited runtime, and release/install workflows covered by the current gates
+  experimental and disabled by default: Proof, Sentinel, Capability Tokens, Rewind, Capsules, Counterfactuals, Darwin, and self-improvement
+  provider- or platform-dependent: live provider services, browser sites, external authentication, and operating-system/package behavior outside the local gates
+  explicitly unsupported: hostile-code containment, public exposure of the single-user gateway, and deterministic rollback or replay of arbitrary remote effects
+
+Hard limits:
+  forked workers are crash containment, not a security sandbox;
+  remote hosting is application-level tenant isolation, not hostile-user OS isolation;
+  external effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
+
+See docs/BETA-3-SURFACE-MATRIX.md for the operator-facing surface matrix.`;
+}
+
 async function main() {
   switch (command) {
     case "init":
@@ -248,11 +264,15 @@ Common commands:
   odinn doctor                      Diagnose the current setup
 
 Help:
-  odinn help --all                  Show every advanced command`);
+  odinn help --all                  Show every advanced command
+
+${betaBoundaryText()}`);
 }
 
 function usage() {
-  console.log(`Usage:
+  console.log(`${betaBoundaryText()}
+
+Usage:
   odinn start [--state .odinn] [--port 18790] [--no-open]
   odinn init [--state .odinn]
   odinn onboard [--provider <name>] [--auth api-key|oauth|device|cli] [--verify] [--state <directory>]

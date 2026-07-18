@@ -1,6 +1,12 @@
 # Operator console
 
-The local console at `http://127.0.0.1:18790/` is an authenticated view over the single-user gateway. Loading `/` sets the HttpOnly bootstrap cookie. Scripts should read the owner-only `.odinn/gateway.token` and use bearer authentication instead. Cookie-authenticated mutations require an exact scheme, host, and port Origin.
+The local console at `http://127.0.0.1:18790/` is an authenticated view over the single-user gateway. Loading `/` sets the HttpOnly bootstrap cookie. Scripts should read the owner-only `.odinn/gateway.token` and use bearer authentication instead. Cookie-authenticated mutations require an exact scheme, host, and port Origin. See the [Beta 3 surface matrix](BETA-3-SURFACE-MATRIX.md) for the operator-facing classification of every console-backed surface: **verified local behavior**, **experimental and disabled by default**, **provider- or platform-dependent**, and **explicitly unsupported**.
+
+The three hard limits are:
+
+- Forked workers are crash containment, not a security sandbox.
+- Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
+- External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
 ## Projects, sessions, goals, and usage
 
@@ -10,13 +16,13 @@ Usage and Audit share one accounting function over the signed audit journal. Bot
 
 ## Cron Jobs
 
-Cron Jobs are stored in `.odinn/cron-jobs.json` and evaluated by the running gateway every 30 seconds. `/cron` creates and lists jobs; `/cron/<id>` updates or deletes them; `/cron/<id>/run` starts one immediately. A scheduled job invokes an existing registered tool through the same isolated-worker, policy, quota, idempotency, and audit boundary as an ordinary gateway task. The gateway must remain running for schedules to fire.
+Cron Jobs are stored in `.odinn/cron-jobs.json` and evaluated by the running gateway every 30 seconds. `/cron` creates and lists jobs; `/cron/<id>` updates or deletes them; `/cron/<id>/run` starts one immediately. A scheduled job invokes an existing registered tool through the same forked crash-containment worker, policy, quota, idempotency, and audit boundary as an ordinary gateway task. The worker is crash containment, not a security sandbox. The gateway must remain running for schedules to fire.
 
 Cron expressions contain five fields. Each job has an explicit IANA timezone, tool, and JSON input. Treat creation or editing as a privileged control-plane mutation.
 
 ## Tasks, Proof, and Audit
 
-Tasks is the operator view over meaningful user, agent, and automation runs. Routine console reads are hidden unless **System activity** is enabled. Each task shows its actual audit timeline, duration, outcome, evidence count, and whether recorded input is declared safe to replay. The replay endpoint enforces the same retry-safe classification server-side.
+Tasks is the operator view over meaningful user, agent, and automation runs. Routine console reads are hidden unless **System activity** is enabled. Each task shows its actual audit timeline, duration, outcome, evidence count, and whether recorded input is declared safe to replay. The replay endpoint enforces the same retry-safe classification server-side; external effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
 Audit provides server-side search, type/tool/actor/outcome/date filtering, pagination, JSON export, and integrity verification. Proof remains disabled by default and command assertions require exact operator-owned argument-vector allowlisting. Chain verification detects journal damage; it does not make a local journal tamper-proof against an attacker who controls the state directory.
 
@@ -44,4 +50,4 @@ Memory shows persisted records, namespaces, scope, provenance, authority, confid
 
 ## Remote hosting
 
-The console may be reached through the dedicated TLS multi-user host. Each tenant receives a separate gateway, state root, workspace, browser profile, and quota boundary. This remains application-level separation. Mutually hostile users require separate operating-system users, containers, or machines.
+The console may be reached through the dedicated TLS multi-user host. Each tenant receives a separate gateway, state root, workspace, browser profile, and quota boundary. Remote hosting is application-level tenant isolation, not hostile-user OS isolation. Mutually hostile users require separate operating-system users, containers, or machines.

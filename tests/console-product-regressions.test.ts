@@ -107,6 +107,17 @@ test("console presents the consolidated, scoped product surfaces", async () => {
     assert.match(html, /agentManifestDraft/);
     assert.match(html, /state\.agentManifestDraft = JSON\.parse/);
     assert.match(html, /\.\.\.\(state\.agentManifestDraft \|\| \{\}\)/);
+
+    const experiments = section(html, /<section id="view-experiments"[^>]*>/, /<section id="view-audit"[^>]*>/);
+    assertIds(experiments, ["beta-boundary", "beta-boundary-title"]);
+    assert.equal(experiments.match(/data-boundary-class=/g)?.length ?? 0, 4);
+    assert.match(experiments, /Verified local behavior/);
+    assert.match(experiments, /Experimental and disabled by default/);
+    assert.match(experiments, /Provider- or platform-dependent/);
+    assert.match(experiments, /Explicitly unsupported/);
+    assert.match(experiments, /Forked workers are crash containment, not a security sandbox\./);
+    assert.match(experiments, /Remote hosting is application-level tenant isolation, not hostile-user OS isolation\./);
+    assert.match(experiments, /External effects and nondeterministic provider behavior are outside full replay\/rollback guarantees\./);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error?: Error) => error ? reject(error) : resolve()));
   }

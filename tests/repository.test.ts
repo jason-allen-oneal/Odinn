@@ -55,6 +55,7 @@ test("dispatched release pull requests receive dependency and title checks", asy
 test("public beta support and reporting surfaces ship in the release tree", async () => {
   for (const path of [
     "docs/public-beta.md",
+    "docs/BETA-3-SURFACE-MATRIX.md",
     ".github/ISSUE_TEMPLATE/bug-report.yml",
     ".github/ISSUE_TEMPLATE/feature-request.yml",
     ".github/ISSUE_TEMPLATE/config.yml"
@@ -65,6 +66,16 @@ test("public beta support and reporting surfaces ship in the release tree", asyn
   assert.doesNotMatch(betaGuide, /v\d+\.\d+\.\d+-beta\.\d+/);
   assert.match(betaGuide, /registration and discovery do not execute or activate/u);
   assert.doesNotMatch(betaGuide, /attachments sent to their configured API/u);
+  const matrix = await read("docs/BETA-3-SURFACE-MATRIX.md");
+  for (const label of [
+    "verified local behavior",
+    "experimental and disabled by default",
+    "provider- or platform-dependent",
+    "explicitly unsupported"
+  ]) assert.match(matrix, new RegExp(label, "i"));
+  assert.match(matrix, /forked workers are crash containment, not a security sandbox/i);
+  assert.match(matrix, /remote hosting is application-level tenant isolation, not hostile-user OS isolation/i);
+  assert.match(matrix, /external effects and nondeterministic provider behavior are outside full replay\/rollback guarantees/i);
 });
 
 test("release packaging removes stale assets before creating a version", async () => {

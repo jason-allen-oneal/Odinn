@@ -2672,6 +2672,17 @@ function renderConsoleHtml() {
       background: linear-gradient(135deg, rgba(101, 87, 34, .18), rgba(17, 22, 30, .92));
     }
     .experimental-warning p { margin: 5px 0 0; color: var(--muted); line-height: 1.5; }
+    .beta-boundary { display: grid; gap: 12px; border-color: #3b4b5f; background: linear-gradient(145deg, rgba(34, 48, 64, .7), rgba(17, 22, 30, .96)); }
+    .beta-boundary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .beta-boundary-card { display: grid; gap: 7px; min-height: 132px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: rgba(12, 15, 20, .48); }
+    .beta-boundary-card strong { color: var(--text); font-size: 12px; line-height: 1.3; }
+    .beta-boundary-card p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .beta-boundary-card.verified { border-color: #245849; }
+    .beta-boundary-card.experimental { border-color: #655722; }
+    .beta-boundary-card.dependent { border-color: #456071; }
+    .beta-boundary-card.unsupported { border-color: #703141; }
+    .beta-boundary-limits { margin: 0; padding: 10px 12px 10px 28px; border-top: 1px solid var(--line-soft); color: #c8d2df; font-size: 12px; line-height: 1.5; }
+    .beta-boundary-limits li + li { margin-top: 4px; }
     .experimental-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
@@ -2705,6 +2716,7 @@ function renderConsoleHtml() {
     .experimental-run-card:hover { border-color: #456071; }
     @media (max-width: 900px) {
       .usage-grid, .agent-layout, .workshop-grid, .experimental-workbench { grid-template-columns: 1fr; }
+      .beta-boundary-grid { grid-template-columns: 1fr 1fr; }
       .session-filters { grid-template-columns: 1fr; }
       .filter-grid { grid-template-columns: 1fr 1fr; }
       .summary-bar { align-items: flex-start; flex-direction: column; gap: 10px; }
@@ -2940,6 +2952,20 @@ function renderConsoleHtml() {
             <div><h2>Sharp machinery. Deliberate switches.</h2><p>These systems can verify runs, issue scoped credentials, restore files, replay capsules, or replace a workspace. Flags are read from <code id="experimental-config-path">.odinn/config.json</code> at startup; this console never enables them silently.</p></div>
             <span class="pill warn" id="experimental-overall-state">DISABLED</span>
           </div>
+          <section class="panel beta-boundary" id="beta-boundary" aria-labelledby="beta-boundary-title">
+            <div class="panel-head"><div><div class="section-kicker">Beta 3 boundary</div><h2 id="beta-boundary-title">Know what this runtime guarantees</h2><span class="muted">The matrix distinguishes shipped local behavior from experiments, dependencies, and hard limits.</span></div><span class="chip">stabilization</span></div>
+            <div class="beta-boundary-grid">
+              <article class="beta-boundary-card verified" data-boundary-class="verified-local"><strong>Verified local behavior</strong><p>Supported local operator paths, audited execution, and release/install workflows covered by the current gates.</p></article>
+              <article class="beta-boundary-card experimental" data-boundary-class="experimental-disabled"><strong>Experimental and disabled by default</strong><p>Proof, Sentinel, Capability Tokens, Rewind, Capsules, Counterfactuals, Darwin, and self-improvement.</p></article>
+              <article class="beta-boundary-card dependent" data-boundary-class="provider-platform"><strong>Provider- or platform-dependent</strong><p>Live provider services, browser sites, external authentication, and operating-system behavior outside local gates.</p></article>
+              <article class="beta-boundary-card unsupported" data-boundary-class="explicitly-unsupported"><strong>Explicitly unsupported</strong><p>Hostile-code containment, public exposure of the single-user gateway, and deterministic rollback of arbitrary remote effects.</p></article>
+            </div>
+            <ul class="beta-boundary-limits">
+              <li>Forked workers are crash containment, not a security sandbox.</li>
+              <li>Remote hosting is application-level tenant isolation, not hostile-user OS isolation.</li>
+              <li>External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.</li>
+            </ul>
+          </section>
           <div class="stat-strip"><div class="stat-card"><strong id="experimental-enabled-count">0</strong><span>features enabled</span></div><div class="stat-card"><strong id="experimental-disabled-count">7</strong><span>features locked</span></div><div class="stat-card"><strong id="experimental-run-count">0</strong><span>ledger runs</span></div><div class="stat-card"><strong>RESTART</strong><span>required after flag changes</span></div></div>
           <div id="experimental-feature-grid" class="experimental-grid"><div class="empty-state"><strong>Reading feature gates</strong><span>Waiting for gateway status.</span></div></div>
           <div class="panel stack">

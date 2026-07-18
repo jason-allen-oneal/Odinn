@@ -23,7 +23,14 @@ test("CLI advanced help exposes documented beta safety controls", () => {
     "--duration-ms <ms>",
     "--constraints <json>",
     "--show-token",
-    "improve rollback --improvement <id>"
+    "improve rollback --improvement <id>",
+    "verified local behavior",
+    "experimental and disabled by default",
+    "provider- or platform-dependent",
+    "explicitly unsupported",
+    "forked workers are crash containment, not a security sandbox",
+    "remote hosting is application-level tenant isolation, not hostile-user OS isolation",
+    "external effects and nondeterministic provider behavior are outside full replay/rollback guarantees"
   ]) {
     assert.match(help.stdout, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }

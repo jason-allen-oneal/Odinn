@@ -19,6 +19,12 @@ The project is a clean-room implementation. It does not copy OpenClaw, Hermes, O
 
 Public beta participants should begin with the [public beta guide](docs/public-beta.md). It defines the supported local-first scope, verified release installation, privacy boundary, diagnostics, and bug-reporting path.
 
+For the authoritative Beta 3 surface classifications, see the [Beta 3 surface matrix](docs/BETA-3-SURFACE-MATRIX.md). Its labels are **verified local behavior**, **experimental and disabled by default**, **provider- or platform-dependent**, and **explicitly unsupported**. The three hard limits are:
+
+- Forked workers are crash containment, not a security sandbox.
+- Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
+- External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
+
 - chat with configured models through API keys, OAuth, imported OAuth sessions, local servers, or CLI adapters;
 - recall durable user and project context across sessions;
 - search the public web and fetch pages;
@@ -27,9 +33,9 @@ Public beta participants should begin with the [public beta guide](docs/public-b
 - inspect sessions, memory, runs, goals, improvements, providers, and audit events;
 - run deterministic tools and bounded model/tool loops through one audited kernel path.
 
-The default gateway remains single-user and loopback-only. An opt-in multi-user host is available for remote deployments; it terminates TLS and routes each authenticated user into an independent loopback gateway, state root, workspace, audit ledger, OAuth store, and browser profile.
+The default gateway remains single-user and loopback-only. An opt-in multi-user host is available for remote deployments; it terminates TLS and routes each authenticated user into an independent loopback gateway, state root, workspace, audit ledger, OAuth store, and browser profile. Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
 
-The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval and browser-recovery journals, provider retries and usage normalization, universally audited process/MCP extension execution, DNS-pinned public web fetches, symlink-safe workspace reads, owner-only state repair, versioned native installers with pointer rollback, signed audit-key rotation, bounded counterfactual execution, approved full capsule replay in disposable workspaces, autonomous rollback-safe reliability tuning, and tenant-isolated remote hosting. See [the P0 beta ledger](docs/P0-BETA-GATES.md).
+The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval and browser-recovery journals, provider retries and usage normalization, universally audited process/MCP extension execution, DNS-pinned public web fetches, symlink-safe workspace reads, owner-only state repair, versioned native installers with pointer rollback, signed audit-key rotation, bounded counterfactual execution, approved full capsule replay in disposable workspaces, autonomous rollback-safe reliability tuning, and opt-in remote hosting with application-level tenant isolation. See the [Beta 3 surface matrix](docs/BETA-3-SURFACE-MATRIX.md) and [P0 beta ledger](docs/P0-BETA-GATES.md) for the boundaries and release evidence.
 
 ## Quick start
 
@@ -100,7 +106,7 @@ The existing `config experimental` and feature-specific commands remain availabl
 - **Darwin** scores models from recorded verification, reliability, speed, cost, and policy outcomes.
 - **Self-improvement** mines repeated audited failures into reviewable proposals. It does not rewrite code, change policy, install skills, or approve its own changes.
 
-These are initial local slices, not a claim that arbitrary remote effects can be reversed or perfectly replayed. Browser sessions and external mutations are supported only through the documented approval, recovery, and egress boundaries. Counterfactual execution is explicit and operator-driven. Remote hosting is supported only through the TLS-only multi-user host and remains application-level tenant separation rather than hostile-code containment. Nondeterministic models and remote services remain outside any deterministic replay guarantee.
+These are initial local slices, not a claim that arbitrary remote effects can be reversed or perfectly replayed. Browser sessions and external mutations are supported only through the documented approval, recovery, and egress boundaries. Counterfactual execution is explicit and operator-driven. Forked workers are crash containment, not a security sandbox. Remote hosting is application-level tenant isolation, not hostile-user OS isolation. External effects and nondeterministic provider behavior are outside full replay/rollback guarantees. See the [Beta 3 surface matrix](docs/BETA-3-SURFACE-MATRIX.md) before enabling an experimental feature.
 
 The authenticated gateway exposes the same experimental surfaces through `/runtime/runs`, `/proof`, `/policy/evaluate`, `/capabilities/*`, `/checkpoints`, `/rewind/*`, `/capsules/*`, `/counterfactual/*`, and `/routing/*`. Each surface remains disabled until its matching experimental flag is enabled in `.odinn/config.json`.
 

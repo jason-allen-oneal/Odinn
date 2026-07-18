@@ -2,6 +2,14 @@
 
 Ódinn Forge's public beta is for real users running a local-first personal agent on a machine they control. Expect rough edges, incomplete provider-specific behavior, and breaking changes between beta releases. Do not use it as a safety-critical service or as a hostile-code sandbox.
 
+Use the [Beta 3 surface matrix](BETA-3-SURFACE-MATRIX.md) as the operator-facing source for the four classifications: **verified local behavior**, **experimental and disabled by default**, **provider- or platform-dependent**, and **explicitly unsupported**.
+
+The three hard limits are:
+
+- Forked workers are crash containment, not a security sandbox.
+- Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
+- External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
+
 ## Supported beta boundary
 
 - Linux, macOS, or Windows with Node.js 24 or newer and Corepack.
@@ -10,7 +18,7 @@
 - Explicit approval for browser mutations and other external side effects.
 - Experimental Proof, Rewind, Sentinel, Capsules, Darwin, Capability, Counterfactual, and self-improvement features remain disabled until individually enabled.
 
-The TLS multi-user host is available to experienced operators, but it provides application-level tenant separation rather than hostile-code containment. It is not the default public-beta path. Do not expose the single-user gateway to a network.
+The TLS multi-user host is available to experienced operators, but remote hosting is application-level tenant isolation, not hostile-user OS isolation. It is not the default public-beta path. Do not expose the single-user gateway to a network.
 
 ## Install a verified release
 
@@ -76,7 +84,7 @@ node scripts/install.ts rollback --prefix "$HOME/.local/share/odinn"
 
 Ódinn Forge has no built-in product telemetry. Runtime state, browser profiles, audit records, memory, and credentials stay in the configured local state directory unless you deliberately use a remote host or external provider.
 
-Model providers receive the prompts, recalled context, and tool results sent to their configured API. Websites receive normal browser or fetch traffic. Imported skills, MCP servers, extensions, and browser pages are untrusted input. Review them before enabling them and never post `.odinn`, OAuth files, gateway tokens, browser profiles, or raw diagnostic bundles publicly.
+Model providers receive the prompts, recalled context, and tool results sent to their configured API. Websites receive normal browser or fetch traffic. Imported skills, MCP servers, extensions, and browser pages are untrusted input. Review them before enabling them and never post `.odinn`, OAuth files, gateway tokens, browser profiles, or raw diagnostic bundles publicly. External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
 ## Before reporting a bug
 

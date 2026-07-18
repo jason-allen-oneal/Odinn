@@ -11,6 +11,7 @@ const required = [
   "LICENSE",
   "SECURITY.md",
   "docs/public-beta.md",
+  "docs/BETA-3-SURFACE-MATRIX.md",
   "pnpm-lock.yaml",
   ".github/ISSUE_TEMPLATE/bug-report.yml",
   ".github/workflows/ci.yml",

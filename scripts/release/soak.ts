@@ -121,7 +121,12 @@ const provider = createProviderServer(async (request: any, response: any) => {
     return;
   }
   let raw = "";
-  for await (const chunk of request) raw += chunk;
+  try {
+    for await (const chunk of request) raw += chunk;
+  } catch (error: any) {
+    if (error?.code === "ECONNRESET" || request.destroyed || response.destroyed) return;
+    throw error;
+  }
   const payload = JSON.parse(raw);
   const content = payload.messages?.some((message: any) => String(message.content).includes("ODINN_CAPABILITY_OK")) ? "ODINN_CAPABILITY_OK" : "ODINN_SOAK_PROVIDER_OK";
   response.writeHead(200, { "content-type": "application/json" });

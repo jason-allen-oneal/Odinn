@@ -32,7 +32,8 @@
     "release:preflight": "node scripts/release/preflight.ts",
     "release:package": "node scripts/release/package.ts",
     "release:checksums": "node scripts/release/checksums.ts",
-    "release:install-smoke": "node scripts/release/install-smoke.ts"
+    "release:install-smoke": "node scripts/release/install-smoke.ts",
+    "release:soak": "node scripts/release/soak.ts"
   },
   "license": "MIT",
   "devDependencies": {

@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { access, chmod, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { access, chmod, mkdir, readFile, readdir, rename, stat as statPath, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
@@ -508,6 +508,8 @@ export async function createGatewayServer({
   improvementTimer?.unref?.();
 
   const server: any = createServer(async (request: any, response: any) => {
+    const requestId = String(request.headers["x-odinn-request-id"] || randomUUID());
+    response.setHeader("x-odinn-request-id", requestId);
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
       if (!validHostHeader(request)) return json(response, 421, { ok: false, error: "invalid gateway Host header" });
@@ -547,6 +549,9 @@ export async function createGatewayServer({
           selfImprovement,
           pendingApprovals: approvalStore.list()
         });
+      }
+      if (request.method === "GET" && url.pathname === "/diagnostics") {
+        return json(response, 200, await diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor }));
       }
       if (request.method === "GET" && url.pathname === "/agents") {
         return json(response, 200, { agents: await agentStore.list(), sdkVersion: "0.3" });
@@ -1120,7 +1125,7 @@ export async function createGatewayServer({
           quotaGate.recordUsage(body.tool, result.output?.usage);
           sendEvent("result", result);
         } catch (error) {
-          sendEvent("error", { error: error instanceof Error ? error.message : String(error) });
+          sendEvent("error", publicError(error, requestId));
         } finally {
           response.end();
         }
@@ -1146,7 +1151,7 @@ export async function createGatewayServer({
       }
       return json(response, 404, { ok: false, error: "not found" });
     } catch (error: any) {
-      return json(response, error.status ?? 400, { ok: false, error: error.message });
+      return json(response, error.status ?? 400, publicError(error, requestId));
     }
   });
 
@@ -1265,7 +1270,7 @@ async function streamAuditEvents(request: any, response: any, auditStore: any, u
       }
       cursor = events.length - 1;
     } catch (error: any) {
-      response.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`);
+      response.write(`event: error\ndata: ${JSON.stringify(publicError(error, String(request.headers["x-odinn-request-id"] || "audit-stream")))}\n\n`);
     }
   }, 500);
   request.on("close", () => clearInterval(poll));
@@ -1352,6 +1357,79 @@ async function summarizeProviders(config: any, state: any) {
       ? await oauthTokenExists(provider, state)
       : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv])
   })));
+}
+
+async function diagnostics({ state, config, featureFlags, auditStore, approvalStore, supervisor }: any) {
+  let audit = { valid: true, events: 0, unsigned: 0, failureCount: 0 };
+  try {
+    const auditPath = join(state, config.auditLog ?? "audit.jsonl");
+    if (await access(auditPath).then(() => true).catch(() => false)) {
+      const verification: any = await auditStore.verifyIntegrity({ allowUnsigned: true });
+      audit = { valid: verification.valid, events: verification.events, unsigned: verification.unsigned, failureCount: verification.failures?.length ?? 0 };
+    }
+  } catch { audit = { valid: false, events: 0, unsigned: 0, failureCount: 1 }; }
+  const jobs = await supervisor.list();
+  const pendingApprovals = approvalStore.list();
+  let recovery: any = { status: "clear" };
+  try { recovery = JSON.parse(await readFile(join(state, "browser-recovery.json"), "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") recovery = { status: "unavailable" }; }
+  let ownerOnly = false;
+  try { ownerOnly = ((await statPath(state)).mode & 0o077) === 0; } catch {}
+  const normalized = normalizeModelConfig(config);
+  let version = "unknown";
+  try { version = JSON.parse(await readFile(new URL("../../../package.json", import.meta.url), "utf8")).version ?? version; } catch {}
+  let commit = process.env.ODINN_COMMIT ?? "";
+  if (!commit) {
+    try { commit = JSON.parse(await readFile(new URL("../../../install-metadata.json", import.meta.url), "utf8")).commit ?? ""; } catch {}
+  }
+  return {
+    ok: audit.valid,
+    command: "diagnostics",
+    version,
+    commit: commit || "unknown",
+    platform: { os: process.platform, arch: process.arch, node: process.version },
+    providerMode: await Promise.all(Object.entries(normalized.providers ?? {}).map(async ([name, provider]: any) => ({
+      name,
+      type: provider.type ?? "openai-compatible",
+      authMode: provider.auth?.mode ?? "api-key",
+      configured: provider.auth?.mode === "oauth" ? await oauthTokenExists(provider, state) : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv]),
+      models: provider.models ?? []
+    }))),
+    experimental: featureFlags,
+    audit,
+    approvals: { pending: pendingApprovals.length, ids: pendingApprovals.map((approval: any) => approval.id) },
+    browserRecovery: { status: recovery.status ?? "clear", pending: ["executing", "unknown"].includes(recovery.status), id: recovery.id ?? undefined },
+    jobs: {
+      total: jobs.length,
+      queued: jobs.filter((job: any) => job.status === "queued").length,
+      running: jobs.filter((job: any) => job.status === "running").length,
+      failed: jobs.filter((job: any) => job.status === "failed").length,
+      needsReview: jobs.filter((job: any) => job.status === "needs-review").length,
+      completed: jobs.filter((job: any) => job.status === "completed").length
+    },
+    state: { ownerOnly, runtimeStateOutsideSourceCheckout: true, secretsExcludedFromDiagnostics: true }
+  };
+}
+
+function publicError(error: any, requestId: string) {
+  const status = Number(error?.status ?? 400);
+  const raw = error instanceof Error ? error.message : String(error);
+  const code = String(error?.code ?? "");
+  const category = code === "BROWSER_RECOVERY_REQUIRED" || /outcome is unknown|uncertain outcome/i.test(raw)
+    ? "browser-recovery"
+    : code.includes("CAPABILITY") || /policy|approval|disabled/i.test(raw)
+      ? "policy"
+      : /timeout|timed out/i.test(raw)
+        ? "timeout"
+        : /provider|model/i.test(raw)
+          ? "provider"
+          : status === 404 ? "not-found" : status >= 500 ? "runtime" : "validation";
+  const safe = error instanceof GatewayError || /experimental\.[a-z-]+ is disabled|request body must be valid JSON|request body exceeds \d+ bytes|origin rejected|gateway authentication required|outcome is unknown|uncertain outcome/i.test(raw)
+    ? raw.slice(0, 240)
+    : category === "timeout" ? "The operation timed out. Retry it or inspect diagnostics."
+      : category === "provider" ? "The provider operation failed. Check the configured provider and retry."
+        : category === "policy" ? "The operation was blocked by policy or approval state. Review the policy and pending approvals."
+          : "The operation failed. Run `odinn doctor` for a safe diagnostic report.";
+  return { ok: false, error: safe, category, nextAction: category === "browser-recovery" ? "Inspect and resolve the browser recovery record before retrying." : "Run `odinn doctor` and retry after correcting the reported condition.", requestId };
 }
 
 async function oauthTokenExists(provider: any, state: any) {

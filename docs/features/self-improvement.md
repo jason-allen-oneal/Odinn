@@ -15,6 +15,7 @@ Enable autonomous application explicitly:
 pnpm odinn config self-improvement set \
   --enabled true \
   --mode auto \
+  --confirm-impact \
   --interval-ms 300000 \
   --max-changes 1
 ```

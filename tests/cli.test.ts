@@ -352,7 +352,7 @@ test("CLI exposes explicit security posture controls", async () => {
   assert.equal(init.status, 0, init.stderr || init.stdout);
   const set = spawnSync("node", [
     "apps/cli/src/cli.ts", "config", "security", "set", "--state", state,
-    "--surface", "browser", "--require-approval", "false", "--allowed-domains", "example.com"
+    "--surface", "browser", "--require-approval", "false", "--allowed-domains", "example.com", "--confirm-impact"
   ], { cwd: root, encoding: "utf8" });
   assert.equal(set.status, 0, set.stderr || set.stdout);
   const config = JSON.parse(await readFile(join(state, "config.json"), "utf8"));
@@ -361,6 +361,23 @@ test("CLI exposes explicit security posture controls", async () => {
   const show = spawnSync("node", ["apps/cli/src/cli.ts", "config", "security", "show", "--state", state], { cwd: root, encoding: "utf8" });
   assert.equal(show.status, 0, show.stderr || show.stdout);
   assert.match(show.stdout, /allowPrivateNetwork/);
+});
+
+test("CLI doctor reports safe diagnostics without state paths or credentials", async () => {
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-doctor-"));
+  const init = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], { cwd: root, encoding: "utf8" });
+  assert.equal(init.status, 0, init.stderr || init.stdout);
+  const provider = spawnSync("node", ["apps/cli/src/cli.ts", "config", "provider", "add", "ci", "--base-url", "http://127.0.0.1:1/v1", "--model", "safe-model", "--api-key-env", "ODINN_DOCTOR_SECRET", "--state", state], { cwd: root, encoding: "utf8" });
+  assert.equal(provider.status, 0, provider.stderr || provider.stdout);
+  const doctor = spawnSync("node", ["apps/cli/src/cli.ts", "doctor", "--state", state], { cwd: root, encoding: "utf8", env: { ...process.env, ODINN_COMMIT: "test-commit" } });
+  assert.equal(doctor.status, 0, doctor.stderr || doctor.stdout);
+  const report = JSON.parse(doctor.stdout);
+  assert.equal(report.command, "doctor");
+  assert.equal(report.commit, "test-commit");
+  assert.equal(report.providerMode[0].configured, false);
+  assert.equal(report.state.secretsExcludedFromDiagnostics, true);
+  assert.doesNotMatch(doctor.stdout, new RegExp(state.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(doctor.stdout, /ODINN_DOCTOR_SECRET/);
 });
 
 test("CLI onboarding completes an OAuth PKCE callback locally", async () => {

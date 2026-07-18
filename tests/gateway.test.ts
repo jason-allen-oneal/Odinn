@@ -64,6 +64,40 @@ test("gateway exposes status, run execution, plans, and run summaries", async ()
   }
 });
 
+test("gateway diagnostics expose safe state and errors carry correlation metadata", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-diagnostics-"));
+  const server = await createGatewayServer({ stateDir, workspaceRoot: root });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const diagnosticsResponse = await fetch(`${base}/diagnostics`, { headers: { "x-odinn-request-id": "diagnostics-test-request" } });
+    assert.equal(diagnosticsResponse.status, 200);
+    assert.equal(diagnosticsResponse.headers.get("x-odinn-request-id"), "diagnostics-test-request");
+    const diagnostics = await diagnosticsResponse.json();
+    assert.equal(diagnostics.command, "diagnostics");
+    assert.equal(diagnostics.audit.valid, true);
+    assert.equal(diagnostics.state.ownerOnly, true);
+    assert.equal(diagnostics.state.runtimeStateOutsideSourceCheckout, true);
+    assert.equal(diagnostics.state.secretsExcludedFromDiagnostics, true);
+    assert.equal(JSON.stringify(diagnostics).includes(stateDir), false);
+
+    const invalid = await fetch(`${base}/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-odinn-request-id": "diagnostics-error-request" },
+      body: "{"
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal(invalid.headers.get("x-odinn-request-id"), "diagnostics-error-request");
+    const error = await invalid.json();
+    assert.equal(error.ok, false);
+    assert.equal(error.category, "validation");
+    assert.equal(error.requestId, "diagnostics-error-request");
+    assert.match(error.nextAction, /doctor/);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
 test("gateway permits capability inspection and revocation after the feature is disabled", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-capability-cleanup-"));
   const workspaceRoot = await mkdtemp(join(tmpdir(), "odinn-gateway-capability-workspace-"));
@@ -292,12 +326,15 @@ test("gateway blocks retries after an uncertain browser mutation until recovery 
     const failed = await failedResponse.json();
     assert.equal(failedResponse.status, 400);
     assert.match(failed.error, /outcome is unknown/);
+    assert.equal(failed.category, "browser-recovery");
+    assert.match(failed.nextAction, /recovery/);
     const status = await postJson(`${base}/run`, { tool: "browser.recovery.status", input: {} });
     assert.equal(status.output.recovery.status, "unknown");
     const blockedResponse = await fetch(`${base}/run`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.press", input: { tabId: opened.output.id, key: "Escape", confirmed: true } }) });
     const blocked = await blockedResponse.json();
     assert.equal(blockedResponse.status, 400);
     assert.match(blocked.error, /uncertain outcome/);
+    assert.equal(blocked.category, "browser-recovery");
     const resolved = await postJson(`${base}/run`, { tool: "browser.recovery.resolve", input: { outcome: "not-applied", note: "missing selector did not mutate the page" } });
     assert.equal(resolved.output.recovery.status, "resolved");
   } finally { await new Promise((resolve: any) => server.close(() => resolve())); }
@@ -316,7 +353,9 @@ test("gateway rejects invalid and oversized JSON bodies", async () => {
       body: "{"
     });
     assert.equal(invalid.status, 400);
-    assert.match((await invalid.json()).error, /valid JSON/);
+    const invalidBody = await invalid.json();
+    assert.match(invalidBody.error, /valid JSON/);
+    assert.equal(invalidBody.category, "validation");
 
     const oversized = await fetch(`${base}/run`, {
       method: "POST",
@@ -324,7 +363,9 @@ test("gateway rejects invalid and oversized JSON bodies", async () => {
       body: JSON.stringify({ tool: "text.echo", input: { text: "x".repeat(200) } })
     });
     assert.equal(oversized.status, 413);
-    assert.match((await oversized.json()).error, /exceeds 32 bytes/);
+    const oversizedBody = await oversized.json();
+    assert.match(oversizedBody.error, /exceeds 32 bytes/);
+    assert.equal(oversizedBody.category, "validation");
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }

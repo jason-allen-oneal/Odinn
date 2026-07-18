@@ -3,7 +3,7 @@
 Capability tokens bind one short-lived operation to a run, step, tool, resource constraints, and a use count. The signing key is local-only with restrictive permissions. Raw credentials are never placed in token claims, ledger payloads, or normal CLI output.
 
 ```bash
-odinn config experimental enable capabilities
+odinn config experimental enable capabilities --confirm-impact
 odinn capability issue --run <run-id> --step <step-id> --tool github.create --scope pull_request:create
 odinn capability list <run-id>
 odinn capability revoke <capability-id>

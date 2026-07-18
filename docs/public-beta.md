@@ -91,10 +91,17 @@ Model providers receive the prompts, recalled context, and tool results sent to 
 Capture the smallest safe reproduction:
 
 ```bash
+odinn doctor
 odinn status
 odinn audit verify
 odinn runs
 ```
+
+The diagnostic report includes the Odinn version and commit, platform and Node
+version, provider mode without credentials, experimental flags, audit status,
+pending approvals, browser recovery, and job counts. It deliberately omits
+state paths, tokens, prompts, cookies, and provider secrets. The running
+gateway exposes the same safe report at `GET /diagnostics`.
 
 Include the operating system, Node.js version, Odinn Forge version, provider name, exact command or UI action, expected result, observed result, and sanitized logs. Remove API keys, OAuth tokens, cookies, prompts containing private data, local usernames, private hostnames, and filesystem paths that identify people or clients.
 

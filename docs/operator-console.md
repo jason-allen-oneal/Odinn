@@ -26,11 +26,17 @@ Tasks is the operator view over meaningful user, agent, and automation runs. Rou
 
 Audit provides server-side search, type/tool/actor/outcome/date filtering, pagination, JSON export, and integrity verification. Proof remains disabled by default and command assertions require exact operator-owned argument-vector allowlisting. Chain verification detects journal damage; it does not make a local journal tamper-proof against an attacker who controls the state directory.
 
+Runtime errors return a stable request correlation ID in the `x-odinn-request-id`
+header and JSON body. Audit entries retain run, task/step, provider-attempt,
+approval, and browser-recovery identifiers where applicable. Use `odinn doctor`
+or `GET /diagnostics` for a redacted health snapshot rather than collecting the
+raw state directory.
+
 ## Experimental Lab
 
 Experimental Lab is the console home for Proof, Sentinel, Capability Tokens, Rewind, Capsules, Counterfactuals, and Darwin. It reads the active startup gates from `/status`, lists recent records from the SQLite runtime ledger, and exposes a fixed set of forms backed by the existing authenticated experimental endpoints. Requests are not arbitrary URLs: each workbench action maps to a known method and route.
 
-The lab does not weaken the disabled-by-default posture. A disabled feature stays locked, destructive operations remain explicit, Rewind and Counterfactual selection default to previews, and configuration changes require an intentional edit or `odinn experimental enable <feature>` followed by a gateway restart. The CLI equivalent is `odinn experimental status`; use `odinn experimental help <feature>` to see the real commands behind one system.
+The lab does not weaken the disabled-by-default posture. A disabled feature stays locked, destructive operations remain explicit, Rewind and Counterfactual selection default to previews, and configuration changes require an intentional edit or `odinn experimental enable <feature> --confirm-impact` followed by a gateway restart. The CLI equivalent is `odinn experimental status`; use `odinn experimental help <feature>` to see the real commands behind one system. Dangerous changes show an impact summary before they can be confirmed.
 
 ## Agent SDK packages
 

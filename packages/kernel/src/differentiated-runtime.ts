@@ -47,8 +47,15 @@ function odinnVersion() {
   } catch {}
   return "unknown";
 }
-function requireExperimental(flags: FeatureFlags, name: string) {
-  if (flags?.[name] !== true) throw new OdinnRuntimeError("POLICY_VIOLATION", `experimental.${name} is disabled`, { feature: name });
+function requireExperimental(flags: FeatureFlags, name: string, ledger?: any) {
+  if (flags?.[name] === true) return;
+  ledger ??= (flags as AnyRecord).__ledger;
+  if (ledger) {
+    const runId = `system:experimental:${name}`;
+    ledger.ensureRun({ runId, objective: `record disabled experimental feature ${name}` });
+    ledger.appendEvent({ runId, type: "experimental-feature-rejected", payload: { feature: name, reason: "disabled" } });
+  }
+  throw new OdinnRuntimeError("POLICY_VIOLATION", `experimental.${name} is disabled`, { feature: name });
 }
 function safePath(root: string, candidate: string) {
   const base = resolve(root);
@@ -183,7 +190,7 @@ export class ProofEngine {
     this.verifierOptions = { allowedCommands, maxOutputBytes, maxFileBytes, commandEnvironment };
   }
   async run(runId: string, contract: AnyRecord, { workspaceRoot = process.cwd() }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "proof");
+    requireExperimental(this.featureFlags, "proof", this.ledger);
     if (contract?.schemaVersion === 1) {
       const verifierOptions = Object.fromEntries(Object.entries(this.verifierOptions).filter(([, value]) => value !== undefined));
       return new ProofVerifier({
@@ -261,7 +268,7 @@ export class Sentinel {
   [key: string]: any;
   constructor({ ledger, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.featureFlags = featureFlags; }
   evaluate({ runId, stepId, toolName, input, policy, workspaceRoot = process.cwd() }: AnyRecord) {
-    requireExperimental(this.featureFlags, "sentinel"); validatePolicy(policy);
+    requireExperimental(this.featureFlags, "sentinel", this.ledger); validatePolicy(policy);
     const policyId = policy.id ?? `policy_${runId}_${hash(json(redact(policy))).slice(0, 16)}`;
     this.ledger.database.db.prepare("INSERT OR IGNORE INTO policies(id, run_id, policy_json, created_at) VALUES (?, ?, ?, ?)").run(policyId, runId, json(redact(policy)), now());
     const evaluations = [];
@@ -283,7 +290,7 @@ export class CapabilityBroker {
   constructor({ ledger, stateDir, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.stateDir = resolve(stateDir ?? ".odinn"); this.featureFlags = featureFlags; this.keyPath = join(this.stateDir, "capability-signing.key"); mkdirSync(this.stateDir, { recursive: true }); this.key = this.loadKey(); }
   loadKey() { if (existsSync(this.keyPath)) return readFileSync(this.keyPath); const key = randomBytes(32); writeFileSync(this.keyPath, key, { mode: 0o600, flag: "wx" }); chmodSync(this.keyPath, 0o600); return key; }
   issue({ runId, stepId, toolName, scopes = [], resourceConstraints = {}, expiresInMs = 60_000, maxUses = 1, approvalId }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "capabilities");
+    requireExperimental(this.featureFlags, "capabilities", this.ledger);
     if (typeof runId !== "string" || !runId || typeof stepId !== "string" || !stepId || typeof toolName !== "string" || !toolName) throw new OdinnRuntimeError("CAPABILITY_DENIED", "runId, stepId, and toolName are required");
     if (!Array.isArray(scopes) || scopes.some((scope) => typeof scope !== "string" || !scope)) throw new OdinnRuntimeError("CAPABILITY_DENIED", "capability scopes must be non-empty strings");
     if (!Number.isInteger(expiresInMs) || expiresInMs < 1 || expiresInMs > 3_600_000) throw new OdinnRuntimeError("CAPABILITY_DENIED", "expiresInMs must be an integer from 1 through 3600000");
@@ -295,7 +302,7 @@ export class CapabilityBroker {
     return { token: `${encoded}.${signature}`, claims };
   }
   consume(token: string, { runId, toolName, resource = {} }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "capabilities");
+    requireExperimental(this.featureFlags, "capabilities", this.ledger);
     const [encoded, signature] = String(token ?? "").split("."); const expected = createHmac("sha256", this.key).update(encoded ?? "").digest("base64url");
     if (!encoded || !signature || signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) throw new OdinnRuntimeError("CAPABILITY_DENIED", "invalid capability signature");
     const claims = parse(Buffer.from(encoded, "base64url").toString("utf8"), null); if (!claims) throw new OdinnRuntimeError("CAPABILITY_DENIED", "invalid capability claims");
@@ -331,7 +338,7 @@ export class SnapshotManager {
   [key: string]: any;
   constructor({ ledger, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.featureFlags = featureFlags; }
   create({ runId, stepId, paths = [], label, workspaceRoot = process.cwd() }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "rewind");
+    requireExperimental(this.featureFlags, "rewind", this.ledger);
     if (!this.ledger.getRun(runId)) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot run not found", { runId });
     if (!Array.isArray(paths) || paths.length === 0 || paths.some((path) => typeof path !== "string" || !path.trim())) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot paths must contain at least one non-empty path");
     const requestedPaths = [...new Set(paths)];
@@ -357,7 +364,7 @@ export class SnapshotManager {
   }
   plan(snapshotId: string): AnyRecord { const snapshot = this.ledger.database.db.prepare("SELECT * FROM snapshots WHERE id = ?").get(snapshotId) as AnyRecord | undefined; if (!snapshot) throw new OdinnRuntimeError("SNAPSHOT_FAILED", "snapshot not found"); return { snapshotId, workspaceRoot: snapshot.workspace_root, entries: this.ledger.database.db.prepare("SELECT * FROM snapshot_entries WHERE snapshot_id = ? ORDER BY path").all(snapshotId) }; }
   restore(snapshotId: string, { apply = false }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "rewind");
+    requireExperimental(this.featureFlags, "rewind", this.ledger);
     const plan = this.plan(snapshotId);
     const prepared = plan.entries.map((entry: AnyRecord) => {
       const target = safeExistingPath(plan.workspaceRoot, entry.path);
@@ -393,9 +400,9 @@ export class SnapshotManager {
 export class DarwinRouter {
   [key: string]: any;
   constructor({ ledger, featureFlags = {}, weights = {} }: AnyRecord = {}) { this.ledger = ledger; this.featureFlags = featureFlags; this.weights = { verified: 0.45, reliability: 0.15, speed: 0.1, cost: 0.15, compliance: 0.15, ...weights }; }
-  observe(observation: AnyRecord) { requireExperimental(this.featureFlags, "darwin"); const item = { id: observation.id ?? randomUUID(), runId: observation.runId, providerId: observation.providerId, modelId: observation.modelId, taskClass: observation.taskClass ?? "general", verified: Boolean(observation.verified), partiallyVerified: Boolean(observation.partiallyVerified), costUsd: observation.costUsd ?? null, durationMs: Number(observation.durationMs ?? 0), toolCalls: Number(observation.toolCalls ?? 0), toolErrors: Number(observation.toolErrors ?? 0), retries: Number(observation.retries ?? 0), policyViolations: Number(observation.policyViolations ?? 0), rolledBack: Boolean(observation.rolledBack), createdAt: now() }; this.ledger.database.db.prepare("INSERT INTO model_observations(id, run_id, provider_id, model_id, task_class, verified, partially_verified, cost_usd, duration_ms, tool_calls, tool_errors, retries, policy_violations, rolled_back, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(item.id, item.runId, item.providerId, item.modelId, item.taskClass, item.verified ? 1 : 0, item.partiallyVerified ? 1 : 0, item.costUsd, item.durationMs, item.toolCalls, item.toolErrors, item.retries, item.policyViolations, item.rolledBack ? 1 : 0, item.createdAt); return item; }
-  stats(taskClass = "general") { requireExperimental(this.featureFlags, "darwin"); const rows = this.ledger.database.db.prepare("SELECT provider_id, model_id, AVG(verified) verified, AVG(tool_errors = 0) reliability, AVG(duration_ms) duration, AVG(COALESCE(cost_usd, 0)) cost, AVG(policy_violations = 0) compliance, COUNT(*) observations FROM model_observations WHERE task_class = ? GROUP BY provider_id, model_id").all(taskClass) as AnyRecord[]; const maxDuration = Math.max(...rows.map((row: AnyRecord) => Number(row.duration)), 1); const maxCost = Math.max(...rows.map((row: AnyRecord) => Number(row.cost)), 0.000001); return rows.map((row: AnyRecord) => ({ ...row, score: Number(row.verified) * this.weights.verified + Number(row.reliability) * this.weights.reliability + (1 - Number(row.duration) / maxDuration) * this.weights.speed + (1 - Number(row.cost) / maxCost) * this.weights.cost + Number(row.compliance) * this.weights.compliance, uncertaintyPenalty: 1 / Math.max(Number(row.observations), 1) })); }
-  choose(taskClass = "general", { pinnedModel }: AnyRecord = {}) { if (pinnedModel) return { model: pinnedModel, reason: "user-pinned model" }; const stats: AnyRecord[] = this.stats(taskClass).map((row: AnyRecord) => ({ ...row, adjustedScore: row.score - row.uncertaintyPenalty })); stats.sort((a: AnyRecord, b: AnyRecord) => b.adjustedScore - a.adjustedScore); if (!stats[0]) throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", "no observations for task class", { taskClass }); return { model: `${stats[0].provider_id}:${stats[0].model_id}`, taskClass, score: stats[0].adjustedScore, explanation: `selected from ${stats[0].observations} observed runs; verified=${Number(stats[0].verified).toFixed(2)}, reliability=${Number(stats[0].reliability).toFixed(2)}`, candidates: stats };
+  observe(observation: AnyRecord) { requireExperimental(this.featureFlags, "darwin", this.ledger); const item = { id: observation.id ?? randomUUID(), runId: observation.runId, providerId: observation.providerId, modelId: observation.modelId, taskClass: observation.taskClass ?? "general", verified: Boolean(observation.verified), partiallyVerified: Boolean(observation.partiallyVerified), costUsd: observation.costUsd ?? null, durationMs: Number(observation.durationMs ?? 0), toolCalls: Number(observation.toolCalls ?? 0), toolErrors: Number(observation.toolErrors ?? 0), retries: Number(observation.retries ?? 0), policyViolations: Number(observation.policyViolations ?? 0), rolledBack: Boolean(observation.rolledBack), createdAt: now() }; this.ledger.database.db.prepare("INSERT INTO model_observations(id, run_id, provider_id, model_id, task_class, verified, partially_verified, cost_usd, duration_ms, tool_calls, tool_errors, retries, policy_violations, rolled_back, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(item.id, item.runId, item.providerId, item.modelId, item.taskClass, item.verified ? 1 : 0, item.partiallyVerified ? 1 : 0, item.costUsd, item.durationMs, item.toolCalls, item.toolErrors, item.retries, item.policyViolations, item.rolledBack ? 1 : 0, item.createdAt); return item; }
+  stats(taskClass = "general") { requireExperimental(this.featureFlags, "darwin", this.ledger); const rows = this.ledger.database.db.prepare("SELECT provider_id, model_id, AVG(verified) verified, AVG(tool_errors = 0) reliability, AVG(duration_ms) duration, AVG(COALESCE(cost_usd, 0)) cost, AVG(policy_violations = 0) compliance, COUNT(*) observations FROM model_observations WHERE task_class = ? GROUP BY provider_id, model_id").all(taskClass) as AnyRecord[]; const maxDuration = Math.max(...rows.map((row: AnyRecord) => Number(row.duration)), 1); const maxCost = Math.max(...rows.map((row: AnyRecord) => Number(row.cost)), 0.000001); return rows.map((row: AnyRecord) => ({ ...row, score: Number(row.verified) * this.weights.verified + Number(row.reliability) * this.weights.reliability + (1 - Number(row.duration) / maxDuration) * this.weights.speed + (1 - Number(row.cost) / maxCost) * this.weights.cost + Number(row.compliance) * this.weights.compliance, uncertaintyPenalty: 1 / Math.max(Number(row.observations), 1) })); }
+  choose(taskClass = "general", { pinnedModel }: AnyRecord = {}) { requireExperimental(this.featureFlags, "darwin", this.ledger); if (pinnedModel) return { model: pinnedModel, reason: "user-pinned model" }; const stats: AnyRecord[] = this.stats(taskClass).map((row: AnyRecord) => ({ ...row, adjustedScore: row.score - row.uncertaintyPenalty })); stats.sort((a: AnyRecord, b: AnyRecord) => b.adjustedScore - a.adjustedScore); if (!stats[0]) throw new OdinnRuntimeError("MODEL_ROUTING_UNAVAILABLE", "no observations for task class", { taskClass }); return { model: `${stats[0].provider_id}:${stats[0].model_id}`, taskClass, score: stats[0].adjustedScore, explanation: `selected from ${stats[0].observations} observed runs; verified=${Number(stats[0].verified).toFixed(2)}, reliability=${Number(stats[0].reliability).toFixed(2)}`, candidates: stats };
   }
 }
 
@@ -403,7 +410,7 @@ export class CapsuleManager {
   [key: string]: any;
   constructor({ ledger, stateDir, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.stateDir = resolve(stateDir ?? ".odinn"); this.featureFlags = featureFlags; this.root = join(this.stateDir, "capsules"); mkdirSync(this.root, { recursive: true }); }
   async export(runId: string, { output, contract, policy, replayMode = "verification-only" }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "capsules");
+    requireExperimental(this.featureFlags, "capsules", this.ledger);
     if (!output) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule output is required");
     const run = this.ledger.getRun(runId); if (!run) throw new OdinnRuntimeError("CAPSULE_INVALID", "run not found", { runId });
     const destination = resolve(output);
@@ -452,7 +459,7 @@ export class CapsuleManager {
     return [...digests].map((digest) => this.ledger.database.db.prepare("SELECT digest, path FROM artifacts WHERE digest = ?").get(digest)).filter(Boolean);
   }
   async verify(path: string) {
-    requireExperimental(this.featureFlags, "capsules");
+    requireExperimental(this.featureFlags, "capsules", this.ledger);
     const archive = resolve(path);
     if (!existsSync(archive)) throw new OdinnRuntimeError("CAPSULE_INVALID", "capsule not found");
     const recorded = this.ledger.database.db.prepare("SELECT digest FROM capsules WHERE path = ? ORDER BY created_at DESC LIMIT 1").get(archive);
@@ -583,7 +590,7 @@ export class CounterfactualManager {
   [key: string]: any;
   constructor({ ledger, stateDir, featureFlags = {} }: AnyRecord = {}) { this.ledger = ledger; this.stateDir = resolve(stateDir ?? ".odinn"); this.featureFlags = featureFlags; }
   async create({ sourceRunId, sourceStepId, plans = [], workspaceRoot = process.cwd() }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "counterfactual");
+    requireExperimental(this.featureFlags, "counterfactual", this.ledger);
     const normalizedPlans = validateCounterfactualPlans(plans);
     if (typeof sourceRunId !== "string" || !sourceRunId || typeof sourceStepId !== "string" || !sourceStepId) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual sourceRunId and sourceStepId are required");
     const sourceRun = this.ledger.getRun(sourceRunId);
@@ -624,7 +631,7 @@ export class CounterfactualManager {
     }
   }
   async execute(groupId: string, { executor, proof, capabilities, policy, workspaceRoot = this.ledger.workspaceRoot }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "counterfactual");
+    requireExperimental(this.featureFlags, "counterfactual", this.ledger);
     if (typeof executor !== "function") throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual execution requires an executor");
     const rows = this.ledger.database.db.prepare("SELECT c.*, r.workspace_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id WHERE c.group_id = ? ORDER BY c.id").all(groupId);
     if (!rows.length) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual group not found");
@@ -682,9 +689,9 @@ export class CounterfactualManager {
     this.ledger.database.db.prepare("UPDATE counterfactual_groups SET status = 'executed' WHERE id = ?").run(groupId);
     return { groupId, results };
   }
-  compare(groupId: string) { requireExperimental(this.featureFlags, "counterfactual"); const rows = this.ledger.database.db.prepare("SELECT c.*, c.status AS candidate_status, r.status AS run_status, r.workspace_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id WHERE c.group_id = ? ORDER BY c.id").all(groupId) as AnyRecord[]; return { groupId, candidates: rows.map((row: AnyRecord) => ({ ...row, status: row.candidate_status, runStatus: row.run_status, plan: parse(row.plan_json), proof: this.ledger.database.db.prepare("SELECT status, COUNT(*) count FROM assertion_results WHERE run_id = ? GROUP BY status").all(row.run_id) })) }; }
+  compare(groupId: string) { requireExperimental(this.featureFlags, "counterfactual", this.ledger); const rows = this.ledger.database.db.prepare("SELECT c.*, c.status AS candidate_status, r.status AS run_status, r.workspace_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id WHERE c.group_id = ? ORDER BY c.id").all(groupId) as AnyRecord[]; return { groupId, candidates: rows.map((row: AnyRecord) => ({ ...row, status: row.candidate_status, runStatus: row.run_status, plan: parse(row.plan_json), proof: this.ledger.database.db.prepare("SELECT status, COUNT(*) count FROM assertion_results WHERE run_id = ? GROUP BY status").all(row.run_id) })) }; }
   async commit(groupId: string, runId: string, { apply = false }: AnyRecord = {}) {
-    requireExperimental(this.featureFlags, "counterfactual");
+    requireExperimental(this.featureFlags, "counterfactual", this.ledger);
     const candidate = this.ledger.database.db.prepare("SELECT c.*, r.workspace_root AS candidate_root, parent.workspace_root AS source_root FROM counterfactual_candidates c JOIN runs r ON r.id = c.run_id JOIN runs parent ON parent.id = (SELECT source_run_id FROM counterfactual_groups WHERE id = c.group_id) WHERE c.group_id = ? AND c.run_id = ?").get(groupId, runId) as AnyRecord | undefined;
     if (!candidate) throw new OdinnRuntimeError("CAPSULE_INVALID", "counterfactual candidate not found");
     if (candidate.status !== "completed" && candidate.status !== "verified" && candidate.status !== "completed-unverified") throw new OdinnRuntimeError("WORKSPACE_CONFLICT", "only a completed candidate can be selected", { status: candidate.status });
@@ -726,5 +733,6 @@ async function syncWorkspace(source: string, destination: string) {
 
 export function createDifferentiatedRuntime({ stateDir = ".odinn", workspaceRoot = process.cwd(), featureFlags = {}, proofOptions = {} }: AnyRecord = {}) {
   const ledger = createRunLedger({ stateDir, workspaceRoot, featureFlags });
-  return { ledger, proof: new ProofEngine({ ledger, featureFlags, ...proofOptions }), sentinel: new Sentinel({ ledger, featureFlags }), capabilities: new CapabilityBroker({ ledger, stateDir, featureFlags }), snapshots: new SnapshotManager({ ledger, featureFlags }), capsules: new CapsuleManager({ ledger, stateDir, featureFlags }), counterfactual: new CounterfactualManager({ ledger, stateDir, featureFlags }), darwin: new DarwinRouter({ ledger, featureFlags }) };
+  const runtimeFlags = { ...featureFlags, __ledger: ledger };
+  return { ledger, proof: new ProofEngine({ ledger, featureFlags: runtimeFlags, ...proofOptions }), sentinel: new Sentinel({ ledger, featureFlags: runtimeFlags }), capabilities: new CapabilityBroker({ ledger, stateDir, featureFlags: runtimeFlags }), snapshots: new SnapshotManager({ ledger, featureFlags: runtimeFlags }), capsules: new CapsuleManager({ ledger, stateDir, featureFlags: runtimeFlags }), counterfactual: new CounterfactualManager({ ledger, stateDir, featureFlags: runtimeFlags }), darwin: new DarwinRouter({ ledger, featureFlags: runtimeFlags }) };
 }

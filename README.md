@@ -90,7 +90,7 @@ This is the shared foundation for the experimental Proof, Rewind, Sentinel, Caps
 ```bash
 pnpm odinn experimental status
 pnpm odinn experimental help proof
-pnpm odinn experimental enable proof
+pnpm odinn experimental enable proof --confirm-impact
 ```
 
 The existing `config experimental` and feature-specific commands remain available for scripts. The local console also provides an **Experimental Lab** for live gate status, recent runtime-ledger records, and operator-invoked actions against the same authenticated APIs; it never enables a feature silently. Read the feature notes under [docs/features](docs/features/) before enabling them. See [the event-ledger architecture note](docs/architecture/event-ledger.md).
@@ -206,7 +206,7 @@ Security controls are configurable:
 ```bash
 pnpm odinn config security show
 pnpm odinn config security set --surface web --allowed-domains docs.example.com
-pnpm odinn config security set --surface browser --require-approval false
+pnpm odinn config security set --surface browser --require-approval false --confirm-impact
 ```
 
 The last command weakens the default posture. That is intentional: the user owns the dangerous decision, and the configuration makes the decision visible.
@@ -304,6 +304,7 @@ pnpm release:package
 pnpm release:checksums
 node scripts/release/verify.ts
 pnpm release:install-smoke
+pnpm release:soak
 pnpm storage:drill
 ```
 
@@ -325,7 +326,7 @@ Opt-in multi-user host:
 ODINN_HOST_STATE=/srv/odinn ODINN_USER_PASSWORD='use-a-password-manager' \
   node apps/gateway/src/host.ts user-add --id alice --workspace /srv/workspaces/alice
 
-ODINN_HOST=0.0.0.0 ODINN_PORT=443 ODINN_HOST_STATE=/srv/odinn \
+ODINN_CONFIRM_IMPACT=true ODINN_HOST=0.0.0.0 ODINN_PORT=443 ODINN_HOST_STATE=/srv/odinn \
 ODINN_PUBLIC_ORIGIN=https://odinn.example.com \
 ODINN_TLS_CERT=/etc/letsencrypt/live/odinn.example.com/fullchain.pem \
 ODINN_TLS_KEY=/etc/letsencrypt/live/odinn.example.com/privkey.pem \

@@ -5,7 +5,7 @@ Proof is an experimental, evidence-backed verification layer. A model response c
 Enable it explicitly:
 
 ```bash
-odinn config experimental enable proof
+odinn config experimental enable proof --confirm-impact
 ```
 
 Contracts use `schemaVersion: 1` and support exact-allowlisted command arrays, root-confined file assertions, bounded HTTP `GET`/`HEAD` assertions, and fixed Git working-tree assertions. Command assertions are denied by default. An operator may place exact argument vectors in `proof.allowedCommands` in the state `config.json`; allowing an executable name alone is deliberately unsupported. Approved commands receive a minimal environment without provider credentials or the parent process environment. Command and response output is bounded and captured as content-addressed evidence, and timed-out or flooding commands have their process tree terminated.

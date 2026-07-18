@@ -9,6 +9,19 @@ const files = (await readdir(directory))
   .filter((name: any) => name !== "SHA256SUMS.txt")
   .sort();
 
+const manifestPath = join(directory, "release-manifest.json");
+const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+manifest.archiveSha256 = Object.fromEntries(await Promise.all((manifest.artifacts ?? []).map(async (name: string) => [
+  name,
+  createHash("sha256").update(await readFile(join(directory, name))).digest("hex")
+])));
+await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+const provenancePath = join(directory, manifest.provenance ?? "release-provenance.json");
+const provenance = JSON.parse(await readFile(provenancePath, "utf8"));
+provenance.archiveSha256 = manifest.archiveSha256;
+provenance.checksumFile = "SHA256SUMS.txt";
+await writeFile(provenancePath, `${JSON.stringify(provenance, null, 2)}\n`);
+
 const lines = [];
 for (const name of files) {
   const digest = createHash("sha256").update(await readFile(join(directory, name))).digest("hex");

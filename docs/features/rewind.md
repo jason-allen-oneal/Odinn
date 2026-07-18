@@ -3,7 +3,7 @@
 Rewind snapshots selected local files before mutation. Snapshots store content-addressed artifacts and original existence, mode, and digest metadata. The default CLI operation is a dry-run; `--apply` performs restoration.
 
 ```bash
-odinn config experimental enable rewind
+odinn config experimental enable rewind --confirm-impact
 odinn checkpoint create <run-id> --path src,tests --label before-change
 odinn rewind <snapshot-id>
 odinn rewind <snapshot-id> --apply

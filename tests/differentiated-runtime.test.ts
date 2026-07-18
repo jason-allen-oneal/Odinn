@@ -159,3 +159,22 @@ test("kernel execution enforces Sentinel and capability tokens at the real tool 
     assert.doesNotMatch(JSON.stringify(runtime.ledger.getRun("run-kernel-cap")), new RegExp(issued.token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   } finally { runtime.ledger.close(); }
 });
+
+test("every experimental runtime gate rejects disabled features and records a durable rejection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-diff-disabled-"));
+  const state = join(root, ".odinn");
+  const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags: { proof: false, rewind: false, sentinel: false, capsules: false, darwin: false, capabilities: false, counterfactual: false } });
+  try {
+    await assert.rejects(runtime.proof.run("disabled-proof", { version: 1, goal: "blocked", acceptance: [{ id: "a", type: "file", path: "missing", expect: { exists: false } }] }), /experimental\.proof is disabled/);
+    assert.throws(() => runtime.sentinel.evaluate({ runId: "disabled-sentinel", toolName: "text.echo", input: {}, policy: { version: 1, invariants: [] } }), /experimental\.sentinel is disabled/);
+    assert.throws(() => runtime.capabilities.issue({ runId: "disabled-cap", stepId: "step", toolName: "text.echo" }), /experimental\.capabilities is disabled/);
+    assert.throws(() => runtime.snapshots.create({ runId: "disabled-rewind", stepId: "step", paths: ["README.md"], workspaceRoot: root }), /experimental\.rewind is disabled/);
+    await assert.rejects(runtime.capsules.verify(join(root, "missing.odinn")), /experimental\.capsules is disabled/);
+    await assert.rejects(runtime.counterfactual.create({ sourceRunId: "disabled-counterfactual", sourceStepId: "step", workspaceRoot: root, plans: [] }), /experimental\.counterfactual is disabled/);
+    assert.throws(() => runtime.darwin.choose("general", { pinnedModel: "pinned:model" }), /experimental\.darwin is disabled/);
+    for (const feature of ["proof", "sentinel", "capabilities", "rewind", "capsules", "counterfactual", "darwin"]) {
+      const run = runtime.ledger.getRun(`system:experimental:${feature}`);
+      assert.ok(run?.events.some((event: any) => event.type === "experimental-feature-rejected" && event.payload.feature === feature));
+    }
+  } finally { runtime.ledger.close(); }
+});

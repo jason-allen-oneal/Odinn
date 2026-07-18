@@ -12,6 +12,11 @@ test("native installer upgrades by atomic pointer and rolls back to the previous
   const prefix = await mkdtemp(join(tmpdir(), "odinn-native-install-"));
   run(["install", "--source", root, "--prefix", prefix, "--version", "0.1.0", "--skip-deps"]);
   const first = JSON.parse(await readFile(join(prefix, "install-state.json"), "utf8"));
+  const metadata = JSON.parse(await readFile(join(prefix, "versions", first.current, "install-metadata.json"), "utf8"));
+  assert.equal(metadata.version, "0.1.0");
+  assert.match(metadata.lockfileSha256, /^[a-f0-9]{64}$/);
+  assert.equal(metadata.toolchain.node, process.version);
+  assert.equal(metadata.toolchain.packageManager, "pnpm@10.14.0");
   run(["upgrade", "--source", root, "--prefix", prefix, "--version", "0.1.1", "--skip-deps"]);
   const upgraded = JSON.parse(await readFile(join(prefix, "install-state.json"), "utf8"));
   assert.notEqual(upgraded.current, first.current);

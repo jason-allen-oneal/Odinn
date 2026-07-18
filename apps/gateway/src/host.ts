@@ -274,6 +274,10 @@ if (isMain) {
   const host = process.env.ODINN_HOST || "127.0.0.1";
   const port = Number(process.env.ODINN_PORT || 18791);
   const remote = !["127.0.0.1", "::1", "localhost"].includes(host);
+  if (process.env.ODINN_CONFIRM_IMPACT !== "true") {
+    console.error("Multi-user host impact summary\n\nAuthority changes: starts an authenticated multi-user service with separate application-level tenant state and loopback gateways.\nApproval gates: TLS, public-origin, password, session, quota, and tenant routing controls remain active; this is not hostile-user operating-system isolation.\nRollback or disable: stop the host and remove or disable its configuration; tenant state remains on disk until deliberately removed.\nAudit record: each tenant audit journal and the host state directory retain the operational records.\n\nExplicit confirmation required: set ODINN_CONFIRM_IMPACT=true after reviewing this summary.");
+    throw new Error("impact confirmation required for multi-user-host");
+  }
   const cert = process.env.ODINN_TLS_CERT; const key = process.env.ODINN_TLS_KEY;
   if (remote && (!cert || !key || !process.env.ODINN_PUBLIC_ORIGIN)) throw new Error("remote hosting requires ODINN_TLS_CERT, ODINN_TLS_KEY, and ODINN_PUBLIC_ORIGIN");
   const tls = cert && key ? { cert: await readFile(cert), key: await readFile(key) } : undefined;

@@ -721,7 +721,8 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
         runLedger: context.runLedger,
         policy: context.policy,
         signal: context.signal,
-        onModelDelta: context.onModelDelta
+        onModelDelta: context.onModelDelta,
+        onProviderAttempt: context.onProviderAttempt
       })
     }],
     ["model.chat", {
@@ -732,7 +733,7 @@ export function createBuiltInRegistry({ workspaceRoot = process.cwd(), stateDir 
           ? { retries: config.runtime.modelRetries }
           : {}),
         ...input
-      }, { stateDir, signal: context.signal, onDelta: context.onModelDelta })
+      }, { stateDir, signal: context.signal, onDelta: context.onModelDelta, onProviderAttempt: context.onProviderAttempt })
     }],
     ["memory.remember", {
       capability: "memory.write",
@@ -1649,7 +1650,7 @@ const AGENT_TOOL_SCHEMAS = [
   ,{ type: "function", function: { name: "browser.recovery.status", description: "Inspect an uncertain browser mutation after a crash or failed action.", parameters: { type: "object", properties: {} } } }
 ];
 
-async function runAgent(modelConfig: any, input: any = {}, { stateDir, memoryStore, registry, runTool, runLedger, policy, signal, onModelDelta }: any = {}) {
+async function runAgent(modelConfig: any, input: any = {}, { stateDir, memoryStore, registry, runTool, runLedger, policy, signal, onModelDelta, onProviderAttempt }: any = {}) {
   const messages = Array.isArray(input.messages) ? input.messages.map((message: any) => ({ ...message })) : [{ role: "user", content: cleanRequired(input.prompt, "agent.run requires prompt") }];
   const memoryOptions = normalizeMemoryOptions(input.memory);
   const policyAllows = (toolName: string, toolInput: any = {}) => evaluateTaskPolicy({
@@ -1686,7 +1687,7 @@ async function runAgent(modelConfig: any, input: any = {}, { stateDir, memorySto
   let aggregateUsage;
   for (let turn = 0; turn < maxTurns; turn += 1) {
     throwIfAborted(signal);
-    const result: any = await chatWithModel(modelConfig, { model: input.model, messages, tools: availableTools, stream: true }, { stateDir, signal, onDelta: onModelDelta });
+    const result: any = await chatWithModel(modelConfig, { model: input.model, messages, tools: availableTools, stream: true }, { stateDir, signal, onDelta: onModelDelta, onProviderAttempt });
     aggregateUsage = mergeUsage(aggregateUsage, result.usage);
     if (!result.toolCalls?.length) return { ...result, ...(aggregateUsage ? { usage: aggregateUsage } : {}), memory: { recalled: recalled.memories.length, learned: learned.learned.length, compacted: compacted?.duplicate ? 0 : compacted ? 1 : 0 } };
     messages.push({ role: "assistant", content: result.content || "", tool_calls: result.toolCalls });
@@ -1729,7 +1730,8 @@ export async function runTask({
   now = () => new Date().toISOString(),
   signal,
   runLedger,
-  onModelDelta
+  onModelDelta,
+  onProviderAttempt
 }: any) {
   const request = normalizeTaskRequest(task);
   const tool = registry.get(request.tool);
@@ -1855,6 +1857,7 @@ export async function runTask({
       auditStore,
       signal,
       onModelDelta,
+      onProviderAttempt: async (attempt: any) => auditStore.append({ at: now(), runId: request.id, type: "provider.attempt", actor: request.actor, tool: request.tool, capability: tool.capability, decision: "allow", data: attempt }),
       runLedger,
       capability: capabilityClaims,
       runTool: (nestedTask: any) => runTask({
@@ -1865,7 +1868,8 @@ export async function runTask({
         now,
         signal,
         runLedger: nestedTask.runLedger ?? runLedger,
-        onModelDelta
+        onModelDelta,
+        onProviderAttempt
       })
     });
     throwIfAborted(signal);
@@ -1982,7 +1986,7 @@ export function createAuditStore(path: any = ".odinn/audit.jsonl") {
   return new FileAuditStore(path);
 }
 
-async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, signal, onDelta }: any = {}) {
+async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, signal, onDelta, onProviderAttempt }: any = {}) {
   const modelRef = modelString(input.model, modelConfig.defaultModel);
   if (!modelRef) {
     throw new Error("no model configured; run `odinn onboard --provider openai` or `odinn onboard --provider ollama --model <installed-model>`");
@@ -2073,17 +2077,24 @@ async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, sign
     let response;
     let payload;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-      response = await fetch(`${baseUrl}/${isResponsesTransport ? "responses" : "chat/completions"}`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(requestBody),
-        signal: controller.signal
-      });
-      payload = isChatGptResponsesTransport
-        ? await readResponsesModelResponse(response, onDelta)
-        : streamRequested
-          ? await readStreamingChatResponse(response, onDelta)
-          : await readModelResponse(response);
+      const attemptId = `provider_attempt_${randomUUID()}`;
+      try {
+        response = await fetch(`${baseUrl}/${isResponsesTransport ? "responses" : "chat/completions"}`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(requestBody),
+          signal: controller.signal
+        });
+        payload = isChatGptResponsesTransport
+          ? await readResponsesModelResponse(response, onDelta)
+          : streamRequested
+            ? await readStreamingChatResponse(response, onDelta)
+            : await readModelResponse(response);
+        await onProviderAttempt?.({ attemptId, providerId: parsed.provider, modelId: parsed.model, attempt: attempt + 1, status: response.status, retryable: !response.ok && isRetryableProviderStatus(response.status) });
+      } catch (error) {
+        await onProviderAttempt?.({ attemptId, providerId: parsed.provider, modelId: parsed.model, attempt: attempt + 1, status: "error", retryable: true });
+        throw error;
+      }
       if (response.ok || !isRetryableProviderStatus(response.status) || attempt === maxRetries) break;
       await waitForRetry(response, attempt, controller.signal);
     }

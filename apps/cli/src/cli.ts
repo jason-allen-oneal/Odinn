@@ -3,10 +3,10 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
-import { createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
 import { isPromptCancelled, TerminalPrompter } from "./onboarding/prompts.ts";
@@ -136,6 +136,61 @@ Hard limits:
 See docs/BETA-3-SURFACE-MATRIX.md for the operator-facing surface matrix.`;
 }
 
+const DANGEROUS_IMPACT_SUMMARIES = Object.freeze({
+  "multi-user-host": {
+    title: "Multi-user host impact summary",
+    authority: "Starts a host that accepts multiple authenticated users and creates separate application-level tenant gateways, state roots, workspaces, browser profiles, and quotas.",
+    approvals: "TLS, public-origin, password, session, quota, and tenant routing controls remain active; this does not create hostile-user operating-system isolation.",
+    rollback: "Stop the host and remove or disable the host configuration. Tenant application state remains on disk until the operator removes it deliberately.",
+    audit: "Per-tenant audit records are stored under the configured host state directory; host login throttles and sessions are stored there as well."
+  },
+  "unconfined-process": {
+    title: "Unconfined extension impact summary",
+    authority: "Runs trusted extension code as the current Odinn operating-system user with that user's filesystem and network authority; it is not a security sandbox.",
+    approvals: "Manifest trust, entrypoint integrity, explicit capability grants, and the audited execution boundary remain required. Container restrictions do not apply to this adapter.",
+    rollback: "Disable or roll back the extension registry entry. This cannot undo external effects already caused by the process.",
+    audit: "Execution records are written to the configured Odinn audit journal, normally .odinn/audit.jsonl."
+  },
+  "network-capability": {
+    title: "Network capability impact summary",
+    authority: "Expands web or browser egress, or permits private-network targets, beyond the safe default boundary.",
+    approvals: "Domain, private-network, and browser-mutation approval checks remain explicit; allowing private networks increases exposure to local services and metadata endpoints.",
+    rollback: "Set the changed security option back to false and restart the gateway where required. Existing external requests cannot be rolled back.",
+    audit: "Requests and policy decisions are recorded in the configured Odinn audit journal without storing credentials or raw secrets."
+  },
+  "autonomous-self-improvement": {
+    title: "Autonomous self-improvement impact summary",
+    authority: "Allows the bounded self-improvement controller to apply allowlisted runtime tuning without a separate approval for every proposal.",
+    approvals: "The allowlist, Sentinel, capability policy, credentials, extensions, and approval policy remain protected; this is not arbitrary code or policy mutation.",
+    rollback: "Each applied change must have a captured configuration snapshot and can be reverted through the improvement rollback path.",
+    audit: "Proposals, decisions, snapshots, applications, failures, and rollbacks are recorded in the configured Odinn audit journal and improvement store."
+  },
+  "browser-mutation": {
+    title: "External browser mutation impact summary",
+    authority: "Permits an approved browser action to change state on an external website or connected service.",
+    approvals: "The browser approval gate, stale-snapshot checks, recovery journal, and egress policy remain active. An interrupted action blocks subsequent mutations until resolved.",
+    rollback: "Odinn can block and document uncertain outcomes, but it cannot guarantee reversal of remote changes, purchases, messages, or other external effects.",
+    audit: "The audit journal and browser-recovery journal retain the action decision and recovery record; prompts, cookies, and tokens are not included in the summary."
+  },
+  "experimental-replay": {
+    title: "Experimental replay and restore impact summary",
+    authority: "Enables local Proof, Rewind, Capsules, or Counterfactual operations that read, copy, verify, restore, or replay bounded local run data.",
+    approvals: "Feature flags remain individually persisted and disabled by default. Full capsule replay and destructive restores retain their own explicit checks and approval gates.",
+    rollback: "Disable the feature or restore the local workspace from a verified snapshot. Remote effects and nondeterministic provider behavior are outside deterministic rollback guarantees.",
+    audit: "Run-ledger events, evidence, snapshots, and replay decisions are stored in the configured Odinn state directory and audit journal."
+  }
+});
+
+function impactSummary(kind: keyof typeof DANGEROUS_IMPACT_SUMMARIES) {
+  const summary = DANGEROUS_IMPACT_SUMMARIES[kind];
+  return `${summary.title}\n\nAuthority changes: ${summary.authority}\nApproval gates: ${summary.approvals}\nRollback or disable: ${summary.rollback}\nAudit record: ${summary.audit}`;
+}
+
+function requireImpactConfirmation(args: any[], kind: keyof typeof DANGEROUS_IMPACT_SUMMARIES) {
+  console.error(`${impactSummary(kind)}\n\nExplicit confirmation required: pass --confirm-impact after reviewing this summary.`);
+  if (!hasFlag(args, "--confirm-impact")) throw new Error(`impact confirmation required for ${kind}`);
+}
+
 async function main() {
   switch (command) {
     case "init":
@@ -167,6 +222,8 @@ async function main() {
       await extensionCommand(args);
       break;
     case "doctor":
+      await printJson(await doctor(args));
+      break;
     case "status":
       await printJson(await status(args));
       break;
@@ -281,22 +338,22 @@ Usage:
   odinn config provider catalog
   odinn config provider remove <name> [--state .odinn]
   odinn config security show [--state .odinn]
-  odinn config security set --surface web|browser [--enabled true|false] [--allow-private-network true|false] [--allowed-domains a,b] [--blocked-domains a,b] [--require-approval true|false] [--state .odinn]
+  odinn config security set --surface web|browser [--enabled true|false] [--allow-private-network true|false] [--allowed-domains a,b] [--blocked-domains a,b] [--require-approval true|false] [--confirm-impact] [--state .odinn]
   odinn config experimental show [--state .odinn]
-  odinn config experimental enable|disable <feature> [--state .odinn]
+  odinn config experimental enable|disable <feature> [--confirm-impact] [--state .odinn]
   odinn experimental help [proof|sentinel|capabilities|rewind|capsules|counterfactual|darwin|self-improvement]
   odinn experimental list|status [feature] [--state .odinn]
-  odinn experimental enable|disable <feature> [--state .odinn]
+  odinn experimental enable|disable <feature> [--confirm-impact] [--state .odinn]
   odinn experimental <feature> <action> [options]
   odinn config self-improvement show [--state .odinn]
-  odinn config self-improvement set [--enabled true|false] [--mode disabled|propose|auto] [--interval-ms <ms>] [--max-changes <count>] [--state .odinn]
+  odinn config self-improvement set [--enabled true|false] [--mode disabled|propose|auto] [--interval-ms <ms>] [--max-changes <count>] [--confirm-impact] [--state .odinn]
   odinn auth import openclaw [--provider openai] [--profile <id-or-email>] [--source <path>] [--state .odinn]
   odinn import openclaw|hermes [--source <path>] [--auth-only|--skills-only] [--dry-run] [--state .odinn]
   odinn state backup --output <directory> [--state .odinn]
   odinn state restore --input <directory> --confirm [--state .odinn]
   odinn extension install --manifest <manifest.json> [--state .odinn]
   odinn extension list [--state .odinn]
-  odinn extension enable --id <id> --grant <capability[,capability]> [--trust] [--allow-unsafe-sandbox] [--state .odinn]
+  odinn extension enable --id <id> --grant <capability[,capability]> [--trust] [--allow-unsafe-sandbox] [--confirm-impact] [--state .odinn]
   odinn extension disable --id <id> [--reason <text>] [--state .odinn]
   odinn extension rollback --id <id> [--state .odinn]
   odinn extension run --id <id> --input-json <json> [--capability <capability>] [--capability-token <token>] [--state .odinn]
@@ -1104,6 +1161,70 @@ async function status(args: any) {
   };
 }
 
+async function readJsonIfPresent(path: string, fallback: any) {
+  try { return JSON.parse(await readFile(path, "utf8")); }
+  catch (error: any) { if (error?.code === "ENOENT") return fallback; throw error; }
+}
+
+async function doctor(args: any) {
+  const state = stateDir(args);
+  await recoverInterruptedOnboardingTransactions(state);
+  const config = await readConfig(state);
+  const normalizedModels = normalizeModelConfig(config);
+  const auditPath = join(state, config.auditLog ?? "audit.jsonl");
+  const auditStore = createAuditStore(auditPath);
+  let audit = { valid: true, events: 0, unsigned: 0, failures: [] as any[] };
+  try {
+    const auditExists = await access(auditPath).then(() => true).catch(() => false);
+    if (auditExists) {
+      const verification: any = await auditStore.verifyIntegrity({ allowUnsigned: true });
+      audit = { valid: verification.valid, events: verification.events, unsigned: verification.unsigned, failures: verification.failures ?? [] };
+    }
+  } catch (error) {
+    audit = { valid: false, events: 0, unsigned: 0, failures: [{ reason: "audit verification unavailable" }] };
+  }
+  const approvals = createApprovalStore({ path: join(state, "approvals.json") });
+  const pendingApprovals = approvals.list();
+  const jobsState = await readJsonIfPresent(join(state, "jobs.json"), { jobs: {} });
+  const jobs = Object.values(jobsState?.jobs ?? {}) as any[];
+  const jobCounts = {
+    queued: jobs.filter((job) => job.status === "queued").length,
+    running: jobs.filter((job) => job.status === "running").length,
+    failed: jobs.filter((job) => job.status === "failed").length,
+    needsReview: jobs.filter((job) => job.status === "needs-review").length,
+    completed: jobs.filter((job) => job.status === "completed").length
+  };
+  const recovery = await readJsonIfPresent(join(state, "browser-recovery.json"), { status: "clear" });
+  let ownerOnly = false;
+  try { ownerOnly = ((await statPath(state)).mode & 0o077) === 0; } catch {}
+  let version = "unknown";
+  try { version = JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")).version ?? version; } catch {}
+  let commit = process.env.ODINN_COMMIT ?? "";
+  if (!commit) {
+    try { commit = JSON.parse(await readFile(new URL("../../../install-metadata.json", import.meta.url), "utf8")).commit ?? ""; } catch {}
+  }
+  return {
+    ok: audit.valid,
+    command: "doctor",
+    version,
+    commit: commit || "unknown",
+    platform: { os: process.platform, arch: process.arch, node: process.version },
+    providerMode: await Promise.all(Object.entries(normalizedModels.providers ?? {}).map(async ([name, provider]: any) => ({
+      name,
+      type: provider.type ?? "openai-compatible",
+      authMode: provider.auth?.mode ?? "api-key",
+      configured: provider.auth?.mode === "oauth" ? await oauthTokenExists(provider, state) : !provider.apiKeyEnv || Boolean(process.env[provider.apiKeyEnv]),
+      models: provider.models ?? []
+    }))),
+    experimental: normalizeExperimentalFlags(config.experimental),
+    audit: { valid: audit.valid, events: audit.events, unsigned: audit.unsigned, failureCount: audit.failures.length },
+    approvals: { pending: pendingApprovals.length, ids: pendingApprovals.map((approval: any) => approval.id) },
+    browserRecovery: { status: recovery.status ?? "clear", pending: ["executing", "unknown"].includes(recovery.status), id: recovery.id ?? undefined },
+    jobs: { total: jobs.length, ...jobCounts },
+    state: { ownerOnly, runtimeStateOutsideSourceCheckout: true, secretsExcludedFromDiagnostics: true }
+  };
+}
+
 async function verifyConfiguredModel(state: any, config: any) {
   const normalized = normalizeModelConfig(config);
   if (!normalized.defaultModel) {
@@ -1245,7 +1366,7 @@ inspection, proposals, and dry-run previews stay separate from mutating operatio
 Commands:
   odinn experimental list [--state .odinn]
   odinn experimental status [feature] [--state .odinn]
-  odinn experimental enable|disable <feature> [--state .odinn]
+  odinn experimental enable|disable <feature> [--confirm-impact] [--state .odinn]
   odinn experimental help <feature>
   odinn experimental <feature> <action> [options]
 
@@ -1270,6 +1391,9 @@ async function setExperimentalFeatureFlag(state: any, config: any, feature: any,
 async function toggleExperimentalFeature(requestedFeature: any, enabled: boolean, args: any) {
   const feature = normalizeExperimentalHomeFeature(requestedFeature);
   if (!feature) throw new Error(`unknown experimental feature: ${requestedFeature}`);
+  if (enabled && feature !== "self-improvement") {
+    requireImpactConfirmation(args, "experimental-replay");
+  }
   if (feature === "self-improvement") {
     const state = stateDir(args);
     const config = await readConfig(state);
@@ -1387,6 +1511,7 @@ async function configCommand(args: any) {
     const enabled = option(rest, "--enabled", "");
     const mode = option(rest, "--mode", current.mode);
     if (!["disabled", "propose", "auto"].includes(mode)) throw new Error("--mode requires disabled, propose, or auto");
+    if (enabled === "true" || mode === "auto") requireImpactConfirmation(rest, "autonomous-self-improvement");
     config.selfImprovement = normalizeSelfImprovementConfig({
       ...current,
       mode,
@@ -1406,6 +1531,7 @@ async function configCommand(args: any) {
     if (subcommand === "show" || !subcommand) { await printJson(normalizeExperimentalFlags(config.experimental)); return; }
     if (subcommand !== "enable" && subcommand !== "disable") throw new Error("config experimental requires show, enable, or disable");
     const feature = rest[0];
+    if (subcommand === "enable") requireImpactConfirmation(rest.slice(1), "experimental-replay");
     await setExperimentalFeatureFlag(state, config, feature, subcommand === "enable");
     return;
   }
@@ -1464,6 +1590,12 @@ async function configSecurityCommand(state: any, config: any, subcommand: any, a
   const surface = option(args, "--surface", "");
   if (!['web', 'browser'].includes(surface)) throw new Error("config security set requires --surface web|browser");
   const current: any = { ...(policy.security as any)[surface] };
+  const impact = surface === "browser" ? "browser-mutation" : "network-capability";
+  const broadensAuthority = ["--enabled", "--allow-private-network", "--require-approval"].some((flag) => {
+    const value = option(args, flag, "");
+    return (flag === "--require-approval" && value === "false") || value === "true";
+  });
+  if (broadensAuthority) requireImpactConfirmation(args, impact);
   for (const field of ["enabled", "allowPrivateNetwork", "requireApproval"]) {
     if (field === "requireApproval" && surface !== "browser") continue;
     const value = option(args, `--${kebabCase(field)}`, "");
@@ -2366,11 +2498,18 @@ async function extensionCommand(args: any) {
       await printJson({ extensions: await registry.list() });
       break;
     case "enable":
+      {
+        const id = option(rest, "--id");
+        const existing = await registry.get(id);
+        if (existing?.sandbox === "unconfined-process" || hasFlag(rest, "--allow-unsafe-sandbox")) {
+          requireImpactConfirmation(rest, "unconfined-process");
+        }
       await printJson(await registry.enable(option(rest, "--id"), {
         grants: splitCsv(option(rest, "--grant", "")),
         trust: hasFlag(rest, "--trust"),
         allowUnsafeSandbox: hasFlag(rest, "--allow-unsafe-sandbox")
       }));
+      }
       break;
     case "disable":
       await printJson(await registry.disable(option(rest, "--id"), option(rest, "--reason", "operator disabled")));

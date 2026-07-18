@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmod, cp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, chmod, cp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -12,7 +12,7 @@ const statePath = join(prefix, "install-state.json");
 if (command === "install" || command === "upgrade") await install(command);
 else if (command === "rollback") await rollback();
 else if (command === "status") console.log(JSON.stringify(await readState(), null, 2));
-else throw new Error("usage: install.ts install|upgrade|rollback|status [--source DIR] [--prefix DIR] [--version VERSION] [--skip-deps]");
+else throw new Error("usage: install.ts install|upgrade|rollback|status [--source DIR] [--prefix DIR] [--version VERSION] [--commit SHA] [--artifact-sha256 HASH] [--skip-deps]");
 
 async function install(operation: any) {
   const source = resolve(option("--source", process.cwd()));
@@ -20,7 +20,12 @@ async function install(operation: any) {
   if (pkg.name !== "odinn") throw new Error("install source is not an Odinn Forge package");
   const version = option("--version", pkg.version);
   if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) throw new Error("invalid Odinn Forge version");
-  const identity = createHash("sha256").update(await readFile(join(source, "pnpm-lock.yaml"))).digest("hex").slice(0, 12);
+  const lockfileSha256 = createHash("sha256").update(await readFile(join(source, "pnpm-lock.yaml"))).digest("hex");
+  const commit = option("--commit", process.env.ODINN_RELEASE_COMMIT || pkg.odinnCommit || "unknown");
+  const artifactSha256 = option("--artifact-sha256", process.env.ODINN_ARTIFACT_SHA256 || "unknown");
+  const toolchain = { node: process.version, packageManager: pkg.packageManager || "unknown" };
+  const toolchainSha256 = createHash("sha256").update(JSON.stringify(toolchain)).digest("hex");
+  const identity = `${lockfileSha256.slice(0, 12)}-${String(commit).slice(0, 12)}-${toolchainSha256.slice(0, 12)}`;
   const versionId = `${version}-${identity}`;
   const versions = join(prefix, "versions");
   const destination = join(versions, versionId);
@@ -29,8 +34,18 @@ async function install(operation: any) {
   await rm(staging, { recursive: true, force: true });
   await cp(source, staging, { recursive: true, filter: (path: any) => !excluded(path, source) });
   if (!has("--skip-deps")) run(process.platform === "win32" ? "corepack.cmd" : "corepack", ["pnpm", "install", "--frozen-lockfile"], staging);
-  await rm(destination, { recursive: true, force: true });
-  await rename(staging, destination);
+  const metadata = { schemaVersion: 1, version, commit, lockfileSha256, artifactSha256, toolchain, installedAt: new Date().toISOString() };
+  await writeFile(join(staging, "install-metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 });
+  const destinationExists = await access(destination).then(() => true).catch(() => false);
+  if (destinationExists) {
+    const existing = JSON.parse(await readFile(join(destination, "install-metadata.json"), "utf8"));
+    if (existing.version !== metadata.version || existing.commit !== metadata.commit || existing.lockfileSha256 !== metadata.lockfileSha256 || existing.artifactSha256 !== metadata.artifactSha256 || JSON.stringify(existing.toolchain) !== JSON.stringify(metadata.toolchain)) {
+      throw new Error(`immutable Odinn version directory already exists with different release identity: ${versionId}`);
+    }
+    await rm(staging, { recursive: true, force: true });
+  } else {
+    await rename(staging, destination);
+  }
   const previous = await readState();
   const next = { schemaVersion: 1, current: versionId, previous: previous.current && previous.current !== versionId ? previous.current : previous.previous ?? null, installedAt: new Date().toISOString(), operation };
   await writeState(next);

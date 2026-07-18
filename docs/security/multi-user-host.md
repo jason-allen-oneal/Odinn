@@ -7,7 +7,7 @@ The default Ódinn Forge gateway is a single-user loopback service and must not 
 Passwords are read from the environment and stored only as scrypt hashes in an owner-only user database:
 
 ```bash
-ODINN_HOST_STATE=/srv/odinn-host \
+ODINN_CONFIRM_IMPACT=true ODINN_HOST_STATE=/srv/odinn-host \
 ODINN_USER_PASSWORD='use-a-password-manager-generated-secret' \
 node apps/gateway/src/host.ts user-add \
   --id alice \
@@ -19,7 +19,7 @@ There is no public signup endpoint. Provisioning is an operator action.
 ## Start the host
 
 ```bash
-ODINN_HOST_STATE=/srv/odinn-host \
+ODINN_CONFIRM_IMPACT=true ODINN_HOST_STATE=/srv/odinn-host \
 ODINN_HOST=0.0.0.0 \
 ODINN_PORT=18791 \
 ODINN_PUBLIC_ORIGIN=https://odinn.example.com \

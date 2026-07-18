@@ -86,10 +86,19 @@ async function workspacePackageCount() {
   return count;
 }
 
-function runWorkspaceScript(script: any) {
+async function workspaceFilters() {
+  const filters = [];
+  for (const base of ["apps", "packages", "adapters"]) {
+    if (existsSync(join(root, base))) filters.push(`./${base}/**`);
+  }
+  return filters;
+}
+
+async function runWorkspaceScript(script: any) {
+  const filters = await workspaceFilters();
   const result = spawnSync(
     "pnpm",
-    ["--recursive", "--if-present", "--filter", "./apps/**", "--filter", "./packages/**", "--filter", "./adapters/**", "run", script],
+    ["--recursive", "--if-present", ...filters.flatMap((filter) => ["--filter", filter]), "run", script],
     { cwd: root, encoding: "utf8", shell: process.platform === "win32" }
   );
   if (result.stdout) process.stdout.write(result.stdout);
@@ -100,7 +109,7 @@ function runWorkspaceScript(script: any) {
 async function typecheck() {
   const rootPackage = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
   if (rootPackage.engines?.node !== ">=24.0.0") fail(["package.json: engines.node must remain >=24.0.0"]);
-  if (await workspacePackageCount()) runWorkspaceScript("typecheck");
+  if (await workspacePackageCount()) await runWorkspaceScript("typecheck");
   for (const config of ["tsconfig.tools.json"]) {
     const tools = spawnSync("pnpm", ["exec", "tsc", "-p", config], {
       cwd: root,
@@ -115,7 +124,7 @@ async function typecheck() {
 }
 
 async function build() {
-  if (await workspacePackageCount()) runWorkspaceScript("build");
+  if (await workspacePackageCount()) await runWorkspaceScript("build");
   const result = spawnSync("git", ["ls-files", "-z"], { cwd: root, encoding: "buffer" });
   if (result.status !== 0) throw new Error("git ls-files failed");
   const files = result.stdout.toString("utf8").split("\0").filter(Boolean).sort();

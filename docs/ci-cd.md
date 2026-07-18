@@ -106,6 +106,7 @@ pnpm release:package
 pnpm release:checksums
 node scripts/release/verify.ts
 pnpm release:install-smoke
+pnpm release:soak
 ```
 
 Artifacts are written to `dist/release/`.

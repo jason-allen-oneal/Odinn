@@ -46,14 +46,20 @@ test("experimental CLI has a discoverable disabled-by-default control plane", as
   assert.ok(initial.features.every((feature: any) => feature.enabled === false));
   assert.equal(initial.features.find((feature: any) => feature.id === "self-improvement").mode, "propose");
 
-  const enabled = expectOk(invoke(workspace, ["experimental", "enable", "proof", "--state", state]));
+  const missingConfirmation = invoke(workspace, ["experimental", "enable", "proof", "--state", state]);
+  assert.equal(missingConfirmation.status, 1);
+  assert.match(missingConfirmation.stderr, /Explicit confirmation required/);
+  const enabled = expectOk(invoke(workspace, ["experimental", "enable", "proof", "--confirm-impact", "--state", state]));
   assert.equal(enabled.feature, "proof");
   assert.equal(enabled.enabled, true);
   const proofStatus = expectOk(invoke(workspace, ["experimental", "proof", "status", "--state", state]));
   assert.equal(proofStatus.features[0].enabled, true);
   assert.equal(proofStatus.features[0].configKey, "experimental.proof");
 
-  const improvement = expectOk(invoke(workspace, ["experimental", "enable", "self-improvement", "--state", state]));
+  const improvementMissingConfirmation = invoke(workspace, ["experimental", "enable", "self-improvement", "--state", state]);
+  assert.equal(improvementMissingConfirmation.status, 1);
+  assert.match(improvementMissingConfirmation.stderr, /Autonomous self-improvement impact summary/);
+  const improvement = expectOk(invoke(workspace, ["experimental", "enable", "self-improvement", "--confirm-impact", "--state", state]));
   assert.equal(improvement.selfImprovement.enabled, true);
   assert.equal(improvement.selfImprovement.mode, "propose");
 
@@ -102,7 +108,7 @@ test("experimental CLI routes every system to its real runtime implementation", 
   assert.match(directDisabledProof.stderr, /experimental\.proof is disabled/);
 
   for (const feature of ["proof", "sentinel", "capabilities", "rewind", "capsules", "counterfactual", "darwin"]) {
-    const toggled = expectOk(invoke(workspace, ["experimental", "enable", feature, "--state", state]));
+    const toggled = expectOk(invoke(workspace, ["experimental", "enable", feature, "--confirm-impact", "--state", state]));
     assert.equal(toggled.enabled, true);
   }
 

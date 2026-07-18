@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createServer as createProviderServer } from "node:http";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,16 +15,45 @@ const packageManager = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
 const startedAt = Date.now();
 const steps: any[] = [];
 
-function run(command: string, args: string[], cwd: string, extraEnv: Record<string, string> = {}) {
-  const result = spawnSync(command, args, {
-    cwd,
-    encoding: "utf8",
-    env: { ...process.env, ...extraEnv },
-    shell: process.platform === "win32",
-    timeout: 180_000
+async function run(command: string, args: string[], cwd: string, extraEnv: Record<string, string> = {}) {
+  return await new Promise<string>((resolveRun, rejectRun) => {
+    const child = spawn(command, args, {
+      cwd,
+      env: { ...process.env, ...extraEnv },
+      shell: process.platform === "win32",
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      if (!settled) {
+        settled = true;
+        rejectRun(new Error(`${command} ${args.join(" ")} timed out after 180000 ms`));
+      }
+    }, 180_000);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      rejectRun(new Error(`${command} ${args.join(" ")} failed: ${error.message}`));
+    });
+    child.once("close", (status, signal) => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      if (status !== 0) {
+        rejectRun(new Error(`${command} ${args.join(" ")} failed: ${stderr || stdout || `exit ${status ?? signal}`}`));
+        return;
+      }
+      resolveRun(stdout);
+    });
   });
-  if (result.error || result.status !== 0) throw new Error(`${command} ${args.join(" ")} failed: ${result.error?.message || result.stderr || result.stdout || `exit ${result.status}`}`);
-  return result.stdout;
 }
 
 async function listen(server: any) {
@@ -133,14 +162,18 @@ try {
   providerMode = "fail-once";
   providerRequests = 0;
   await record("provider-failure-retry-recovery", async () => {
-    const output = run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "run", "--tool", "model.chat", "--input-json", JSON.stringify({ retries: 1, messages: [{ role: "user", content: "retry" }] }), "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" });
+    const output = await run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "run", "--tool", "model.chat", "--input-json", JSON.stringify({ retries: 1, messages: [{ role: "user", content: "retry" }] }), "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" });
     if (!output.includes("ODINN_SOAK_PROVIDER_OK") || providerRequests < 2) throw new Error("provider retry did not recover after a transient failure");
     return { providerAttempts: providerRequests };
   });
   providerMode = "timeout";
   await record("provider-timeout", async () => {
-    const result = spawnSync(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "run", "--tool", "model.chat", "--input-json", JSON.stringify({ timeoutMs: 1_000, retries: 0, messages: [{ role: "user", content: "timeout" }] }), "--state", state], { cwd: workspace, encoding: "utf8", env: { ...process.env, INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" } });
-    if (result.status === 0 || !/timed out|timeout/i.test(result.stderr)) throw new Error("provider timeout did not fail safely");
+    try {
+      await run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "run", "--tool", "model.chat", "--input-json", JSON.stringify({ timeoutMs: 1_000, retries: 0, messages: [{ role: "user", content: "timeout" }] }), "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" });
+      throw new Error("provider timeout did not fail safely");
+    } catch (error: any) {
+      if (!/timed out|timeout/i.test(error.message)) throw error;
+    }
     return { recovered: true };
   });
   providerMode = "normal";
@@ -200,27 +233,27 @@ try {
   const config = JSON.parse(await readFile(configPath, "utf8"));
   config.experimental = { ...(config.experimental ?? {}), rewind: true };
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`);
-  const rewindRun = JSON.parse(run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "run", "--tool", "text.echo", "--input-json", JSON.stringify({ text: "ODINN_SOAK_REWIND" }), "--state", state], workspace, { INIT_CWD: workspace }));
-  const checkpoint = JSON.parse(run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "experimental", "rewind", "checkpoint", "create", rewindRun.id, "--path", "soak-output.txt", "--state", state], workspace, { INIT_CWD: workspace }));
-  await record("rewind-dry-run", () => { const preview = JSON.parse(run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "experimental", "rewind", "restore", checkpoint.snapshotId, "--state", state], workspace, { INIT_CWD: workspace })); if (preview.applied !== false) throw new Error("rewind dry-run applied a restore"); return { applied: false }; });
-  await record("audit-integrity-and-persisted-output", () => { const verification = JSON.parse(run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "audit", "verify", "--state", state], workspace, { INIT_CWD: workspace })); if (!verification.valid) throw new Error("audit verification failed"); run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "run", "show", rewindRun.id, "--state", state], workspace, { INIT_CWD: workspace }); return { auditVerification: true }; });
+  const rewindRun = JSON.parse(await run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "run", "--tool", "text.echo", "--input-json", JSON.stringify({ text: "ODINN_SOAK_REWIND" }), "--state", state], workspace, { INIT_CWD: workspace }));
+  const checkpoint = JSON.parse(await run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "experimental", "rewind", "checkpoint", "create", rewindRun.id, "--path", "soak-output.txt", "--state", state], workspace, { INIT_CWD: workspace }));
+  await record("rewind-dry-run", async () => { const preview = JSON.parse(await run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "experimental", "rewind", "restore", checkpoint.snapshotId, "--state", state], workspace, { INIT_CWD: workspace })); if (preview.applied !== false) throw new Error("rewind dry-run applied a restore"); return { applied: false }; });
+  await record("audit-integrity-and-persisted-output", async () => { const verification = JSON.parse(await run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "audit", "verify", "--state", state], workspace, { INIT_CWD: workspace })); if (!verification.valid) throw new Error("audit verification failed"); await run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "run", "show", rewindRun.id, "--state", state], workspace, { INIT_CWD: workspace }); return { auditVerification: true }; });
 
   await record("installer-upgrade-rollback", async () => {
     const installer = join(packageRoot, "scripts/install.ts");
-    run(process.execPath, [installer, "install", "--source", packageRoot, "--prefix", installPrefix, "--version", pkg.version, "--commit", "soak-release-a", "--artifact-sha256", "soak-a"], workspace);
-    const first = JSON.parse(run(process.execPath, [installer, "status", "--prefix", installPrefix], workspace));
-    run(process.execPath, [installer, "upgrade", "--source", packageRoot, "--prefix", installPrefix, "--version", pkg.version, "--commit", "soak-release-b", "--artifact-sha256", "soak-b"], workspace);
-    const upgraded = JSON.parse(run(process.execPath, [installer, "status", "--prefix", installPrefix], workspace));
+    await run(process.execPath, [installer, "install", "--source", packageRoot, "--prefix", installPrefix, "--version", pkg.version, "--commit", "soak-release-a", "--artifact-sha256", "soak-a"], workspace);
+    const first = JSON.parse(await run(process.execPath, [installer, "status", "--prefix", installPrefix], workspace));
+    await run(process.execPath, [installer, "upgrade", "--source", packageRoot, "--prefix", installPrefix, "--version", pkg.version, "--commit", "soak-release-b", "--artifact-sha256", "soak-b"], workspace);
+    const upgraded = JSON.parse(await run(process.execPath, [installer, "status", "--prefix", installPrefix], workspace));
     if (upgraded.previous !== first.current) throw new Error("installer did not preserve the previous release pointer");
-    run(process.execPath, [installer, "rollback", "--prefix", installPrefix], workspace);
-    const rolledBack = JSON.parse(run(process.execPath, [installer, "status", "--prefix", installPrefix], workspace));
+    await run(process.execPath, [installer, "rollback", "--prefix", installPrefix], workspace);
+    const rolledBack = JSON.parse(await run(process.execPath, [installer, "status", "--prefix", installPrefix], workspace));
     if (rolledBack.current !== first.current) throw new Error("installer rollback did not restore the previous release");
     const rollbackRoot = join(installPrefix, "versions", rolledBack.current);
     const rollbackWorkspace = join(temp, "post-rollback-workspace");
     const rollbackState = join(temp, "post-rollback-state");
     await mkdir(rollbackWorkspace, { recursive: true });
-    run(process.execPath, [join(rollbackRoot, "apps/cli/src/cli.ts"), "onboard", "--state", rollbackState], rollbackWorkspace, { INIT_CWD: rollbackWorkspace });
-    const smoke = run(process.execPath, [join(rollbackRoot, "apps/cli/src/cli.ts"), "run", "--tool", "text.echo", "--input-json", JSON.stringify({ text: "ODINN_POST_ROLLBACK_OK" }), "--state", rollbackState], rollbackWorkspace, { INIT_CWD: rollbackWorkspace });
+    await run(process.execPath, [join(rollbackRoot, "apps/cli/src/cli.ts"), "onboard", "--state", rollbackState], rollbackWorkspace, { INIT_CWD: rollbackWorkspace });
+    const smoke = await run(process.execPath, [join(rollbackRoot, "apps/cli/src/cli.ts"), "run", "--tool", "text.echo", "--input-json", JSON.stringify({ text: "ODINN_POST_ROLLBACK_OK" }), "--state", rollbackState], rollbackWorkspace, { INIT_CWD: rollbackWorkspace });
     if (!smoke.includes("ODINN_POST_ROLLBACK_OK")) throw new Error("post-rollback deterministic smoke failed");
     return { rollbackVerified: true, postRollbackOnboarding: true, postRollbackSmoke: true };
   });

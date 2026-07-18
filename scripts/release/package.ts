@@ -30,9 +30,20 @@ function currentCommit() {
 }
 
 function commandOutput(command: any, args: any[]) {
-  const result = spawnSync(command, args, { cwd: root, encoding: "utf8" });
-  if (result.status !== 0) throw new Error(`${command} ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
-  return result.stdout.trim();
+  const candidates = process.platform === "win32" && command === packageManager
+    ? [["pnpm.cmd", args], ["corepack.cmd", ["pnpm", ...args]]]
+    : [[command, args]];
+  let failure = "";
+  for (const [candidate, candidateArgs] of candidates) {
+    const result = spawnSync(candidate as string, candidateArgs as string[], {
+      cwd: root,
+      encoding: "utf8",
+      shell: process.platform === "win32" && String(candidate).endsWith(".cmd")
+    });
+    if (result.status === 0) return result.stdout.trim();
+    failure = result.error?.message || result.stderr || result.stdout || `exit ${result.status}`;
+  }
+  throw new Error(`${command} ${args.join(" ")} failed: ${failure}`);
 }
 
 const commit = currentCommit();

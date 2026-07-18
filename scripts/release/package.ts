@@ -8,6 +8,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const output = join(root, "dist", "release");
 const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 const base = `odinn-v${pkg.version}`;
+const packageManager = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
 await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });
 
@@ -61,7 +62,7 @@ const manifest = {
   version: pkg.version,
   commit,
   lockfileSha256: createHash("sha256").update(lockfile).digest("hex"),
-  toolchain: { node: process.version, pnpm: commandOutput("pnpm", ["--version"]) },
+  toolchain: { node: process.version, pnpm: commandOutput(packageManager, ["--version"]) },
   artifacts: artifacts.map((path: any) => path.slice(output.length + 1)),
   sbom: "odinn.spdx.json",
   provenance: "release-provenance.json",

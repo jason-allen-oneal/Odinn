@@ -135,11 +135,12 @@ const provider = createProviderServer(async (request: any, response: any) => {
 await listen(provider);
 const providerUrl = `http://127.0.0.1:${(provider.address() as any).port}/v1`;
 
-async function record(name: string, operation: () => Promise<any> | any) {
+async function record(name: string, operation: () => Promise<any> | any, summarize: (result: any) => Record<string, any> = (result) => result) {
   const started = Date.now();
   try {
     const result = await operation();
-    steps.push({ name, ok: true, durationMs: Date.now() - started, ...(result && typeof result === "object" ? result : {}) });
+    const evidence = summarize(result);
+    steps.push({ name, ok: true, durationMs: Date.now() - started, ...(evidence && typeof evidence === "object" ? evidence : {}) });
     return result;
   } catch (error: any) {
     steps.push({ name, ok: false, durationMs: Date.now() - started, category: "step-failed" });
@@ -184,7 +185,7 @@ try {
   providerMode = "normal";
   await record("provider-post-timeout-recovery", () => run(process.execPath, [join(packageRoot, "apps/cli/src/cli.ts"), "run", "--tool", "model.chat", "--input-json", JSON.stringify({ messages: [{ role: "user", content: "recover" }] }), "--state", state], workspace, { INIT_CWD: workspace, ODINN_SOAK_KEY: "odinn-soak-key" }));
 
-  let gateway = await record("gateway-start", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }));
+  let gateway = await record("gateway-start", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }), () => ({ bound: true }));
   await record("gateway-status", async () => { const result = await gatewayRequest(gateway, "/status"); if (!result.response.ok) throw new Error("gateway status failed"); return { status: "healthy" }; });
   const gatewayRun = await record("gateway-provider-run", async () => {
     const result = await gatewayRequest(gateway, "/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: "soak-gateway-run", tool: "model.chat", input: { messages: [{ role: "user", content: "gateway" }] } }) });
@@ -192,7 +193,7 @@ try {
     return { runId: result.body.id };
   });
   await stopGateway(gateway);
-  gateway = await record("gateway-restart", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }));
+  gateway = await record("gateway-restart", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }), () => ({ bound: true }));
   await record("persisted-output-after-restart", async () => {
     const result = await gatewayRequest(gateway, `/runs/${encodeURIComponent(gatewayRun.runId)}`);
     if (!result.response.ok || !result.body.events?.some((event: any) => event.type === "task.completed")) throw new Error("gateway restart lost persisted output");
@@ -212,7 +213,7 @@ try {
   });
   await stopGateway(gateway);
   providerMode = "normal";
-  gateway = await record("queue-stop-restart-recovery", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }));
+  gateway = await record("queue-stop-restart-recovery", () => startGateway(packageRoot, workspace, state, { ODINN_SOAK_KEY: "odinn-soak-key" }), () => ({ bound: true }));
   await record("recovered-job-state", async () => {
     for (let attempt = 0; attempt < 50; attempt += 1) {
       const result = await gatewayRequest(gateway, `/jobs/${encodeURIComponent(queuedJob.jobId)}`);

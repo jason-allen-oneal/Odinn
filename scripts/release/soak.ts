@@ -247,7 +247,7 @@ try {
     const installer = join(packageRoot, "scripts/install.ts");
     await run(process.execPath, [installer, "install", "--source", packageRoot, "--prefix", installPrefix, "--version", pkg.version, "--commit", "soak-release-a", "--artifact-sha256", "soak-a"], workspace);
     const first = JSON.parse(await run(process.execPath, [installer, "status", "--prefix", installPrefix], workspace));
-    await run(process.execPath, [installer, "upgrade", "--source", packageRoot, "--prefix", installPrefix, "--version", `${pkg.version}+soak-b`, "--commit", "soak-release-b", "--artifact-sha256", "soak-b"], workspace);
+    await run(process.execPath, [installer, "upgrade", "--source", packageRoot, "--prefix", installPrefix, "--version", `${pkg.version}-soak-b`, "--commit", "soak-release-b", "--artifact-sha256", "soak-b"], workspace);
     const upgraded = JSON.parse(await run(process.execPath, [installer, "status", "--prefix", installPrefix], workspace));
     if (upgraded.previous !== first.current) throw new Error("installer did not preserve the previous release pointer");
     await run(process.execPath, [installer, "rollback", "--prefix", installPrefix], workspace);

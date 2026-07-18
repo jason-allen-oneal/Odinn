@@ -1,5 +1,5 @@
 import { createServer as createProviderServer } from "node:http";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -96,6 +96,7 @@ export async function runInferenceProtocolSmoke() {
     child.kill();
     await new Promise((resolve: any) => child.once("close", resolve));
     await close(provider);
+    await rm(stateDir, { recursive: true, force: true });
   }
 }
 

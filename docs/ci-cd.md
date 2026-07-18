@@ -99,6 +99,10 @@ pnpm benchmark:ci
 node scripts/ci/audit.ts high
 ```
 
+`benchmark:ci` measures twenty cold packaged-gateway protocol runs and fails
+when p95 exceeds the 2-second budget. Set `ODINN_BENCHMARK_P95_MAX_MS` only
+when diagnosing a slower host; do not use it to hide a release regression.
+
 To inspect release output without publishing:
 
 ```bash

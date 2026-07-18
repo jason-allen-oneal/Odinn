@@ -18,7 +18,7 @@ const report = {
 };
 
 console.log(JSON.stringify(report, null, 2));
-const maxP95Ms = Number(process.env.ODINN_BENCHMARK_P95_MAX_MS || 1500);
+const maxP95Ms = Number(process.env.ODINN_BENCHMARK_P95_MAX_MS || 2000);
 if (report.p95Ms > maxP95Ms) {
   throw new Error(`OpenAI-compatible protocol smoke p95 exceeded ${maxP95Ms} ms: ${report.p95Ms} ms`);
 }

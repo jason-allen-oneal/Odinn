@@ -11,6 +11,8 @@ test("package metadata names Odinn Forge and pins the toolchain", async () => {
   assert.equal(pkg.bin.odinn, "./apps/cli/src/cli.ts");
   assert.match(pkg.packageManager, /^pnpm@\d+\.\d+\.\d+$/);
   assert.equal(pkg.engines.node, ">=24.0.0");
+  const changelog = await read("CHANGELOG.md");
+  assert.ok(changelog.includes(`## [${pkg.version}](`), "changelog must describe the package version");
 });
 
 test("local package operations have conservative resource limits", async () => {
@@ -26,30 +28,23 @@ test("local package operations have conservative resource limits", async () => {
 });
 
 test("required CI/CD workflows exist", async () => {
-  for (const workflow of ["ci.yml", "security.yml", "release-please.yml", "release.yml", "nightly.yml"]) {
+  for (const workflow of ["ci.yml", "security.yml", "release.yml", "nightly.yml"]) {
     const content = await read(`.github/workflows/${workflow}`);
     assert.match(content, /^name:/m);
     assert.match(content, /^permissions:/m);
   }
 });
 
-test("Release Please hands token-created tags to the protected release workflow", async () => {
-  const releasePlease = await read(".github/workflows/release-please.yml");
+test("operator-created tags hand releases to the protected workflow", async () => {
   const release = await read(".github/workflows/release.yml");
-  const config = JSON.parse(await read("release-please-config.json"));
+  const preflight = await read("scripts/release/preflight.ts");
 
-  assert.match(releasePlease, /release_created:\s*\$\{\{ steps\.release\.outputs\.release_created \}\}/);
-  assert.match(releasePlease, /uses:\s*\.\/\.github\/workflows\/release\.yml/);
-  assert.match(releasePlease, /tag:\s*\$\{\{ needs\.release_please\.outputs\.tag_name \}\}/);
-  assert.match(releasePlease, /if:\s*steps\.release\.outputs\.prs_created == 'true'/);
-  for (const workflow of ["ci.yml", "package-integrity.yml", "workflow-lint.yml", "security.yml", "pr-title.yml"]) {
-    assert.match(releasePlease, new RegExp(`gh workflow run ${workflow.replace(".", "\\.")} --repo "\\$GITHUB_REPOSITORY"`));
-  }
-  assert.match(release, /^\s{2}workflow_call:/m);
+  assert.match(release, /^\s{2}push:\s*\n\s{4}tags:\s*\n\s{6}- "v\*"/m);
+  assert.match(release, /^\s{2}workflow_dispatch:/m);
+  assert.doesNotMatch(release, /^\s{2}workflow_call:/m);
   assert.match(release, /\*-\*\) prerelease=\(--prerelease\)/);
-  assert.equal(config.packages["."].versioning, "prerelease");
-  assert.equal(config.packages["."]["prerelease-type"], "beta");
-  assert.equal(config.packages["."].prerelease, true);
+  assert.match(preflight, /releaseTag !== expected/);
+  assert.match(preflight, /tagCommit\.stdout\.trim\(\) !== headCommit\.stdout\.trim\(\)/);
 });
 
 test("dispatched release pull requests receive dependency and title checks", async () => {

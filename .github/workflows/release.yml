@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_call:
-    inputs:
-      tag:
-        description: Existing release tag to publish
-        required: true
-        type: string
   workflow_dispatch:
     inputs:
       tag:

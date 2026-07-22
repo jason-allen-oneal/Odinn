@@ -14,6 +14,7 @@ test("native installer upgrades by atomic pointer and rolls back to the previous
   const first = JSON.parse(await readFile(join(prefix, "install-state.json"), "utf8"));
   const metadata = JSON.parse(await readFile(join(prefix, "versions", first.current, "install-metadata.json"), "utf8"));
   assert.equal(metadata.version, "0.1.0");
+  assert.equal(first.currentVersion, "0.1.0");
   assert.match(metadata.lockfileSha256, /^[a-f0-9]{64}$/);
   assert.equal(metadata.toolchain.node, process.version);
   assert.equal(metadata.toolchain.packageManager, "pnpm@10.14.0");
@@ -21,10 +22,12 @@ test("native installer upgrades by atomic pointer and rolls back to the previous
   const upgraded = JSON.parse(await readFile(join(prefix, "install-state.json"), "utf8"));
   assert.notEqual(upgraded.current, first.current);
   assert.equal(upgraded.previous, first.current);
+  assert.equal(upgraded.currentVersion, "0.1.1");
   run(["rollback", "--prefix", prefix]);
   const rolledBack = JSON.parse(await readFile(join(prefix, "install-state.json"), "utf8"));
   assert.equal(rolledBack.current, first.current);
   assert.equal(rolledBack.previous, upgraded.current);
+  assert.equal(rolledBack.currentVersion, "0.1.0");
 });
 
 function run(args: any) {

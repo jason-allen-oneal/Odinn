@@ -28,7 +28,7 @@ the release pull request or recorded in the release artifacts.
 - [x] Recursive workspace jobs default to one worker.
 - [x] Dependency lifecycle scripts default to one worker.
 - [x] Node.js package scripts default to a 1536 MB old-space limit.
-- [ ] A clean source archive install and release soak complete with the limits in
+- [x] A clean source archive install and release soak complete with the limits in
   effect on a representative developer machine.
 
 The defaults can be deliberately changed with
@@ -42,8 +42,8 @@ archive checksum, provider path, result, and sanitized failure evidence.
 
 | Platform | Install | Onboarding | Provider run | Restart/recovery | Rollback |
 | --- | --- | --- | --- | --- | --- |
-| Linux | [ ] | [ ] | [ ] | [ ] | [ ] |
-| macOS | [ ] | [ ] | [ ] | [ ] | [ ] |
+| Linux | [x] | [x] | [x] | [x] | [ ] |
+| macOS | [x] | [x] | [ ] | [ ] | [x] |
 | Windows | [ ] | [ ] | [ ] | [ ] | [ ] |
 
 At least one cloud OAuth path, one API-key path, and one local Ollama path must

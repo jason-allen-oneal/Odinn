@@ -6,7 +6,7 @@ import { createServer } from "node:http";
 import { access, chmod, copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, join, relative, resolve } from "node:path";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
+import { closeBrowserManagers, createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, createOAuthAuthorizationRequest, createRunLedger, exchangeOAuthCode, experimentalFeatureWarning, EXPERIMENTAL_FEATURES, ExtensionExecutor, ExtensionRegistry, listConfiguredModels, listProviderPresets, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, parseStructuredDocument, ProofVerifier, PROVIDER_PRESETS, runPlan, runTask, saveOAuthToken, validateContract, validatePolicy, validateVerificationContract, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy } from "@odinn/policy";
 import { atomicWrite, commitOnboardingDraft, createOnboardingDraft, discardOnboardingDraft, recoverInterruptedOnboardingTransactions } from "./onboarding/apply.ts";
 import { isPromptCancelled, TerminalPrompter } from "./onboarding/prompts.ts";
@@ -332,7 +332,7 @@ function usage() {
 Usage:
   odinn start [--state .odinn] [--port 18790] [--no-open]
   odinn init [--state .odinn]
-  odinn onboard [--provider <name>] [--auth api-key|oauth|device|cli] [--verify] [--state <directory>]
+  odinn onboard [--provider <name>] [--auth api-key|oauth|device|cli] [--verify] [--verify-timeout-ms <ms>] [--state <directory>]
   odinn config provider add <name> [--auth api-key|oauth|device|cli] [--base-url <url>] [--model <model[,model]>] [--api-key-env <ENV>] [--authorization-url <url>] [--token-url <url>] [--client-id <id>] [--scope <scope[,scope]>] [--state .odinn]
   odinn config provider list [--state .odinn]
   odinn config provider catalog
@@ -485,7 +485,11 @@ async function onboard(args: any) {
   }
   const configPath = await ensureConfig(state);
   if (hasFlag(args, "--verify")) {
-    const result = await verifyConfiguredModel(state, await readConfig(state));
+    const result = await verifyConfiguredModel(
+      state,
+      await readConfig(state),
+      providerVerificationTimeoutMs(option(args, "--verify-timeout-ms", ""))
+    );
     if (!result.ok) {
       console.error(result.message);
       process.exitCode = 1;
@@ -1225,7 +1229,7 @@ async function doctor(args: any) {
   };
 }
 
-async function verifyConfiguredModel(state: any, config: any) {
+async function verifyConfiguredModel(state: any, config: any, timeoutMs = providerVerificationTimeoutMs()) {
   const normalized = normalizeModelConfig(config);
   if (!normalized.defaultModel) {
     return { ok: false, kind: "missing-model", message: "No AI model is selected. Choose an AI connection first." };
@@ -1245,7 +1249,7 @@ async function verifyConfiguredModel(state: any, config: any) {
         input: {
           model: normalized.defaultModel,
           retries: 0,
-          timeoutMs: 20_000,
+          timeoutMs,
           messages: [{ role: "user", content: "Reply with exactly ODINN_CAPABILITY_OK." }]
         }
       },
@@ -1497,6 +1501,11 @@ function classifyConnectionFailure(detail: any) {
   return { kind: "provider-error", message: `The AI connection test failed: ${message || "unknown provider error"}` };
 }
 
+function providerVerificationTimeoutMs(requested = "") {
+  const configured = Number.parseInt(requested || process.env.ODINN_PROVIDER_VERIFY_TIMEOUT_MS || "60000", 10);
+  return Number.isInteger(configured) && configured >= 1_000 && configured <= 300_000 ? configured : 60_000;
+}
+
 async function configCommand(args: any) {
   const [section, subcommand, ...rest] = args;
   if (!["provider", "model", "security", "experimental", "self-improvement"].includes(section)) {
@@ -1593,7 +1602,7 @@ async function configSecurityCommand(state: any, config: any, subcommand: any, a
   const impact = surface === "browser" ? "browser-mutation" : "network-capability";
   const broadensAuthority = ["--enabled", "--allow-private-network", "--require-approval"].some((flag) => {
     const value = option(args, flag, "");
-    return (flag === "--require-approval" && value === "false") || value === "true";
+    return flag === "--require-approval" ? value === "false" : value === "true";
   });
   if (broadensAuthority) requireImpactConfirmation(args, impact);
   for (const field of ["enabled", "allowPrivateNetwork", "requireApproval"]) {
@@ -2355,27 +2364,39 @@ async function run(args: any) {
   const inputRaw = inputFile ? await readFile(resolveInvocationPath(inputFile), "utf8") : option(args, "--input-json", "{}");
   const input = JSON.parse(inputRaw);
   const config = await readConfig(state);
-  const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
-  try {
-    const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
-    const result: any = await runTask({
-      task: { tool, input, actor: "cli" },
-      auditStore,
-      policy: createDefaultPolicy(config.policy),
-      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config, auditStore }),
-      runLedger
-    });
-    const contractPath = option(args, "--contract", "");
-    if (contractPath) {
-      const contract = parseStructuredDocument(await readFile(resolveInvocationPath(contractPath), "utf8"), contractPath);
-      const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
-      try { result.proof = await runtime.proof.run(result.id, contract, { workspaceRoot: invocationRoot() }); }
-      finally { runtime.ledger.close(); }
+  const workspaceRoot = invocationRoot();
+  const policy = createDefaultPolicy(config.policy);
+  let result: any;
+  if (tool.startsWith("browser.")) {
+    const executor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy });
+    try {
+      result = await executor({ task: { tool, input, actor: "cli" } });
+    } finally {
+      await executor.shutdown();
     }
-    await printJson(result);
-  } finally {
-    runLedger.close();
+  } else {
+    const runLedger = createRunLedger({ stateDir: state, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
+    try {
+      const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
+      result = await runTask({
+        task: { tool, input, actor: "cli" },
+        auditStore,
+        policy,
+        registry: createBuiltInRegistry({ workspaceRoot, stateDir: state, config, auditStore }),
+        runLedger
+      });
+    } finally {
+      runLedger.close();
+    }
   }
+  const contractPath = option(args, "--contract", "");
+  if (contractPath) {
+    const contract = parseStructuredDocument(await readFile(resolveInvocationPath(contractPath), "utf8"), contractPath);
+    const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
+    try { result.proof = await runtime.proof.run(result.id, contract, { workspaceRoot }); }
+    finally { runtime.ledger.close(); }
+  }
+  await printJson(result);
 }
 
 async function plan(args: any) {
@@ -2383,13 +2404,25 @@ async function plan(args: any) {
   const file = option(args, "--file");
   if (!file) throw new Error("plan requires --file");
   const config = await readConfig(state);
-  const runLedger = createRunLedger({ stateDir: state, workspaceRoot: invocationRoot(), featureFlags: normalizeExperimentalFlags(config.experimental) });
+  const workspaceRoot = invocationRoot();
+  const parsedPlan = JSON.parse(await readFile(resolveInvocationPath(file), "utf8"));
+  const policy = createDefaultPolicy(config.policy);
+  if (parsedPlan.steps?.some((step: any) => String(step?.tool ?? "").startsWith("browser."))) {
+    const executor = createIsolatedTaskExecutor({ stateDir: state, workspaceRoot, config, policy });
+    try {
+      await printJson(await executor({ plan: parsedPlan, actor: "cli" }));
+    } finally {
+      await executor.shutdown();
+    }
+    return;
+  }
+  const runLedger = createRunLedger({ stateDir: state, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
   try {
     const result = await runPlan({
-      plan: JSON.parse(await readFile(resolveInvocationPath(file), "utf8")),
+      plan: parsedPlan,
       auditStore: createAuditStore(join(state, config.auditLog ?? "audit.jsonl")),
-      policy: createDefaultPolicy(config.policy),
-      registry: createBuiltInRegistry({ workspaceRoot: invocationRoot(), stateDir: state, config }),
+      policy,
+      registry: createBuiltInRegistry({ workspaceRoot, stateDir: state, config }),
       actor: "cli",
       runLedger
     });
@@ -3164,9 +3197,13 @@ function redactErrorMessage(error: unknown): string {
     .replace(/((?:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|authorization)\s*[=:]\s*)[^\s,;]+/giu, "$1[redacted]");
 }
 
-main().catch((error: any) => {
-  // Dynamic failures are credential-redacted before reaching stderr.
-  // lgtm[js/clear-text-logging]
-  console.error(redactErrorMessage(error));
-  process.exitCode = 1;
-});
+main()
+  .finally(async () => {
+    if (!["start", "serve", "gateway"].includes(command)) await closeBrowserManagers();
+  })
+  .catch((error: any) => {
+    // Dynamic failures are credential-redacted before reaching stderr.
+    // lgtm[js/clear-text-logging]
+    console.error(redactErrorMessage(error));
+    process.exitCode = 1;
+  });

@@ -1420,6 +1420,8 @@ function publicError(error: any, requestId: string) {
       ? "policy"
       : /timeout|timed out/i.test(raw)
         ? "timeout"
+        : /browser(?:type|context| tab| proxy)|chromium|playwright|locator\./i.test(raw)
+          ? "browser"
         : /provider|model/i.test(raw)
           ? "provider"
           : status === 404 ? "not-found" : status >= 500 ? "runtime" : "validation";
@@ -1427,6 +1429,7 @@ function publicError(error: any, requestId: string) {
     ? raw.slice(0, 240)
     : category === "timeout" ? "The operation timed out. Retry it or inspect diagnostics."
       : category === "provider" ? "The provider operation failed. Check the configured provider and retry."
+        : category === "browser" ? "The browser operation failed. Check the browser runtime and retry."
         : category === "policy" ? "The operation was blocked by policy or approval state. Review the policy and pending approvals."
           : "The operation failed. Run `odinn doctor` for a safe diagnostic report.";
   return { ok: false, error: safe, category, nextAction: category === "browser-recovery" ? "Inspect and resolve the browser recovery record before retrying." : "Run `odinn doctor` and retry after correcting the reported condition.", requestId };

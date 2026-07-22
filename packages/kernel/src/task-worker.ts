@@ -5,7 +5,7 @@ import type { RuntimePolicy } from "@odinn/policy";
 let shuttingDown = false;
 
 interface TaskWorkerMessage {
-  payload?: { plan?: unknown; task?: unknown };
+  payload?: { actor?: string; plan?: unknown; task?: unknown };
   stateDir?: string;
   workspaceRoot?: string;
   config?: { auditLog?: string; experimental?: unknown };
@@ -26,7 +26,7 @@ process.on("message", async (rawMessage: unknown) => {
     const registry = createBuiltInRegistry(registryOptions);
     runLedger = createRunLedger({ stateDir, workspaceRoot, featureFlags: normalizeExperimentalFlags(config.experimental) });
     const result = payload.plan
-      ? await runPlan({ plan: payload.plan, auditStore, policy, registry, runLedger })
+      ? await runPlan({ plan: payload.plan, auditStore, policy, registry, runLedger, actor: payload.actor })
       : await runTask({ task: payload.task, auditStore, policy, registry, runLedger, signal: undefined });
     process.send?.({ ok: true, result });
   } catch (error) {

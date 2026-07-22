@@ -17,6 +17,13 @@ pnpm install --frozen-lockfile
 pnpm check
 ```
 
+The repository defaults to one concurrent workspace/build worker, one dependency
+lifecycle worker, and a 1536 MB Node.js old-space limit. This keeps local checks
+from exhausting a development machine. Maintainers can deliberately tune the
+workspace and heap limits with `ODINN_WORKSPACE_CONCURRENCY` and
+`ODINN_NODE_MAX_OLD_SPACE_MB`; CI should only raise them when the runner capacity
+is known.
+
 ## Pull requests
 
 Use a focused branch and a Conventional Commit pull request title, for example:

@@ -13,6 +13,18 @@ test("package metadata names Odinn Forge and pins the toolchain", async () => {
   assert.equal(pkg.engines.node, ">=24.0.0");
 });
 
+test("local package operations have conservative resource limits", async () => {
+  const npmrc = await read(".npmrc");
+  assert.match(npmrc, /^child-concurrency=1$/m);
+  assert.match(npmrc, /^workspace-concurrency=1$/m);
+  assert.match(npmrc, /^node-options=--max-old-space-size=1536$/m);
+
+  const runner = await read("scripts/ci/run.ts");
+  assert.match(runner, /ODINN_WORKSPACE_CONCURRENCY/);
+  assert.match(runner, /ODINN_NODE_MAX_OLD_SPACE_MB/);
+  assert.match(runner, /--workspace-concurrency=\$\{workspaceConcurrency\}/);
+});
+
 test("required CI/CD workflows exist", async () => {
   for (const workflow of ["ci.yml", "security.yml", "release-please.yml", "release.yml", "nightly.yml"]) {
     const content = await read(`.github/workflows/${workflow}`);
@@ -55,6 +67,7 @@ test("dispatched release pull requests receive dependency and title checks", asy
 test("public beta support and reporting surfaces ship in the release tree", async () => {
   for (const path of [
     "docs/public-beta.md",
+    "docs/BETA-4-STABLE-EXIT.md",
     "docs/BETA-3-SURFACE-MATRIX.md",
     ".github/ISSUE_TEMPLATE/bug-report.yml",
     ".github/ISSUE_TEMPLATE/feature-request.yml",
@@ -66,6 +79,10 @@ test("public beta support and reporting surfaces ship in the release tree", asyn
   assert.doesNotMatch(betaGuide, /v\d+\.\d+\.\d+-beta\.\d+/);
   assert.match(betaGuide, /registration and discovery do not execute or activate/u);
   assert.doesNotMatch(betaGuide, /attachments sent to their configured API/u);
+  const stableExit = await read("docs/BETA-4-STABLE-EXIT.md");
+  assert.match(stableExit, /No unresolved production CodeQL alerts/u);
+  assert.match(stableExit, /Linux[\s\S]*macOS[\s\S]*Windows/u);
+  assert.match(stableExit, /one cloud OAuth path, one API-key path, and one local Ollama path/u);
   const matrix = await read("docs/BETA-3-SURFACE-MATRIX.md");
   for (const label of [
     "verified local behavior",

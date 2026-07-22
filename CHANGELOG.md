@@ -4,7 +4,7 @@ All notable changes to Odinn Forge will be documented in this file.
 
 The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
-## [0.3.0-beta.3](https://github.com/jason-allen-oneal/Odinn/compare/v0.3.0-beta.2...v0.3.0-beta.3) (2026-07-18)
+## [0.3.0-beta.3](https://github.com/jason-allen-oneal/Odinn/compare/v0.3.0-beta.1...v0.3.0-beta.3) (2026-07-18)
 
 
 ### Features

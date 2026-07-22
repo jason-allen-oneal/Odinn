@@ -1275,12 +1275,12 @@ class BrowserNetworkProxy {
       upstream.once("close", () => clearTimeout(deadline));
       upstream.once("error", (error: Error) => {
         if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain" });
-        response.end(`browser proxy rejected request: ${error.message}`);
+        response.end("browser proxy request failed");
       });
       request.pipe(upstream);
-    } catch (error) {
+    } catch {
       response.writeHead(403, { "content-type": "text/plain", connection: "close" });
-      response.end(error instanceof Error ? error.message : String(error));
+      response.end("browser proxy rejected request");
     }
   }
 

@@ -7,11 +7,31 @@ import { spawnSync } from "node:child_process";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const mode = process.argv[2];
+const workspaceConcurrency = positiveIntegerEnvironment("ODINN_WORKSPACE_CONCURRENCY", 1);
+const nodeMaxOldSpaceMb = positiveIntegerEnvironment("ODINN_NODE_MAX_OLD_SPACE_MB", 1536);
 const ignored = new Set([".git", "node_modules", "dist", "coverage", ".pnpm-store"]);
 const textExtensions = new Set([
   ".cjs", ".css", ".html", ".js", ".json", ".jsx", ".md", ".ts", ".mts",
   ".scss", ".sh", ".ts", ".tsx", ".yaml", ".yml"
 ]);
+
+function positiveIntegerEnvironment(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer`);
+  return parsed;
+}
+
+function boundedEnvironment() {
+  const existing = String(process.env.NODE_OPTIONS ?? "")
+    .replace(/(?:^|\s)--max[-_]old[-_]space[-_]size(?:=|\s+)\d+/gu, " ")
+    .trim();
+  return {
+    ...process.env,
+    NODE_OPTIONS: `${existing}${existing ? " " : ""}--max-old-space-size=${nodeMaxOldSpaceMb}`
+  };
+}
 
 async function walk(directory: any): Promise<string[]> {
   const output: string[] = [];
@@ -69,6 +89,7 @@ async function lintRepository() {
   const eslint = spawnSync("pnpm", ["exec", "eslint", "."], {
     cwd: root,
     encoding: "utf8",
+    env: boundedEnvironment(),
     shell: process.platform === "win32"
   });
   if (eslint.stdout) process.stdout.write(eslint.stdout);
@@ -98,8 +119,8 @@ async function runWorkspaceScript(script: any) {
   const filters = await workspaceFilters();
   const result = spawnSync(
     "pnpm",
-    ["--recursive", "--if-present", ...filters.flatMap((filter) => ["--filter", filter]), "run", script],
-    { cwd: root, encoding: "utf8", shell: process.platform === "win32" }
+    ["--recursive", `--workspace-concurrency=${workspaceConcurrency}`, "--if-present", ...filters.flatMap((filter) => ["--filter", filter]), "run", script],
+    { cwd: root, encoding: "utf8", env: boundedEnvironment(), shell: process.platform === "win32" }
   );
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
@@ -114,6 +135,7 @@ async function typecheck() {
     const tools = spawnSync("pnpm", ["exec", "tsc", "-p", config], {
       cwd: root,
       encoding: "utf8",
+      env: boundedEnvironment(),
       shell: process.platform === "win32"
     });
     if (tools.stdout) process.stdout.write(tools.stdout);

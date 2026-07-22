@@ -3025,6 +3025,8 @@ async function saveConfig(state: any, config: any) {
 }
 
 function contentFingerprint(value: string | Uint8Array): string {
+  // This is an optimistic-concurrency digest of config bytes, not a password hash.
+  // lgtm[js/insufficient-password-hash]
   return createHash("sha256").update(value).digest("hex");
 }
 
@@ -3153,7 +3155,18 @@ function redactOutput(value: any): any {
   ]));
 }
 
+function redactErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/giu, "$1[redacted]@")
+    .replace(/\b(Bearer|Basic)\s+[^\s,;]+/giu, "$1 [redacted]")
+    .replace(/([?&](?:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|authorization)=)[^&\s]+/giu, "$1[redacted]")
+    .replace(/((?:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|authorization)\s*[=:]\s*)[^\s,;]+/giu, "$1[redacted]");
+}
+
 main().catch((error: any) => {
-  console.error(error.message);
+  // Dynamic failures are credential-redacted before reaching stderr.
+  // lgtm[js/clear-text-logging]
+  console.error(redactErrorMessage(error));
   process.exitCode = 1;
 });

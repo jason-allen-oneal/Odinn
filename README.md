@@ -19,6 +19,8 @@ The project is a clean-room implementation. It does not copy OpenClaw, Hermes, O
 
 Public beta participants should begin with the [public beta guide](docs/public-beta.md). It defines the supported local-first scope, verified release installation, privacy boundary, diagnostics, and bug-reporting path.
 
+Current stabilization work and the evidence required before a stable release are tracked in the [Beta 4 stable-exit plan](docs/BETA-4-STABLE-EXIT.md). New subsystems are deferred until those gates are satisfied.
+
 For the authoritative Beta 3 surface classifications, see the [Beta 3 surface matrix](docs/BETA-3-SURFACE-MATRIX.md). Its labels are **verified local behavior**, **experimental and disabled by default**, **provider- or platform-dependent**, and **explicitly unsupported**. The three hard limits are:
 
 - Forked workers are crash containment, not a security sandbox.

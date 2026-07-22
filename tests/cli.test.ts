@@ -36,6 +36,22 @@ test("CLI advanced help exposes documented beta safety controls", () => {
   }
 });
 
+test("CLI redacts credential-like values from top-level failures", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "odinn-cli-redaction-"));
+  const secret = "odinn-secret-probe";
+  const state = join(rootDir, `api-key=${secret}`);
+  await writeFile(state, "not a directory\n");
+
+  const failed = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], {
+    cwd: root,
+    encoding: "utf8"
+  });
+
+  assert.notEqual(failed.status, 0);
+  assert.doesNotMatch(failed.stderr, new RegExp(secret));
+  assert.match(failed.stderr, /api-key=\[redacted\]/i);
+});
+
 test("CLI runs a deterministic tool through the audited kernel path", async () => {
   const state = await mkdtemp(join(tmpdir(), "odinn-cli-"));
   const init = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], {

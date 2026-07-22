@@ -4,7 +4,30 @@ All notable changes to Odinn Forge will be documented in this file.
 
 The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
-## [0.3.0-beta.3](https://github.com/jason-allen-oneal/Odinn/compare/v0.3.0-beta.2...v0.3.0-beta.3) (2026-07-18)
+## [0.4.0-beta.1](https://github.com/jason-allen-oneal/Odinn/compare/v0.3.0-beta.3...v0.4.0-beta.1) (2026-07-21)
+
+### Features
+
+* add the Beta 4 stable-exit plan and validation matrix
+
+### Security
+
+* redact credential-like values from CLI failures
+* stop browser proxy failures from exposing internal network errors
+* scope release workflow permissions to the jobs that require them
+
+### Build and CI
+
+* cap local workspace, dependency lifecycle, and Node.js memory concurrency
+* update pinned GitHub Actions and CodeQL tooling
+* replace Release Please with an explicit reviewed version PR and operator-created tag
+
+### Documentation
+
+* document the resource-bounded development defaults and manual release procedure
+* repair the Beta 3 changelog comparison link
+
+## [0.3.0-beta.3](https://github.com/jason-allen-oneal/Odinn/compare/v0.3.0-beta.1...v0.3.0-beta.3) (2026-07-18)
 
 
 ### Features

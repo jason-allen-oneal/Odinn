@@ -11,33 +11,40 @@ test("package metadata names Odinn Forge and pins the toolchain", async () => {
   assert.equal(pkg.bin.odinn, "./apps/cli/src/cli.ts");
   assert.match(pkg.packageManager, /^pnpm@\d+\.\d+\.\d+$/);
   assert.equal(pkg.engines.node, ">=24.0.0");
+  const changelog = await read("CHANGELOG.md");
+  assert.ok(changelog.includes(`## [${pkg.version}](`), "changelog must describe the package version");
+});
+
+test("local package operations have conservative resource limits", async () => {
+  const npmrc = await read(".npmrc");
+  assert.match(npmrc, /^child-concurrency=1$/m);
+  assert.match(npmrc, /^workspace-concurrency=1$/m);
+  assert.match(npmrc, /^node-options=--max-old-space-size=1536$/m);
+
+  const runner = await read("scripts/ci/run.ts");
+  assert.match(runner, /ODINN_WORKSPACE_CONCURRENCY/);
+  assert.match(runner, /ODINN_NODE_MAX_OLD_SPACE_MB/);
+  assert.match(runner, /--workspace-concurrency=\$\{workspaceConcurrency\}/);
 });
 
 test("required CI/CD workflows exist", async () => {
-  for (const workflow of ["ci.yml", "security.yml", "release-please.yml", "release.yml", "nightly.yml"]) {
+  for (const workflow of ["ci.yml", "security.yml", "release.yml", "nightly.yml"]) {
     const content = await read(`.github/workflows/${workflow}`);
     assert.match(content, /^name:/m);
     assert.match(content, /^permissions:/m);
   }
 });
 
-test("Release Please hands token-created tags to the protected release workflow", async () => {
-  const releasePlease = await read(".github/workflows/release-please.yml");
+test("operator-created tags hand releases to the protected workflow", async () => {
   const release = await read(".github/workflows/release.yml");
-  const config = JSON.parse(await read("release-please-config.json"));
+  const preflight = await read("scripts/release/preflight.ts");
 
-  assert.match(releasePlease, /release_created:\s*\$\{\{ steps\.release\.outputs\.release_created \}\}/);
-  assert.match(releasePlease, /uses:\s*\.\/\.github\/workflows\/release\.yml/);
-  assert.match(releasePlease, /tag:\s*\$\{\{ needs\.release_please\.outputs\.tag_name \}\}/);
-  assert.match(releasePlease, /if:\s*steps\.release\.outputs\.prs_created == 'true'/);
-  for (const workflow of ["ci.yml", "package-integrity.yml", "workflow-lint.yml", "security.yml", "pr-title.yml"]) {
-    assert.match(releasePlease, new RegExp(`gh workflow run ${workflow.replace(".", "\\.")} --repo "\\$GITHUB_REPOSITORY"`));
-  }
-  assert.match(release, /^\s{2}workflow_call:/m);
+  assert.match(release, /^\s{2}push:\s*\n\s{4}tags:\s*\n\s{6}- "v\*"/m);
+  assert.match(release, /^\s{2}workflow_dispatch:/m);
+  assert.doesNotMatch(release, /^\s{2}workflow_call:/m);
   assert.match(release, /\*-\*\) prerelease=\(--prerelease\)/);
-  assert.equal(config.packages["."].versioning, "prerelease");
-  assert.equal(config.packages["."]["prerelease-type"], "beta");
-  assert.equal(config.packages["."].prerelease, true);
+  assert.match(preflight, /releaseTag !== expected/);
+  assert.match(preflight, /tagCommit\.stdout\.trim\(\) !== headCommit\.stdout\.trim\(\)/);
 });
 
 test("dispatched release pull requests receive dependency and title checks", async () => {
@@ -55,6 +62,7 @@ test("dispatched release pull requests receive dependency and title checks", asy
 test("public beta support and reporting surfaces ship in the release tree", async () => {
   for (const path of [
     "docs/public-beta.md",
+    "docs/BETA-4-STABLE-EXIT.md",
     "docs/BETA-3-SURFACE-MATRIX.md",
     ".github/ISSUE_TEMPLATE/bug-report.yml",
     ".github/ISSUE_TEMPLATE/feature-request.yml",
@@ -66,6 +74,10 @@ test("public beta support and reporting surfaces ship in the release tree", asyn
   assert.doesNotMatch(betaGuide, /v\d+\.\d+\.\d+-beta\.\d+/);
   assert.match(betaGuide, /registration and discovery do not execute or activate/u);
   assert.doesNotMatch(betaGuide, /attachments sent to their configured API/u);
+  const stableExit = await read("docs/BETA-4-STABLE-EXIT.md");
+  assert.match(stableExit, /No unresolved production CodeQL alerts/u);
+  assert.match(stableExit, /Linux[\s\S]*macOS[\s\S]*Windows/u);
+  assert.match(stableExit, /one cloud OAuth path, one API-key path, and one local Ollama path/u);
   const matrix = await read("docs/BETA-3-SURFACE-MATRIX.md");
   for (const label of [
     "verified local behavior",

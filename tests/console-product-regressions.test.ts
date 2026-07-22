@@ -35,7 +35,7 @@ test("console presents the consolidated, scoped product surfaces", async () => {
     const response = await fetch(`http://127.0.0.1:${address.port}/`);
     assert.equal(response.status, 200);
     const html = await response.text();
-    const inlineScripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gu)].map((match) => match[1]);
+    const inlineScripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/giu)].map((match) => match[1]);
     assert.equal(inlineScripts.length, 1);
     assert.doesNotThrow(() => new Script(inlineScripts[0], { filename: "odinn-console.js" }));
 

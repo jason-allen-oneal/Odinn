@@ -17,6 +17,13 @@ pnpm install --frozen-lockfile
 pnpm check
 ```
 
+The repository defaults to one concurrent workspace/build worker, one dependency
+lifecycle worker, and a 1536 MB Node.js old-space limit. This keeps local checks
+from exhausting a development machine. Maintainers can deliberately tune the
+workspace and heap limits with `ODINN_WORKSPACE_CONCURRENCY` and
+`ODINN_NODE_MAX_OLD_SPACE_MB`; CI should only raise them when the runner capacity
+is known.
+
 ## Pull requests
 
 Use a focused branch and a Conventional Commit pull request title, for example:
@@ -65,4 +72,25 @@ When changing `.github/workflows/`, also run the pinned actionlint container des
 
 ## Releases
 
-Do not edit release tags manually. Release Please maintains the version and changelog pull request. Merging that pull request creates the tag and directly invokes the protected reusable release workflow. This explicit handoff is required because GitHub suppresses tag-push workflow events caused by the workflow token.
+Prepare every release as a normal reviewed pull request that updates
+`package.json` and `CHANGELOG.md` together. The changelog heading and comparison
+link must match the package version. Do not create the tag until that pull
+request is merged and all required checks on `main` are green.
+
+From an up-to-date, clean `main`, create an annotated tag that exactly matches
+the package version and push only that tag:
+
+```bash
+git switch main
+git pull --ff-only origin main
+pnpm release:preflight
+version="$(node -p "require('./package.json').version")"
+tag="v$version"
+git tag -a "$tag" -m "Odinn Forge $tag"
+git push origin "$tag"
+```
+
+Use a signed tag when signing is configured. The tag starts the protected
+release workflow, which independently verifies the version/tag/commit binding,
+runs the release gates, and publishes through the `release` environment. Never
+move or reuse a published tag; prepare a new patch or prerelease version instead.

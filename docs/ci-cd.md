@@ -1,6 +1,6 @@
 # Odinn Forge CI/CD
 
-Odinn Forge uses separate workflows for correctness, package integrity, workflow linting, pull-request policy, merge-queue validation, security, scheduled verification, version management, and release publication. A green release requires every applicable required workflow to succeed independently.
+Odinn Forge uses separate workflows for correctness, package integrity, workflow linting, pull-request policy, merge-queue validation, security, scheduled verification, and release publication. A green release requires every applicable required workflow to succeed independently.
 
 ## Workflows
 
@@ -43,17 +43,22 @@ Runs on every pull request and push to `main`. Linux, macOS, and Windows each bu
 
 Workflow Lint runs actionlint on every pull request and on workflow changes pushed to `main`. Pull Request Policy validates Conventional Commit syntax for pull-request titles. Merge Queue performs the full release-candidate suite for `merge_group` events.
 
-### Release Please
+### Version preparation
 
-Pushes to `main` are analyzed for Conventional Commit messages. During public beta, Release Please maintains a prerelease pull request that updates `package.json`, `CHANGELOG.md`, and the release manifest. Merging that pull request creates a beta version tag and GitHub prerelease.
+Versions are prepared through ordinary reviewed pull requests. A release change
+updates `package.json` and `CHANGELOG.md` together, receives the same CI,
+Security, Package Integrity, Workflow Lint, and Pull Request Policy checks as
+any other change, and merges without creating a tag or release as a side effect.
 
-GitHub deliberately does not emit a second workflow event for a tag created with the workflow `GITHUB_TOKEN`. The Release Please workflow therefore calls `release.yml` directly when `release_created` is true and passes the exact generated tag into the protected reusable release workflow. The tag-push and manual-dispatch triggers remain available for operator-created recovery runs.
-
-The same recursion guard suppresses ordinary `pull_request` workflow events for Release Please's generated PR. When `prs_created` is true, the workflow explicitly dispatches CI, Security, Package Integrity, Workflow Lint, and Pull Request Policy against the generated head commit. Security receives the exact base and head SHAs so dependency review still compares the intended release change.
+After the version pull request and required `main` checks pass, an operator
+creates an annotated (preferably signed) `v<package-version>` tag at the exact
+merge commit and pushes that tag. Tags are immutable release identities; a
+failed release is corrected with a new version rather than by moving a tag.
 
 ### Release
 
-A `v*` tag starts the release workflow. The workflow:
+A `v*` tag starts the release workflow. Manual dispatch can republish an
+existing tag for recovery, but cannot release an untagged branch. The workflow:
 
 1. Checks out the exact tag.
 2. Verifies that the tag matches `package.json`.

@@ -114,7 +114,56 @@ test("one-shot CLI browser reads close Chromium and exit", async (t) => {
   });
   assert.equal(init.status, 0, init.stderr || init.stdout);
 
-  const browser = spawnSync("node", [
+  const runBrowserCommand = (commandArgs: string[]) => new Promise<{ status: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }>((resolveCommand, rejectCommand) => {
+    const child = spawn("node", commandArgs, {
+      cwd: root,
+      env: { ...process.env, ODINN_BROWSER_HEADLESS: "1", ODINN_CHROMIUM_PATH: chromiumPath }
+    });
+    let stdout = "";
+    let stderr = "";
+    let resultSeen = false;
+    let settled = false;
+    let exitTimer: NodeJS.Timeout | undefined;
+    const overallTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      rejectCommand(new Error(`browser CLI did not produce JSON within 60 seconds: ${stderr}`));
+    }, 60_000);
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+      if (resultSeen) return;
+      try {
+        JSON.parse(stdout);
+        resultSeen = true;
+        exitTimer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          child.kill("SIGKILL");
+          rejectCommand(new Error("browser CLI stayed alive more than 10 seconds after producing JSON"));
+        }, 10_000);
+      } catch {
+        // Output is still incomplete.
+      }
+    });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(overallTimer);
+      if (exitTimer) clearTimeout(exitTimer);
+      rejectCommand(error);
+    });
+    child.on("close", (status, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(overallTimer);
+      if (exitTimer) clearTimeout(exitTimer);
+      resolveCommand({ status, signal, stdout, stderr });
+    });
+  });
+
+  const browser = await runBrowserCommand([
     "apps/cli/src/cli.ts",
     "run",
     "--state",
@@ -123,13 +172,8 @@ test("one-shot CLI browser reads close Chromium and exit", async (t) => {
     "browser.tabs",
     "--input-json",
     "{}"
-  ], {
-    cwd: root,
-    encoding: "utf8",
-    timeout: 20_000,
-    env: { ...process.env, ODINN_BROWSER_HEADLESS: "1", ODINN_CHROMIUM_PATH: chromiumPath }
-  });
-  assert.equal(browser.status, 0, browser.stderr || browser.stdout || String(browser.error));
+  ]);
+  assert.equal(browser.status, 0, browser.stderr || browser.stdout);
   assert.equal(browser.signal, null);
   assert.ok(JSON.parse(browser.stdout).output.tabs.length >= 1);
 
@@ -139,15 +183,10 @@ test("one-shot CLI browser reads close Chromium and exit", async (t) => {
     name: "browser-plan-cli",
     steps: [{ id: "tabs", tool: "browser.tabs", input: {} }]
   })}\n`);
-  const plan = spawnSync("node", [
+  const plan = await runBrowserCommand([
     "apps/cli/src/cli.ts", "plan", "--state", state, "--file", planPath
-  ], {
-    cwd: root,
-    encoding: "utf8",
-    timeout: 20_000,
-    env: { ...process.env, ODINN_BROWSER_HEADLESS: "1", ODINN_CHROMIUM_PATH: chromiumPath }
-  });
-  assert.equal(plan.status, 0, plan.stderr || plan.stdout || String(plan.error));
+  ]);
+  assert.equal(plan.status, 0, plan.stderr || plan.stdout);
   assert.equal(plan.signal, null);
   const planResult = JSON.parse(plan.stdout);
   assert.equal(planResult.id, "browser_plan_cli");

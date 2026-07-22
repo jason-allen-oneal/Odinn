@@ -26,6 +26,11 @@ This includes direct one-shot browser execution, browser execution inside a
 plan, persistent gateway browser reuse, clean profile reopen, approval gating,
 uncertain-outcome lockout, and operator recovery.
 
+The CLI lifecycle assertion allows a shared runner up to 60 seconds to launch
+Chromium, then fails if the command remains alive more than 10 seconds after
+producing valid JSON. This measures the profile-lock regression independently
+of browser startup speed.
+
 ```text
 sudo systemctl set-property --runtime ollama.service \
   MemoryMax=6G CPUQuota=150% TasksMax=256

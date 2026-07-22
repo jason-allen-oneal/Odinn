@@ -166,6 +166,8 @@ export class JobSupervisor {
 }
 
 interface WorkerPayload extends JsonObject {
+  actor?: string;
+  plan?: JsonObject;
   workspaceRoot?: string;
   task?: JsonObject & { tool?: string };
 }

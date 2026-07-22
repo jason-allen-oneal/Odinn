@@ -21,7 +21,8 @@ async function install(operation: any) {
   const version = option("--version", pkg.version);
   if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) throw new Error("invalid Odinn Forge version");
   const lockfileSha256 = createHash("sha256").update(await readFile(join(source, "pnpm-lock.yaml"))).digest("hex");
-  const commit = option("--commit", process.env.ODINN_RELEASE_COMMIT || pkg.odinnCommit || "unknown");
+  const releaseInfo = await readReleaseInfo(source);
+  const commit = option("--commit", process.env.ODINN_RELEASE_COMMIT || releaseInfo.commit || pkg.odinnCommit || "unknown");
   const artifactSha256 = option("--artifact-sha256", process.env.ODINN_ARTIFACT_SHA256 || "unknown");
   const toolchain = { node: process.version, packageManager: pkg.packageManager || "unknown" };
   const toolchainSha256 = createHash("sha256").update(JSON.stringify(toolchain)).digest("hex");
@@ -47,10 +48,10 @@ async function install(operation: any) {
     await rename(staging, destination);
   }
   const previous = await readState();
-  const next = { schemaVersion: 1, current: versionId, previous: previous.current && previous.current !== versionId ? previous.current : previous.previous ?? null, installedAt: new Date().toISOString(), operation };
+  const next = { schemaVersion: 1, current: versionId, currentVersion: version, currentCommit: commit, previous: previous.current && previous.current !== versionId ? previous.current : previous.previous ?? null, installedAt: new Date().toISOString(), operation };
   await writeState(next);
   await writeLaunchers();
-  console.log(JSON.stringify({ ok: true, prefix, version: versionId, previous: next.previous }, null, 2));
+  console.log(JSON.stringify({ ok: true, prefix, version, versionId, commit, previous: next.previous }, null, 2));
 }
 
 async function rollback() {
@@ -58,7 +59,8 @@ async function rollback() {
   if (!current.previous) throw new Error("no previous Odinn Forge installation is available for rollback");
   const priorPath = join(prefix, "versions", current.previous, "package.json");
   await readFile(priorPath);
-  const next = { ...current, current: current.previous, previous: current.current, rolledBackAt: new Date().toISOString(), operation: "rollback" };
+  const priorMetadata = JSON.parse(await readFile(join(prefix, "versions", current.previous, "install-metadata.json"), "utf8"));
+  const next = { ...current, current: current.previous, currentVersion: priorMetadata.version, currentCommit: priorMetadata.commit, previous: current.current, rolledBackAt: new Date().toISOString(), operation: "rollback" };
   await writeState(next);
   console.log(JSON.stringify({ ok: true, prefix, current: next.current, previous: next.previous }, null, 2));
 }
@@ -74,6 +76,17 @@ async function writeState(value: any) {
   await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   await rename(temporary, statePath);
   await chmod(statePath, 0o600).catch(() => undefined);
+}
+
+async function readReleaseInfo(source: string) {
+  try {
+    const value = JSON.parse(await readFile(join(source, "release-info.json"), "utf8"));
+    const commit = String(value?.commit ?? "");
+    return { commit: commit.startsWith("$Format:") ? "" : commit };
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return { commit: "" };
+    throw error;
+  }
 }
 
 async function writeLaunchers() {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -97,6 +97,100 @@ test("CLI runs a deterministic tool through the audited kernel path", async () =
   const detail = JSON.parse(show.stdout);
   assert.equal(detail.id, result.id);
   assert.equal(detail.events.length, 3);
+});
+
+test("one-shot CLI browser reads close Chromium and exit", async (t) => {
+  const chromiumPath = process.env.ODINN_CHROMIUM_PATH || "/usr/bin/chromium";
+  try {
+    await access(chromiumPath);
+  } catch {
+    t.skip(`Chromium not available at ${chromiumPath}`);
+    return;
+  }
+  const state = await mkdtemp(join(tmpdir(), "odinn-cli-browser-exit-"));
+  const init = spawnSync("node", ["apps/cli/src/cli.ts", "init", "--state", state], {
+    cwd: root,
+    encoding: "utf8"
+  });
+  assert.equal(init.status, 0, init.stderr || init.stdout);
+
+  const runBrowserCommand = (commandArgs: string[]) => new Promise<{ status: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }>((resolveCommand, rejectCommand) => {
+    const child = spawn("node", commandArgs, {
+      cwd: root,
+      env: { ...process.env, ODINN_BROWSER_HEADLESS: "1", ODINN_CHROMIUM_PATH: chromiumPath }
+    });
+    let stdout = "";
+    let stderr = "";
+    let resultSeen = false;
+    let settled = false;
+    let exitTimer: NodeJS.Timeout | undefined;
+    const overallTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      rejectCommand(new Error(`browser CLI did not produce JSON within 60 seconds: ${stderr}`));
+    }, 60_000);
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+      if (resultSeen) return;
+      try {
+        JSON.parse(stdout);
+        resultSeen = true;
+        exitTimer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          child.kill("SIGKILL");
+          rejectCommand(new Error("browser CLI stayed alive more than 10 seconds after producing JSON"));
+        }, 10_000);
+      } catch {
+        // Output is still incomplete.
+      }
+    });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(overallTimer);
+      if (exitTimer) clearTimeout(exitTimer);
+      rejectCommand(error);
+    });
+    child.on("close", (status, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(overallTimer);
+      if (exitTimer) clearTimeout(exitTimer);
+      resolveCommand({ status, signal, stdout, stderr });
+    });
+  });
+
+  const browser = await runBrowserCommand([
+    "apps/cli/src/cli.ts",
+    "run",
+    "--state",
+    state,
+    "--tool",
+    "browser.tabs",
+    "--input-json",
+    "{}"
+  ]);
+  assert.equal(browser.status, 0, browser.stderr || browser.stdout);
+  assert.equal(browser.signal, null);
+  assert.ok(JSON.parse(browser.stdout).output.tabs.length >= 1);
+
+  const planPath = join(state, "browser-plan.json");
+  await writeFile(planPath, `${JSON.stringify({
+    id: "browser_plan_cli",
+    name: "browser-plan-cli",
+    steps: [{ id: "tabs", tool: "browser.tabs", input: {} }]
+  })}\n`);
+  const plan = await runBrowserCommand([
+    "apps/cli/src/cli.ts", "plan", "--state", state, "--file", planPath
+  ]);
+  assert.equal(plan.status, 0, plan.stderr || plan.stdout);
+  assert.equal(plan.signal, null);
+  const planResult = JSON.parse(plan.stdout);
+  assert.equal(planResult.id, "browser_plan_cli");
+  assert.ok(planResult.steps[0].result.output.tabs.length >= 1);
 });
 
 test("CLI runs a deterministic JSON plan", async () => {
@@ -377,6 +471,14 @@ test("CLI exposes explicit security posture controls", async () => {
   const show = spawnSync("node", ["apps/cli/src/cli.ts", "config", "security", "show", "--state", state], { cwd: root, encoding: "utf8" });
   assert.equal(show.status, 0, show.stderr || show.stdout);
   assert.match(show.stdout, /allowPrivateNetwork/);
+
+  const restore = spawnSync("node", [
+    "apps/cli/src/cli.ts", "config", "security", "set", "--state", state,
+    "--surface", "browser", "--require-approval", "true"
+  ], { cwd: root, encoding: "utf8" });
+  assert.equal(restore.status, 0, restore.stderr || restore.stdout);
+  assert.equal(JSON.parse(await readFile(join(state, "config.json"), "utf8")).policy.security.browser.requireApproval, true);
+  assert.doesNotMatch(restore.stderr, /impact confirmation required/i);
 });
 
 test("CLI doctor reports safe diagnostics without state paths or credentials", async () => {

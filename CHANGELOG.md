@@ -4,6 +4,16 @@ All notable changes to Odinn Forge will be documented in this file.
 
 The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
+## Unreleased
+
+### Fixed
+
+* close one-shot CLI browser workers after direct and planned runs
+* allow restoring browser approval without a dangerous-change confirmation
+* extend provider verification for cold local-model starts
+* preserve clean release version and commit metadata through install and rollback
+* classify browser runtime failures without exposing internal diagnostics
+
 ## [0.4.0-beta.1](https://github.com/jason-allen-oneal/Odinn/compare/v0.3.0-beta.3...v0.4.0-beta.1) (2026-07-21)
 
 ### Features

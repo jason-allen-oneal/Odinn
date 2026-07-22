@@ -81,12 +81,16 @@ for (const extension of ["zip", "tar.gz"]) {
     const packageRoot = join(destination, expectedRoot);
     const forbidden = (await walk(packageRoot)).filter(forbiddenArchivePath);
     if (forbidden.length) throw new Error(`archive contains runtime state: ${forbidden.join(", ")}`);
-    for (const required of ["README.md", "LICENSE", "SECURITY.md", "package.json", "pnpm-lock.yaml"]) {
+    for (const required of ["README.md", "LICENSE", "SECURITY.md", "package.json", "pnpm-lock.yaml", "release-info.json"]) {
       await readFile(join(packageRoot, required));
     }
     const archivedPackage = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
     if (archivedPackage.name !== "odinn" || archivedPackage.version !== pkg.version) {
       throw new Error(`archive metadata mismatch in ${basename(archive)}`);
+    }
+    const releaseInfo = JSON.parse(await readFile(join(packageRoot, "release-info.json"), "utf8"));
+    if (releaseInfo.commit !== manifest.commit) {
+      throw new Error(`archive commit metadata mismatch in ${basename(archive)}`);
     }
   } finally {
     await rm(destination, { recursive: true, force: true });

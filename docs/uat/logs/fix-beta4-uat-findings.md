@@ -62,14 +62,30 @@ format contract passed
 repository lint passed
 ```
 
+```text
+systemd-run --user --scope --quiet -p MemoryMax=1G -p CPUQuota=75% \
+  -p TasksMax=96 env NODE_OPTIONS=--max-old-space-size=512 \
+  node /tmp/odinn-console-mutations.mjs
+systemd-run --user --scope --quiet -p MemoryMax=1G -p CPUQuota=75% \
+  -p TasksMax=96 env NODE_OPTIONS=--max-old-space-size=512 \
+  node /tmp/odinn-console-mutations-2.mjs
+
+Console bootstrap, smoke plan, health chat, provider chat, session creation,
+project creation, goal create/update, memory create/correct/recall, cron
+create/run, agent install/enable/disable, skill install/verify/enable/disable,
+review-gated improvement proposal, task inspection, signed audit verification,
+audit search, and provider usage accounting passed through browser controls.
+```
+
+The console pass drove an isolated Chromium process directly against the
+owner-controlled loopback gateway. OpenClaw's browser controller retained its
+separate private-network guard; no global SSRF bypass was enabled.
+
 ## Not tested in this proof pass
 
 - Windows installation and rollback.
 - Live cloud OAuth and API-key providers.
 - Multi-day daily-use behavior.
-- Direct console clicking through the OpenClaw controller, which correctly
-  blocks loopback/private navigation; authenticated console APIs and browser
-  recovery were tested directly.
 
 The complete artifact-level Linux and macOS acceptance record is in
 `docs/uat/v0.4.0-beta.1.md`.

@@ -6,6 +6,19 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## Unreleased
 
+## [0.4.0-beta.3](https://github.com/jason-allen-oneal/Odinn/compare/v0.4.0-beta.2...v0.4.0-beta.3) (2026-07-23)
+
+### Validation
+
+* prepare the exact published candidate for Windows, live-provider, multi-user daily-use, and final stable-release validation
+* verify real OpenAI OAuth and OpenRouter API-key inference paths without embedding credentials in configuration or diagnostic evidence
+* retain the Windows, multi-user multi-day, and final maintainer go/no-go gates until their required external evidence is complete
+
+### Documentation
+
+* direct release-identity diagnostics to `odinn doctor`
+* run the release soak before checksums so the soak report is included in verified release evidence
+
 ## [0.4.0-beta.2](https://github.com/jason-allen-oneal/Odinn/compare/v0.4.0-beta.1...v0.4.0-beta.2) (2026-07-23)
 
 ### Fixed

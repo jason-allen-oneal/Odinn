@@ -21,7 +21,7 @@ body:
     id: version
     attributes:
       label: Odinn Forge version
-      description: Run `odinn status` or provide the release tag.
+      description: Run `odinn doctor` or provide the release tag.
       placeholder: v0.2.1-beta.0
     validations:
       required: true
@@ -62,4 +62,3 @@ body:
     attributes:
       label: Sanitized evidence
       description: Add redacted logs, audit verification output, screenshots, or a minimal fixture.
-

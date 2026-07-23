@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 
 ## Unreleased
 
+## [0.4.0-beta.2](https://github.com/jason-allen-oneal/Odinn/compare/v0.4.0-beta.1...v0.4.0-beta.2) (2026-07-23)
+
 ### Fixed
 
 * close one-shot CLI browser workers after direct and planned runs
@@ -13,6 +15,17 @@ The format is based on Keep a Changelog, and releases use Semantic Versioning.
 * extend provider verification for cold local-model starts
 * preserve clean release version and commit metadata through install and rollback
 * classify browser runtime failures without exposing internal diagnostics
+
+### Security
+
+* add reproducibly seeded property tests for malformed protocol input, nested secret redaction, denial preservation, and traversal-sensitive identifiers
+* link private vulnerability reporting and define acknowledgment, status-update, and coordinated-disclosure targets
+* record written dispositions for the five open OpenSSF Scorecard findings without claiming unresolved gaps are fixed
+
+### Documentation
+
+* separate verified beta behavior from incomplete stable-release evidence
+* track Windows, live-provider, multi-user daily-use, and final security/go-no-go gates in the `v0.4.0 stable` milestone
 
 ## [0.4.0-beta.1](https://github.com/jason-allen-oneal/Odinn/compare/v0.3.0-beta.3...v0.4.0-beta.1) (2026-07-21)
 

@@ -8,7 +8,7 @@ Until Odinn Forge reaches a stable 1.0 release, security fixes are applied only 
 
 Do not open a public issue for a suspected vulnerability.
 
-Use GitHub's private vulnerability reporting or security advisory feature for this repository. Include:
+Report it through [GitHub private vulnerability reporting](https://github.com/jason-allen-oneal/Odinn/security/advisories/new). Include:
 
 - A concise description of the issue
 - Affected commit, tag, or package version
@@ -17,7 +17,15 @@ Use GitHub's private vulnerability reporting or security advisory feature for th
 - Potential impact
 - Any suggested mitigation
 
-Reports will be acknowledged as soon as practical. Disclosure timing will be coordinated after impact and remediation are understood.
+We make a best-effort attempt to acknowledge reports within seven calendar days.
+During an active investigation, we aim to provide a status update at least every
+14 days, including when there is no material change.
+
+Disclosure timing will be coordinated with the reporter after impact and
+remediation are understood. Where appropriate, the target coordinated-disclosure
+window is up to 90 days from the initial report. If severity, active exploitation,
+remediation availability, or downstream coordination changes that target, we will
+communicate the revised timeline before disclosure.
 
 ## Security boundaries
 

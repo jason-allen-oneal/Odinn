@@ -80,8 +80,9 @@ supporting beta evidence; it does not check a clean-machine box by itself.
 | macOS | [x] | [x] | [ ] | [ ] | [x] |
 | Windows ([tracker](https://github.com/jason-allen-oneal/Odinn/issues/49)) | [ ] | [ ] | [ ] | [ ] | [ ] |
 
-The local Ollama path has been exercised. At least one cloud OAuth path and one
-API-key path remain open in the
+Across the matrix, one cloud OAuth path, one API-key path, and one local Ollama
+path must be exercised. The local Ollama path has been exercised; the cloud
+OAuth and API-key paths remain open in the
 [live-provider validation issue](https://github.com/jason-allen-oneal/Odinn/issues/50).
 Synthetic CI-provider success does not count as real-provider evidence.
 The remaining non-Windows restart/recovery and rollback observations are

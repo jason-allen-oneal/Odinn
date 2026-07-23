@@ -34,8 +34,8 @@ Verified beta evidence:
 Stable-exit evidence is tracked in the
 [final security review and go/no-go issue](https://github.com/jason-allen-oneal/Odinn/issues/52):
 
-- [ ] Recheck the exact stable candidate for unresolved production CodeQL,
-  dependency, and secret-scanning alerts.
+- [ ] No unresolved production CodeQL alerts at the exact stable candidate;
+  recheck dependency and secret-scanning alerts at the same commit.
 - [ ] Test-only and intentional cryptographic findings are fixed or documented
   as reviewed false positives.
 - [ ] OpenSSF Scorecard findings are either corrected or recorded in the

@@ -15,17 +15,13 @@ The project is a clean-room implementation. It does not copy OpenClaw, Hermes, O
 
 ## Beta status
 
-Ódinn Forge is an initial local beta. The core loop is usable:
+Ódinn Forge is a prerelease beta. The core local workflows and release
+automation have substantial verification, but the external evidence required
+for `v0.4.0` stable is not complete.
 
 Public beta participants should begin with the [public beta guide](docs/public-beta.md). It defines the supported local-first scope, verified release installation, privacy boundary, diagnostics, and bug-reporting path.
 
-Current stabilization work and the evidence required before a stable release are tracked in the [Beta 4 stable-exit plan](docs/BETA-4-STABLE-EXIT.md). New subsystems are deferred until those gates are satisfied.
-
-For the authoritative Beta 3 surface classifications, see the [Beta 3 surface matrix](docs/BETA-3-SURFACE-MATRIX.md). Its labels are **verified local behavior**, **experimental and disabled by default**, **provider- or platform-dependent**, and **explicitly unsupported**. The three hard limits are:
-
-- Forked workers are crash containment, not a security sandbox.
-- Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
-- External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
+### Verified beta behavior
 
 - chat with configured models through API keys, OAuth, imported OAuth sessions, local servers, or CLI adapters;
 - recall durable user and project context across sessions;
@@ -35,9 +31,36 @@ For the authoritative Beta 3 surface classifications, see the [Beta 3 surface ma
 - inspect sessions, memory, runs, goals, improvements, providers, and audit events;
 - run deterministic tools and bounded model/tool loops through one audited kernel path.
 
+These behaviors have local regression coverage, and the release pipeline builds
+and exercises clean source archives on Linux, macOS, and Windows. The
+[artifact-level Beta 4 UAT record](docs/uat/v0.4.0-beta.1.md) additionally
+records clean Linux/macOS installation, local Ollama use, restart/recovery, and
+installer rollback evidence. Automated cross-platform and synthetic-provider
+checks do not substitute for the external stable-release evidence below.
+
 The default gateway remains single-user and loopback-only. An opt-in multi-user host is available for remote deployments; it terminates TLS and routes each authenticated user into an independent loopback gateway, state root, workspace, audit ledger, OAuth store, and browser profile. Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
 
 The verified beta foundation includes restart-safe queued jobs, forked gateway workers, durable approval and browser-recovery journals, provider retries and usage normalization, universally audited process/MCP extension execution, DNS-pinned public web fetches, symlink-safe workspace reads, owner-only state repair, versioned native installers with pointer rollback, signed audit-key rotation, bounded counterfactual execution, approved full capsule replay in disposable workspaces, autonomous rollback-safe reliability tuning, and opt-in remote hosting with application-level tenant isolation. See the [Beta 3 surface matrix](docs/BETA-3-SURFACE-MATRIX.md) and [P0 beta ledger](docs/P0-BETA-GATES.md) for the boundaries and release evidence.
+
+### External evidence still required for stable
+
+`v0.4.0` stable remains blocked on four tracked validation campaigns:
+
+- [Windows artifact validation](https://github.com/jason-allen-oneal/Odinn/issues/49) covering installation, onboarding, restart/recovery, and rollback on a real Windows host;
+- [live-provider validation](https://github.com/jason-allen-oneal/Odinn/issues/50) covering both cloud OAuth and API-key paths;
+- [three-user, multi-day validation](https://github.com/jason-allen-oneal/Odinn/issues/51) covering Projects, Sessions, Goals, Memory, and audited tool execution;
+- [final security review and go/no-go](https://github.com/jason-allen-oneal/Odinn/issues/52) covering exact-candidate security evidence, the P0/P1 audit, and the maintainer release decision.
+
+The [Beta 4 stable-exit plan](docs/BETA-4-STABLE-EXIT.md) is the authoritative
+ledger. No unchecked external gate should be inferred from a green synthetic
+check, and new runtime subsystems remain deferred until the stable gates are
+satisfied.
+
+For the authoritative surface classifications, see the [Beta 3 surface matrix](docs/BETA-3-SURFACE-MATRIX.md). Its labels are **verified local behavior**, **experimental and disabled by default**, **provider- or platform-dependent**, and **explicitly unsupported**. The three hard limits are:
+
+- Forked workers are crash containment, not a security sandbox.
+- Remote hosting is application-level tenant isolation, not hostile-user OS isolation.
+- External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.
 
 ## Quick start
 
@@ -303,12 +326,17 @@ Release-package validation extracts both source archives, installs with the froz
 
 ```bash
 pnpm release:package
+pnpm release:soak
 pnpm release:checksums
 node scripts/release/verify.ts
 pnpm release:install-smoke
-pnpm release:soak
 pnpm storage:drill
 ```
+
+Run this sequence from a clean, committed candidate: the packager archives
+`HEAD`, not uncommitted working-tree changes. Run the soak before checksums so
+`soak-report.json` is included in the final checksum set; if any release
+artifact changes afterward, regenerate the checksums and rerun verification.
 
 ## Security
 

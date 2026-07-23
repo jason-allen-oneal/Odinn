@@ -44,12 +44,15 @@ The verified beta foundation includes restart-safe queued jobs, forked gateway w
 
 ### External evidence still required for stable
 
-`v0.4.0` stable remains blocked on four tracked validation campaigns:
+`v0.4.0` stable remains blocked on three tracked validation campaigns:
 
 - [Windows artifact validation](https://github.com/jason-allen-oneal/Odinn/issues/49) covering installation, onboarding, restart/recovery, and rollback on a real Windows host;
-- [live-provider validation](https://github.com/jason-allen-oneal/Odinn/issues/50) covering both cloud OAuth and API-key paths;
 - [three-user, multi-day validation](https://github.com/jason-allen-oneal/Odinn/issues/51) covering Projects, Sessions, Goals, Memory, and audited tool execution;
 - [final security review and go/no-go](https://github.com/jason-allen-oneal/Odinn/issues/52) covering exact-candidate security evidence, the P0/P1 audit, and the maintainer release decision.
+
+Published `v0.4.0-beta.3` validation completed the
+[cloud OAuth and API-key provider gate](https://github.com/jason-allen-oneal/Odinn/issues/50#issuecomment-5054659155)
+with clean installation, restart persistence, and secret-leak evidence.
 
 The [Beta 4 stable-exit plan](docs/BETA-4-STABLE-EXIT.md) is the authoritative
 ledger. No unchecked external gate should be inferred from a green synthetic

@@ -13,14 +13,14 @@ request, attached to the release artifacts, or recorded in its tracking issue.
 Synthetic providers and hosted CI runners do not count as live-provider,
 daily-use, or clean-machine evidence.
 
-Four issues collect the remaining release-blocking evidence:
+Four issues track the stable-exit evidence; the live-provider gate is complete:
 
-| Gate | Required external evidence | Tracking |
+| Gate | Required external evidence | Status |
 | --- | --- | --- |
-| Windows artifact validation | Real Windows installation, onboarding, restart/recovery, and rollback | [release blocker](https://github.com/jason-allen-oneal/Odinn/issues/49) |
-| Live-provider validation | At least one cloud OAuth path and one API-key path | [release blocker](https://github.com/jason-allen-oneal/Odinn/issues/50) |
-| Three-user, multi-day validation | Projects, Sessions, Goals, Memory, and audited tool execution | [release blocker](https://github.com/jason-allen-oneal/Odinn/issues/51) |
-| Final security review and go/no-go | Exact-candidate security evidence, P0/P1 audit, and maintainer decision | [release blocker](https://github.com/jason-allen-oneal/Odinn/issues/52) |
+| Windows artifact validation | Real Windows installation, onboarding, restart/recovery, and rollback | [Open](https://github.com/jason-allen-oneal/Odinn/issues/49) |
+| Live-provider validation | At least one cloud OAuth path and one API-key path | [Complete](https://github.com/jason-allen-oneal/Odinn/issues/50#issuecomment-5054659155) |
+| Three-user, multi-day validation | Projects, Sessions, Goals, Memory, and audited tool execution | [Open](https://github.com/jason-allen-oneal/Odinn/issues/51) |
+| Final security review and go/no-go | Exact-candidate security evidence, P0/P1 audit, and maintainer decision | [Open](https://github.com/jason-allen-oneal/Odinn/issues/52) |
 
 ## 1. Security closeout
 
@@ -81,10 +81,11 @@ supporting beta evidence; it does not check a clean-machine box by itself.
 | Windows ([tracker](https://github.com/jason-allen-oneal/Odinn/issues/49)) | [ ] | [ ] | [ ] | [ ] | [ ] |
 
 At least one cloud OAuth path, one API-key path, and one local Ollama path must
-be exercised across the matrix. The local Ollama path has been exercised; the
-cloud OAuth and API-key paths remain open in the
-[live-provider validation issue](https://github.com/jason-allen-oneal/Odinn/issues/50).
-Synthetic CI-provider success does not count as real-provider evidence.
+be exercised across the matrix. The local Ollama path and the published
+`v0.4.0-beta.3` cloud OAuth and API-key paths have been exercised. The
+[sanitized live-provider evidence](https://github.com/jason-allen-oneal/Odinn/issues/50#issuecomment-5054659155)
+includes restart persistence and credential-leak checks. Synthetic CI-provider
+success does not count as real-provider evidence.
 The remaining non-Windows restart/recovery and rollback observations are
 collected with the daily-use evidence below.
 

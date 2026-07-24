@@ -159,7 +159,9 @@ test("kernel refreshes OAuth credentials before model execution", async () => {
     assert.equal(request.headers.authorization, "Bearer access-refreshed");
     let raw = "";
     for await (const chunk of request) raw += chunk;
-    assert.equal(JSON.parse(raw).input[0].content, "Hello OAuth");
+    const body = JSON.parse(raw);
+    assert.equal(body.instructions, "Follow the user request.");
+    assert.equal(body.input[0].content, "Hello OAuth");
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ output_text: "ODINN_OAUTH_OK" }));
   });
@@ -226,6 +228,8 @@ test("kernel speaks the ChatGPT Codex SSE transport for imported OAuth", async (
     }));
     assert.equal(body.stream, true);
     assert.equal(body.store, false);
+    assert.equal(body.instructions, "Keep the answer concise.");
+    assert.deepEqual(body.input, [{ role: "user", content: "Hello Codex" }]);
     assert.equal(body.tools[0].name, "web_x2e_search");
     // The live ChatGPT Codex endpoint may omit Content-Type for an SSE body.
     response.writeHead(200);
@@ -264,7 +268,10 @@ test("kernel speaks the ChatGPT Codex SSE transport for imported OAuth", async (
         id: "run_codex_model",
         tool: "model.chat",
         input: {
-          messages: [{ role: "user", content: "Hello Codex" }],
+          messages: [
+            { role: "system", content: "Keep the answer concise." },
+            { role: "user", content: "Hello Codex" }
+          ],
           tools: [{ type: "function", function: { name: "web.search", description: "Search the web", parameters: { type: "object", properties: {} } } }]
         },
         actor: "test"

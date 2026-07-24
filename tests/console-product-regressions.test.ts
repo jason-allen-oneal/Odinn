@@ -79,12 +79,13 @@ test("console presents the human-first product surfaces and dedicated Labs pages
     assert.match(navigation, /data-view="agents"[^>]*data-title="Agent SDK"/);
     assert.match(navigation, /data-view="skills"[^>]*data-title="Skills SDK"/);
     assert.match(navigation, /data-view="projects"[^>]*data-title="Projects"/);
+    assert.match(navigation, /data-view="config"[^>]*data-title="Configuration"/);
 
     const viewMatches = [...html.matchAll(/<section\b[^>]*\bid=["']view-([^"']+)["'][^>]*>/giu)].map((match) => match[1]);
     const navigationMatches = [...navigation.matchAll(/\bdata-view=["']([^"']+)["']/giu)].map((match) => match[1]);
     const views = [...new Set(viewMatches)];
     const navigationTargets = [...new Set(navigationMatches)];
-    assert.equal(views.length, 19, "the console must expose the product surface plus seven dedicated Labs pages");
+    assert.equal(views.length, 20, "the console must expose the product surface plus seven dedicated Labs pages");
     assert.equal(viewMatches.length, views.length, "console view ids must be unique");
     assert.equal(navigationMatches.length, navigationTargets.length, "console navigation targets must be unique");
     assert.deepEqual(
@@ -134,6 +135,12 @@ test("console presents the human-first product surfaces and dedicated Labs pages
     const goals = section(html, /<section id="view-goals"[^>]*>/, /<\/section>/);
     assertIds(goals, ["new-goal", "goal-dialog", "goal-scope-type", "goal-scope-id", "goal-project-filter", "goal-status-filter", "goal-query", "goal-description", "goal-list"]);
     assert.match(goals, /update progress quickly/i);
+
+    const config = section(html, /<section id="view-config"[^>]*>/, /<section id="view-automatic-improvements"[^>]*>/);
+    assertIds(config, ["config-state", "config-editor", "config-error", "format-config", "reload-config", "save-config", "config-restart"]);
+    assert.match(config, /Configuration JSON/);
+    assert.match(config, /\.odinn\/config\.json/);
+    assert.match(config, /restart/i);
 
     const memory = section(html, /<section id="view-memory"[^>]*>/, /<\/section>/);
     assertIds(memory, [
@@ -220,6 +227,14 @@ test("console presents the human-first product surfaces and dedicated Labs pages
     const script = inlineScripts[0];
     assert.match(script, /location\.hash/u, "view selection must be reflected in the URL hash");
     assert.match(script, /addEventListener\(["']hashchange["']/u, "browser Back and direct hashes must restore the selected view");
+    assert.match(script, /api\(["']\/config["']\)/u, "the configuration page must load config.json");
+    assert.match(script, /method:\s*["']PUT["'][\s\S]{0,320}fingerprint/u, "configuration saves must use conflict protection");
+    assert.match(script, /sidebar-settings["']\)\.addEventListener\(["']click["'],\s*\(\)\s*=>\s*switchView\(["']config["']\)/u);
+    assert.match(
+      script,
+      /chat-input["']\)\.addEventListener\(["']keydown["'][\s\S]*event\.key === ["']Enter["'] && !event\.shiftKey && !event\.isComposing && event\.keyCode !== 229[\s\S]*send-chat["']\)\.click\(\)/u,
+      "Enter must send chat while Shift+Enter remains available for a newline"
+    );
     const sessionControls = section(script, /function sessionDisplayTitle\s*\(/u, /function renderChatMessages\s*\(/u);
     assert.match(sessionControls, /window\.prompt\("Rename chat", sessionDisplayTitle\(sessionId\)\)/u);
     assert.match(sessionControls, /const title = sessionDisplayTitle\(sessionId\);[\s\S]*window\.confirm/u);

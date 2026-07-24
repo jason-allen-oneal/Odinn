@@ -48,6 +48,14 @@ test("multi-user host authenticates and isolates each tenant gateway state", asy
     assert.equal(aliceStatusResponse.headers.get("x-odinn-host-user"), "alice");
     const aliceStatus = await aliceStatusResponse.json();
     assert.equal(aliceStatus.workspaceRoot, aliceRoot);
+    const aliceConfig = await (await fetch(`${base}/config`, { headers: { cookie: aliceCookie } })).json();
+    const escapedAudit = await fetch(`${base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", cookie: aliceCookie, origin: publicOrigin },
+      body: JSON.stringify({ config: { ...aliceConfig.config, auditLog: "../bob/audit.jsonl" }, fingerprint: aliceConfig.fingerprint })
+    });
+    assert.equal(escapedAudit.status, 400);
+    assert.match((await escapedAudit.json()).error, /audit-\*\.jsonl filename/);
     const aliceConsole = await (await fetch(`${base}/`, { headers: { cookie: aliceCookie } })).text();
     assert.match(aliceConsole, /<button\b[^>]*\bid=["']remote-signout["'][^>]*\bhidden\b[^>]*>/iu, "the shared shell must keep sign out hidden until hosted status is known");
     assert.match(aliceConsole, /id=["']remote-signout["'][\s\S]{0,160}(?:Sign out|Log out)/iu);

@@ -2,7 +2,7 @@ process.env.ODINN_GATEWAY_AUTH = "off";
 process.env.ODINN_BROWSER_HEADLESS = "1";
 
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -51,6 +51,98 @@ async function patchJson(url: string, body: unknown, expectedStatus = 200) {
     body: JSON.stringify(body)
   }, expectedStatus);
 }
+
+test("configuration API safely edits config.json and rejects stale writes", async () => {
+  const initial = {
+    version: 1,
+    defaultModel: "",
+    providers: {},
+    customSetting: { preserved: true },
+    selfImprovement: { enabled: false, mode: "disabled" }
+  };
+  const gateway = await gatewayFixture("odinn-config-surface", initial);
+  try {
+    const loaded = await requestJson(`${gateway.base}/config`);
+    assert.deepEqual(loaded.config, initial);
+    assert.match(loaded.fingerprint, /^[a-f0-9]{64}$/);
+    assert.equal(loaded.restartRequired, false);
+
+    const unchanged = await requestJson(`${gateway.base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ config: initial, fingerprint: loaded.fingerprint })
+    });
+    assert.equal(unchanged.restartRequired, false);
+
+    const next = {
+      ...initial,
+      defaultModel: "local:test-model",
+      customSetting: { preserved: true, addedThroughConsole: true }
+    };
+    const saved = await requestJson(`${gateway.base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ config: next, fingerprint: unchanged.fingerprint })
+    });
+    assert.deepEqual(saved.config, next);
+    assert.equal(saved.restartRequired, true);
+    assert.match(saved.fingerprint, /^[a-f0-9]{64}$/);
+    assert.deepEqual(JSON.parse(await readFile(join(gateway.stateDir, "config.json"), "utf8")), next);
+    assert.equal((await stat(join(gateway.stateDir, "config.json"))).mode & 0o777, 0o600);
+
+    const current = await requestJson(`${gateway.base}/config`);
+    assert.equal(current.restartRequired, true);
+    const external = { ...next, customSetting: { preserved: true, changedElsewhere: true } };
+    await writeFile(join(gateway.stateDir, "config.json"), `${JSON.stringify(external, null, 2)}\n`, { mode: 0o600 });
+    const conflict = await requestJson(`${gateway.base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ config: next, fingerprint: current.fingerprint })
+    }, 409);
+    assert.match(conflict.error, /changed after this page loaded/);
+    assert.deepEqual(JSON.parse(await readFile(join(gateway.stateDir, "config.json"), "utf8")), external);
+
+    const reloaded = await requestJson(`${gateway.base}/config`);
+    const invalid = await requestJson(`${gateway.base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ config: [], fingerprint: reloaded.fingerprint })
+    }, 400);
+    assert.match(invalid.error, /must be a JSON object/);
+
+    for (const auditLog of [42, "../other-tenant/audit.jsonl", "nested/audit.jsonl", "config.json", "records.jsonl"]) {
+      const unsafe = await requestJson(`${gateway.base}/config`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ config: { ...external, auditLog }, fingerprint: reloaded.fingerprint })
+      }, 400);
+      assert.match(unsafe.error, /auditLog must be audit\.jsonl or an audit-\*\.jsonl filename/);
+    }
+
+    const invalidProvider = await requestJson(`${gateway.base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        config: {
+          ...external,
+          providers: {
+            local: {
+              type: "openai-compatible",
+              baseUrl: "http://127.0.0.1:1234/v1",
+              models: ["test"],
+              auth: { mode: "unsupported" }
+            }
+          }
+        },
+        fingerprint: reloaded.fingerprint
+      })
+    }, 400);
+    assert.match(invalidProvider.error, /unsupported auth mode/);
+    assert.deepEqual(JSON.parse(await readFile(join(gateway.stateDir, "config.json"), "utf8")), external);
+  } finally {
+    await gateway.close();
+  }
+});
 
 test("audit query paginates and filters while usage shares its summary semantics", async () => {
   const gateway = await gatewayFixture("odinn-audit-surface", {

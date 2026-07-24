@@ -106,7 +106,7 @@ const EXPERIMENTAL_HOME = [
     id: "self-improvement",
     label: "Self-improvement",
     configKey: "selfImprovement",
-    description: "Learn from recorded failures, create auditable proposals, and keep application review-gated unless auto mode is explicitly enabled.",
+    description: "Watch for repeated reliability problems, ask the configured model for guidance, and apply only bounded changes with a restore point.",
     safeActions: [
       "odinn experimental self-improvement list [--state .odinn]",
       "odinn experimental self-improvement propose --title <title> --rationale <text> [--state .odinn]"
@@ -346,7 +346,7 @@ Usage:
   odinn experimental enable|disable <feature> [--confirm-impact] [--state .odinn]
   odinn experimental <feature> <action> [options]
   odinn config self-improvement show [--state .odinn]
-  odinn config self-improvement set [--enabled true|false] [--mode disabled|propose|auto] [--interval-ms <ms>] [--max-changes <count>] [--confirm-impact] [--state .odinn]
+  odinn config self-improvement set [--enabled true|false] [--mode disabled|propose|auto] [--interval-ms <ms>] [--max-changes <count>] [--state .odinn]
   odinn auth import openclaw [--provider openai] [--profile <id-or-email>] [--source <path>] [--state .odinn]
   odinn import openclaw|hermes [--source <path>] [--auth-only|--skills-only] [--dry-run] [--state .odinn]
   odinn state backup --output <directory> [--state .odinn]
@@ -1316,7 +1316,7 @@ function experimentalFeatureStatus(entry: any, config: any) {
     inspectionActions: [...entry.safeActions],
     enabledActions: [...entry.activeActions],
     guard: selfManaged
-      ? "proposal and review commands remain available; autonomous application requires enabled=true and mode=auto"
+      ? "runs automatically by default; application stays limited to reversible, allowlisted reliability settings"
       : entry.id === "capabilities"
         ? `token issuance and consumption reject requests until ${entry.configKey}=true; list and revoke remain available for inspection and emergency cleanup`
         : `active runtime actions reject requests until ${entry.configKey}=true`
@@ -1338,7 +1338,9 @@ async function experimentalStatus(args: any, requestedFeature: any = undefined, 
     configPath: join(state, "config.json"),
     configured: existsSync(join(state, "config.json")),
     warning: experimentalFeatureWarning(config.experimental),
-    disabledByDefault: true,
+    disabledByDefault: false,
+    experimentalFeaturesDisabledByDefault: true,
+    automaticSelfImprovementDefault: true,
     features: visible
   };
 }
@@ -1364,8 +1366,8 @@ Status:
   }
   console.log(`Ódinn experimental systems
 
-All feature flags and autonomous self-improvement are disabled by default. Validation,
-inspection, proposals, and dry-run previews stay separate from mutating operations.
+The seven Labs feature flags are off by default. Automatic improvement runs by default
+and remains limited to reversible, allowlisted reliability adjustments.
 
 Commands:
   odinn experimental list [--state .odinn]
@@ -1520,7 +1522,6 @@ async function configCommand(args: any) {
     const enabled = option(rest, "--enabled", "");
     const mode = option(rest, "--mode", current.mode);
     if (!["disabled", "propose", "auto"].includes(mode)) throw new Error("--mode requires disabled, propose, or auto");
-    if (enabled === "true" || mode === "auto") requireImpactConfirmation(rest, "autonomous-self-improvement");
     config.selfImprovement = normalizeSelfImprovementConfig({
       ...current,
       mode,

@@ -151,7 +151,7 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
       }
       const backend = await tenant(user);
       if (!['GET', 'HEAD'].includes(request.method || 'GET') && await directorySize(backend.stateDir) > maximumTenantStorageBytes) return send(response, 507, { error: "tenant storage quota exceeded" });
-      proxy(request, response, backend);
+      proxy(request, response, backend, session.userId);
     } catch (error: any) {
       console.error("Odinn host request failed:", error);
       send(response, 500, { error: "internal host error" });
@@ -181,7 +181,7 @@ export async function addHostUser({ stateDir = ".odinn-host", id, password, work
   return { id, workspaceRoot: workspace };
 }
 
-function proxy(incoming: any, outgoing: any, backend: any) {
+function proxy(incoming: any, outgoing: any, backend: any, userId = "") {
   const headers: Record<string, string | string[] | undefined> = {
     host: `127.0.0.1:${backend.port}`,
     authorization: `Bearer ${backend.token}`,
@@ -197,6 +197,8 @@ function proxy(incoming: any, outgoing: any, backend: any) {
   const sanitizedHeaders = Object.fromEntries(Object.entries(headers).filter(([, value]) => value !== undefined));
   const request = httpRequest({ hostname: "127.0.0.1", port: backend.port, path: incoming.url, method: incoming.method, headers: sanitizedHeaders }, (response: any) => {
     const forwarded = { ...response.headers }; delete forwarded["set-cookie"];
+    forwarded["x-odinn-hosted"] = "true";
+    forwarded["x-odinn-host-user"] = userId;
     outgoing.writeHead(response.statusCode ?? 502, forwarded); response.pipe(outgoing);
   });
   request.on("error", (error: any) => {
@@ -260,7 +262,62 @@ async function readBody(request: any) { const chunks = []; let size = 0; for awa
 function send(response: any, status: any, value: any) { if (response.headersSent) return; response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" }); response.end(`${JSON.stringify(value)}\n`); }
 function loginPage(response: any) {
   response.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'" });
-  response.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Ódinn Forge sign in</title><style>body{margin:0;background:#080a0d;color:#e7e9ee;font:15px system-ui;display:grid;place-items:center;min-height:100vh}form{width:min(360px,85vw);display:grid;gap:14px;padding:28px;border:1px solid #262b34;border-radius:16px;background:#11141a}input,button{padding:12px;border-radius:9px;border:1px solid #343b47;background:#0b0e13;color:inherit}button{background:#d6a84b;color:#111;font-weight:700}</style></head><body><form id="login"><h1>Ódinn Forge</h1><input name="userId" autocomplete="username" placeholder="User" required><input name="password" type="password" autocomplete="current-password" placeholder="Password" required><button>Sign in</button><div id="error"></div></form><script>login.onsubmit=async(e)=>{e.preventDefault();const f=new FormData(login);const r=await fetch('/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.fromEntries(f))});if(r.ok)location='/';else error.textContent='Authentication failed';}</script></body></html>`);
+  response.end(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in to Ódinn Forge</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#080a0d;color:#e7e9ee;font:15px system-ui;display:grid;place-items:center;min-height:100vh;padding:20px}
+    form{width:min(390px,100%);display:grid;gap:14px;padding:28px;border:1px solid #343b47;border-radius:16px;background:#11141a;box-shadow:0 18px 54px rgba(0,0,0,.35)}
+    h1,p{margin:0}p{color:#aeb8c7;line-height:1.5}label{display:grid;gap:7px;font-weight:700}
+    input,button{min-height:46px;padding:12px;border-radius:9px;border:1px solid #4a5566;background:#0b0e13;color:inherit;font:inherit}
+    button{background:#d6a84b;color:#111;font-weight:800;cursor:pointer}button:disabled{cursor:wait;opacity:.72}
+    input:focus-visible,button:focus-visible{outline:3px solid #8baeff;outline-offset:2px}
+    #error{min-height:22px;color:#ff9eaa;font-weight:700}
+  </style>
+</head>
+<body>
+  <form id="login">
+    <h1>Sign in to Ódinn Forge</h1>
+    <p>Use the account provided by this host's administrator. Each account has a separate workspace and state.</p>
+    <label for="user-id">User ID<input id="user-id" name="userId" autocomplete="username" required></label>
+    <label for="password">Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+    <button id="sign-in" type="submit">Sign in</button>
+    <div id="error" role="alert" aria-live="assertive"></div>
+  </form>
+  <script>
+    const form=document.getElementById('login');
+    const button=document.getElementById('sign-in');
+    const error=document.getElementById('error');
+    form.addEventListener('submit',async(event)=>{
+      event.preventDefault();
+      error.textContent='';
+      button.disabled=true;
+      button.textContent='Signing in…';
+      try{
+        const fields=new FormData(form);
+        const response=await fetch('/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.fromEntries(fields))});
+        if(response.ok){location.assign('/');return;}
+        const payload=await response.json().catch(()=>({}));
+        error.textContent=response.status===429
+          ? 'Too many sign-in attempts. Wait a few minutes and try again.'
+          : payload.error==='user disabled'
+            ? 'This account is disabled. Contact the host administrator.'
+            : 'Sign-in failed. Check your user ID and password.';
+        document.getElementById('user-id').focus();
+      }catch{
+        error.textContent='The sign-in service is unavailable. Check your connection and try again.';
+        document.getElementById('user-id').focus();
+      }finally{
+        button.disabled=false;
+        button.textContent='Sign in';
+      }
+    });
+  </script>
+</body>
+</html>`);
 }
 
 if (isMain) {

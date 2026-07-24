@@ -324,15 +324,84 @@ test("workspace.readText is confined to the workspace root", async () => {
   );
 });
 
-test("self-improvement defaults to review-gated proposals", async () => {
+test("self-improvement defaults to automatic observation without a review gate", async () => {
   const { root, auditStore } = await fixture();
   const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn"), auditStore });
   await auditStore.append({ runId: "failed-a", type: "task.failed", actor: "test", tool: "web.fetch", message: "DNS validation failed" });
   await auditStore.append({ runId: "failed-b", type: "task.failed", actor: "test", tool: "web.fetch", message: "DNS validation failed" });
   const result = await runTask({ task: { id: "learn-1", tool: "improve.learn", input: {}, actor: "test" }, auditStore, registry });
   assert.equal(result.output.applied.length, 0);
-  assert.equal(result.output.requiresHumanDecision, true);
+  assert.equal(result.output.mode, "auto");
+  assert.equal(result.output.requiresHumanDecision, false);
   assert.equal(result.output.generated.length, 1);
+});
+
+test("self-improvement uses the configured model for plain-language guidance without exposing raw failures", async () => {
+  let providerRequest: any;
+  const provider = createHttpServer(async (request: any, response: any) => {
+    let raw = "";
+    for await (const chunk of request) raw += chunk;
+    providerRequest = JSON.parse(raw);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      choices: [{
+        message: {
+          role: "assistant",
+          content: JSON.stringify({
+            groups: [{
+              key: "observation-1",
+              title: "Make web reading more dependable",
+              rationale: "The same connection problem interrupted web reading more than once.",
+              summary: "Repeated connection interruption",
+              priority: "high"
+            }]
+          })
+        }
+      }]
+    }));
+  });
+  await new Promise((resolve: any) => provider.listen(0, "127.0.0.1", resolve));
+  const { port } = provider.address();
+  const { root, auditStore } = await fixture();
+  const stateDir = join(root, ".odinn");
+  const config = {
+    defaultModel: "test:advisor",
+    providers: {
+      test: {
+        type: "openai-compatible",
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+        models: ["advisor"]
+      }
+    }
+  };
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir, config, auditStore });
+  const sensitiveFailure = "DNS connection failed with token sk-do-not-send";
+  await auditStore.append({ runId: "web-a", type: "task.failed", actor: "test", tool: "web.fetch", message: sensitiveFailure });
+  await auditStore.append({ runId: "web-b", type: "task.failed", actor: "test", tool: "web.fetch", message: sensitiveFailure });
+  try {
+    const learned = await runTask({ task: { id: "learn-advised", tool: "improve.learn", input: {}, actor: "test" }, auditStore, registry });
+    assert.equal(learned.output.advisor.source, "configured-provider");
+    assert.equal(learned.output.advisor.model, "test:advisor");
+    assert.equal(learned.output.generated[0].title, "Make web reading more dependable");
+    assert.equal(learned.output.generated[0].priority, "high");
+    assert.equal(learned.output.generated[0].action, undefined, "model guidance cannot invent an autonomous action");
+    assert.match(JSON.stringify(providerRequest), /observation-1/);
+    assert.doesNotMatch(JSON.stringify(providerRequest), /sk-do-not-send|DNS connection failed/);
+  } finally {
+    await new Promise((resolve: any, reject: any) => provider.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
+test("self-improvement ignores allowed safety checks and its own activity", async () => {
+  const { root, auditStore } = await fixture();
+  const registry = createBuiltInRegistry({ workspaceRoot: root, stateDir: join(root, ".odinn"), auditStore });
+  await auditStore.append({ runId: "allowed-a", type: "task.policy", actor: "test", tool: "model.chat", decision: "allow", message: "policy allowed task" });
+  await auditStore.append({ runId: "allowed-b", type: "task.policy", actor: "test", tool: "model.chat", decision: "allow", message: "policy allowed task" });
+  await auditStore.append({ runId: "own-a", type: "task.failed", actor: "automatic-improvement", tool: "model.chat", message: "provider unavailable" });
+  await auditStore.append({ runId: "own-b", type: "task.failed", actor: "autonomous-improvement", tool: "model.chat", message: "provider unavailable" });
+  const learned = await runTask({ task: { id: "learn-filtered", tool: "improve.learn", input: {}, actor: "test" }, auditStore, registry });
+  assert.equal(learned.output.generated.length, 0);
+  assert.equal(learned.output.observedEvents, 0);
 });
 
 test("self-improvement autonomously applies and rolls back allowlisted runtime tuning", async () => {
@@ -484,6 +553,13 @@ test("memory records are typed, searchable, curated, and superseded by correctio
   assert.equal(search.output.memories.length, 1);
   assert.equal(search.output.memories[0].id, original.output.id);
 
+  const noMatch = await runTask({
+    task: { id: "run_memory_search_no_match", tool: "memory.search", input: { query: "unlikely-no-match-ux-audit" }, actor: "test" },
+    auditStore,
+    registry
+  });
+  assert.deepEqual(noMatch.output.memories, []);
+
   const correction = await runTask({
     task: {
       id: "run_memory_correct",
@@ -514,6 +590,19 @@ test("memory records are typed, searchable, curated, and superseded by correctio
     registry
   });
   assert.ok(browsed.output.namespaces.some((entry: any) => entry.namespace === "user/preferences"));
+
+  const forgotten = await runTask({
+    task: { id: "run_memory_forget", tool: "memory.forget", input: { targetId: correction.output.id }, actor: "test" },
+    auditStore,
+    registry
+  });
+  assert.equal(forgotten.output.forgotten, true);
+  const afterForget = await runTask({
+    task: { id: "run_memory_search_after_forget", tool: "memory.search", input: { query: "exact runnable commands" }, actor: "test" },
+    auditStore,
+    registry
+  });
+  assert.deepEqual(afterForget.output.memories, []);
 });
 
 test("memory compacts session context into an L0 summary", async () => {
@@ -587,7 +676,22 @@ test("agent auto-learns explicit facts and recalls them into later model context
       auditStore,
       registry
     });
-    assert.equal(learned.output.memory.learned, 1);
+    assert.equal(learned.output.memory.suggested, 1);
+    assert.equal(learned.output.memory.learned, 0);
+    const candidates = await runTask({
+      task: { id: "run_agent_memory_candidates", tool: "memory.candidates", input: { status: "pending" }, actor: "test" },
+      auditStore,
+      registry
+    });
+    assert.equal(candidates.output.count, 1);
+    assert.match(candidates.output.candidates[0].text, /dark themes/i);
+    const accepted = await runTask({
+      task: { id: "run_agent_memory_accept", tool: "memory.decide", input: { candidateId: candidates.output.candidates[0].id, decision: "accepted" }, actor: "test" },
+      auditStore,
+      registry
+    });
+    assert.equal(accepted.output.candidate.status, "accepted");
+    assert.equal(accepted.output.memory.authority, "user-curated");
 
     const recalled = await runTask({
       task: {

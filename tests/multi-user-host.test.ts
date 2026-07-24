@@ -5,6 +5,14 @@ import { join } from "node:path";
 import test from "node:test";
 import { createMultiUserHost, hashPassword } from "../apps/gateway/src/host.ts";
 
+function assertLabeledInput(html: string, name: string) {
+  const input = new RegExp(`<input\\b[^>]*\\bname=["']${name}["'][^>]*>`, "iu").exec(html)?.[0];
+  assert.ok(input, `missing ${name} input`);
+  const id = /\bid=["']([^"']+)["']/iu.exec(input)?.[1];
+  assert.ok(id, `${name} input needs an id for its label`);
+  assert.match(html, new RegExp(`<label\\b[^>]*\\bfor=["']${id}["'][^>]*>`, "iu"), `${name} input needs a visible label`);
+}
+
 test("multi-user host authenticates and isolates each tenant gateway state", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-host-"));
   const aliceRoot = await mkdtemp(join(tmpdir(), "odinn-alice-"));
@@ -19,13 +27,36 @@ test("multi-user host authenticates and isolates each tenant gateway state", asy
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
+    const loginPage = await fetch(`${base}/auth/login`);
+    assert.equal(loginPage.status, 200);
+    const loginHtml = await loginPage.text();
+    assertLabeledInput(loginHtml, "userId");
+    assertLabeledInput(loginHtml, "password");
+    const loginFeedback = [...loginHtml.matchAll(/<[^>]+>/gu)]
+      .map((match) => match[0])
+      .find((tag) => /\bid=["'][^"']*(?:error|feedback|status)[^"']*["']/iu.test(tag));
+    assert.ok(loginFeedback, "login needs a dedicated error region");
+    assert.match(loginFeedback, /\b(?:role=["']alert["']|aria-live=["'](?:polite|assertive)["'])/iu, "login failures need to be announced");
+
     assert.equal((await fetch(`${base}/status`)).status, 401);
     assert.equal((await fetch(`${base}/auth/login`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ userId: "alice", password: "alice-password-long" }) })).status, 403);
     const aliceLogin = await fetch(`${base}/auth/login`, { method: "POST", headers: { "content-type": "application/json", origin: publicOrigin }, body: JSON.stringify({ userId: "alice", password: "alice-password-long" }) });
     assert.equal(aliceLogin.status, 200);
     const aliceCookie = aliceLogin.headers.get("set-cookie").split(";")[0];
-    const aliceStatus = await (await fetch(`${base}/status`, { headers: { cookie: aliceCookie } })).json();
+    const aliceStatusResponse = await fetch(`${base}/status`, { headers: { cookie: aliceCookie } });
+    assert.equal(aliceStatusResponse.headers.get("x-odinn-hosted"), "true");
+    assert.equal(aliceStatusResponse.headers.get("x-odinn-host-user"), "alice");
+    const aliceStatus = await aliceStatusResponse.json();
     assert.equal(aliceStatus.workspaceRoot, aliceRoot);
+    const aliceConsole = await (await fetch(`${base}/`, { headers: { cookie: aliceCookie } })).text();
+    assert.match(aliceConsole, /<button\b[^>]*\bid=["']remote-signout["'][^>]*\bhidden\b[^>]*>/iu, "the shared shell must keep sign out hidden until hosted status is known");
+    assert.match(aliceConsole, /id=["']remote-signout["'][\s\S]{0,160}(?:Sign out|Log out)/iu);
+    assert.match(
+      aliceConsole,
+      /remote-signout[\s\S]{0,500}(?:hidden\s*=\s*false|removeAttribute\(["']hidden["']\))|(?:hidden\s*=\s*false|removeAttribute\(["']hidden["']\))[\s\S]{0,500}remote-signout/iu,
+      "hosted status must reveal the sign-out control"
+    );
+    assert.match(aliceConsole, /\/auth\/logout/u, "the sign-out control must call the host logout route");
     const bobLogin = await fetch(`${base}/auth/login`, { method: "POST", headers: { "content-type": "application/json", origin: publicOrigin }, body: JSON.stringify({ userId: "bob", password: "bob-password-longer" }) });
     const bobCookie = bobLogin.headers.get("set-cookie").split(";")[0];
     const bobStatus = await (await fetch(`${base}/status`, { headers: { cookie: bobCookie } })).json();

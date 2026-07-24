@@ -101,7 +101,7 @@ pnpm odinn runs
 pnpm odinn audit
 ```
 
-The packaged release gate is stronger than the local echo smoke: CI launches the gateway as a child process, configures a local OpenAI-compatible provider endpoint, sends a model request through the gateway, and verifies the assistant response was written to the run record. See [the P0 beta ledger](docs/P0-BETA-GATES.md) for what is implemented and what is still deliberately blocked.
+The packaged integration check goes beyond the local echo smoke: CI launches the gateway as a child process, configures a local OpenAI-compatible provider endpoint, sends a model request through the gateway, and verifies the assistant response was written to the run record. See [the P0 beta ledger](docs/P0-BETA-GATES.md) for the current implementation evidence and known limits.
 
 ### Phase 0 runtime ledger
 
@@ -132,7 +132,7 @@ The existing `config experimental` and feature-specific commands remain availabl
 - **Capsules** export redacted ZIP-compatible run bundles with checksum verification and safe extraction.
 - **Counterfactual** creates separate filesystem copies of candidate workspaces and compares their durable run records; these copies are not OS sandboxes, and candidate execution and selection remain operator-driven.
 - **Darwin** scores models from recorded verification, reliability, speed, cost, and policy outcomes.
-- **Self-improvement** mines repeated audited failures into reviewable proposals. It does not rewrite code, change policy, install skills, or approve its own changes.
+- **Automatic improvements** watches for repeated audited failures, uses the configured model for a plain-language assessment, and automatically applies only reversible, allowlisted reliability tuning. It does not rewrite code, change safeguards, install skills, or invent its own actions.
 
 These are initial local slices, not a claim that arbitrary remote effects can be reversed or perfectly replayed. Browser sessions and external mutations are supported only through the documented approval, recovery, and egress boundaries. Counterfactual execution is explicit and operator-driven. Forked workers are crash containment, not a security sandbox. Remote hosting is application-level tenant isolation, not hostile-user OS isolation. External effects and nondeterministic provider behavior are outside full replay/rollback guarantees. See the [Beta 3 surface matrix](docs/BETA-3-SURFACE-MATRIX.md) before enabling an experimental feature.
 
@@ -260,7 +260,7 @@ Executable extensions use one of two explicit adapters. `container` is the defau
 
 Use `--allow-unsafe-sandbox` only when enabling a manifest that explicitly selects `unconfined-process`. The flag is not required for the default container adapter.
 
-The local console includes Projects, scoped Sessions and Goals, durable Memory, Usage, Cron Jobs, meaningful proof/audit Tasks, a paginated Audit ledger, an Agent SDK package registry, and a managed Skill SDK. Agent and skill packages install disabled; registration or discovery does not execute or activate them. See [Operator console](docs/operator-console.md) for the API, persistence, and security boundaries behind those views.
+The local console includes Projects, scoped Sessions and Goals, automatic Memory with a user-curated suggestion inbox, Activity with overview and searchable history tabs, Cron Jobs, paginated and manageable Tasks, an Agent SDK package registry, a managed Skills SDK, and seven dedicated Labs pages under a collapsible navigation group. Agent and skill packages install disabled; registration or discovery does not execute or activate them. See [Operator console](docs/operator-console.md) for the API, persistence, and security boundaries behind those views.
 
 ## Architecture
 

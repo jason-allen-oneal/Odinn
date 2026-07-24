@@ -148,20 +148,25 @@ test("gateway serves the local console shell", async () => {
     assert.match(html, /Odinn Forge Console/);
     assert.match(html, /Ódinn Forge/);
     assert.match(html, /odinn-logo\.png/);
-    assert.match(html, /Work queue &amp; execution history/);
-    assert.match(html, /Scheduled automation/);
-    assert.match(html, /Agent SDK v0\.3/);
-    assert.match(html, /Skill SDK v0\.1/);
+    assert.match(html, /Work in one place/);
+    assert.match(html, /Scheduled work/);
+    assert.match(html, /Build reusable agents/);
+    assert.match(html, /Build reusable workflows/);
     assert.doesNotMatch(html, /data-title="Instances"/);
     assert.doesNotMatch(html, /<h1>Run tools<\/h1>/);
     assert.match(html, /Memory/);
     assert.match(html, /Goals/);
-    assert.match(html, /Experimental Lab/);
-    assert.match(html, /Self-improvement/);
+    assert.match(html, /class="nav-labs"/);
+    assert.match(html, /Automatic improvements/);
+    for (const view of ["lab-run-checks", "lab-safety-preview", "lab-temporary-access", "lab-restore-points", "lab-portable-runs", "lab-scenario-compare", "lab-model-routing"]) {
+      assert.match(html, new RegExp(`id="view-${view}"`));
+    }
     assert.match(html, /availableWhenDisabled/);
     assert.match(html, /Projects/);
-    assert.match(html, /Skill SDK/);
-    assert.doesNotMatch(html, />\s*Activity\s*</);
+    assert.doesNotMatch(html, /Register Agent SDK manifest/);
+    assert.match(html, /Agent SDK/);
+    assert.match(html, /Skills SDK/);
+    assert.match(html, /Searchable history/);
     assert.doesNotMatch(html, /Skill Workshop/);
     assert.match(html, /modelOverride/);
     assert.match(html, /allowedCapabilities\?\.includes\("agent\.run"\) \? "agent\.run" : "model\.chat"/);
@@ -172,9 +177,10 @@ test("gateway serves the local console shell", async () => {
     assert.match(html, /renderMarkdown/);
     assert.match(html, /memory-tree/);
     assert.match(html, /memory-namespace/);
-    assert.match(html, /Web &amp; browser/);
+    assert.match(html, /Web tools/);
     assert.match(html, /web-search-run/);
-    assert.match(html, /approval-gated/);
+    assert.match(html, /id="browser-approval-mode"[^>]*>\s*Checking safeguards/);
+    assert.match(html, /requireApproval/);
     assert.doesNotMatch(html, /catch \(error: any\)/);
     assert.match(html, /sidebar-collapsed/);
     assert.match(html, /data-session-action="rename"/);
@@ -391,7 +397,7 @@ test("gateway can replay a persisted task with a new id", async () => {
   }
 });
 
-test("gateway exposes memory remember, search, correction, and curated views", async () => {
+test("gateway exposes memory remember, search, correction, curation, and forgetting", async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "odinn-gateway-memory-"));
   const server = await createGatewayServer({ stateDir, workspaceRoot: root });
   await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
@@ -426,6 +432,25 @@ test("gateway exposes memory remember, search, correction, and curated views", a
     const curated = await getJson(`${base}/memory/curated`);
     assert.equal(curated.count, 1);
     assert.equal(curated.kinds.correction[0].text, "Memory records must preserve provenance and supersession.");
+
+    const suggested = await postJson(`${base}/run`, {
+      tool: "memory.suggest",
+      input: { kind: "preference", subject: "user", text: "Prefer concise release summaries.", scopeType: "global" }
+    });
+    assert.equal(suggested.output.status, "pending");
+    const candidates = await getJson(`${base}/memory/candidates?status=pending`);
+    assert.equal(candidates.count, 1);
+    assert.equal(candidates.candidates[0].id, suggested.output.id);
+    const accepted = await postJson(`${base}/memory/candidates/${encodeURIComponent(suggested.output.id)}/decision`, { decision: "accepted" });
+    assert.equal(accepted.candidate.status, "accepted");
+    assert.equal(accepted.memory.authority, "user-curated");
+    const pendingAfterDecision = await getJson(`${base}/memory/candidates?status=pending`);
+    assert.equal(pendingAfterDecision.count, 0);
+
+    const forgotten = await postJson(`${base}/memory/${encodeURIComponent(corrected.id)}/forget`, {});
+    assert.equal(forgotten.forgotten, true);
+    const afterForget = await getJson(`${base}/memory?query=provenance`);
+    assert.deepEqual(afterForget.memories, []);
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }

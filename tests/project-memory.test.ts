@@ -264,7 +264,7 @@ test("agent.run neither recalls nor learns when memory capabilities are denied",
       messages: [{ role: "user", content: "Remember that ultraviolet dashboards are mandatory." }]
     }, policy);
 
-    assert.deepEqual(result.output.memory, { recalled: 0, learned: 0, compacted: 0 });
+    assert.deepEqual(result.output.memory, { recalled: 0, suggested: 0, learned: 0, compacted: 0 });
     assert.equal(requestHasRecalledContext(fx.requests[0]), false);
     const search = await execute(fx, "search_memory_denied", "memory.search", { query: "ultraviolet dashboards mandatory" });
     assert.equal(search.output.memories.length, 0);
@@ -297,7 +297,7 @@ test("agent.run with read-only memory recalls context without learning", async (
   }
 });
 
-test("agent.run with write-only memory learns without recalling context", async () => {
+test("agent.run with write-only memory suggests without recalling context", async () => {
   const fx = await modelFixture();
   const policy = createDefaultPolicy({ allowedCapabilities: ["agent.run", "model.chat", "memory.write"] });
   try {
@@ -312,10 +312,13 @@ test("agent.run with write-only memory learns without recalling context", async 
     }, policy);
 
     assert.equal(result.output.memory.recalled, 0);
-    assert.equal(result.output.memory.learned, 1);
+    assert.equal(result.output.memory.suggested, 1);
+    assert.equal(result.output.memory.learned, 0);
     assert.equal(requestHasRecalledContext(fx.requests[0]), false);
     const search = await execute(fx, "search_memory_write_only", "memory.search", { query: "ultraviolet dashboards mandatory" });
-    assert.ok(search.output.memories.some((memory: any) => memory.text === "ultraviolet dashboards are mandatory."));
+    assert.equal(search.output.memories.some((memory: any) => memory.text === "ultraviolet dashboards are mandatory."), false);
+    const candidates = await execute(fx, "candidate_memory_write_only", "memory.candidates", { status: "pending" });
+    assert.ok(candidates.output.candidates.some((candidate: any) => candidate.text === "ultraviolet dashboards are mandatory."));
   } finally {
     await fx.close();
   }
@@ -325,7 +328,7 @@ test("agent.run respects concrete memory tool denials for automatic and model-in
   const fx = await modelFixture();
   const policy = createDefaultPolicy({
     allowedCapabilities: ["agent.run", "model.chat", "memory.read", "memory.write"],
-    deniedTools: ["memory.recall", "memory.remember", "memory.compact"]
+    deniedTools: ["memory.recall", "memory.remember", "memory.suggest", "memory.compact"]
   });
   try {
     const session = await execute(fx, "denied_memory_session", "session.create", { title: "Denied memory session" });
@@ -341,7 +344,7 @@ test("agent.run respects concrete memory tool denials for automatic and model-in
         { role: "assistant", content: "This is message six." }
       ]
     }, policy);
-    assert.deepEqual(result.output.memory, { recalled: 0, learned: 0, compacted: 0 });
+    assert.deepEqual(result.output.memory, { recalled: 0, suggested: 0, learned: 0, compacted: 0 });
     const offeredTools = fx.requests[0].tools.map((tool: any) => tool.function.name);
     assert.equal(offeredTools.includes("memory_x2e_recall"), false);
     assert.equal(offeredTools.includes("memory_x2e_remember"), false);

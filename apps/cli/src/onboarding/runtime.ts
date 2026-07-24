@@ -8,7 +8,7 @@ const DEFAULT_PORT = 18_790;
 const DEFAULT_CONNECT_TIMEOUT_MS = 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_500;
 const DEFAULT_BROWSER_COMMAND_TIMEOUT_MS = 1_500;
-const MAX_PROBE_RESPONSE_BYTES = 256 * 1_024;
+const MAX_PROBE_RESPONSE_BYTES = 512 * 1_024;
 
 export type GatewayProtocol = "http" | "https";
 export type GatewayProbeState = "healthy" | "occupied" | "stopped" | "unreachable";

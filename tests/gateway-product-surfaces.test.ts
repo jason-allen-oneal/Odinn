@@ -53,7 +53,9 @@ async function patchJson(url: string, body: unknown, expectedStatus = 200) {
 }
 
 test("audit query paginates and filters while usage shares its summary semantics", async () => {
-  const gateway = await gatewayFixture("odinn-audit-surface");
+  const gateway = await gatewayFixture("odinn-audit-surface", {
+    selfImprovement: { enabled: false, mode: "disabled" }
+  });
   try {
     for (let index = 0; index < 12; index += 1) {
       const result = await postJson(`${gateway.base}/run`, {
@@ -109,6 +111,22 @@ test("tasks hide system reads, expose real detail, and enforce replay safety", a
       tool: "text.echo",
       input: { text: "replay-safe proof" }
     });
+    for (let index = 0; index < 12; index += 1) {
+      await postJson(`${gateway.base}/run`, {
+        id: `run_task_pagination_${String(index).padStart(2, "0")}`,
+        actor: "pagination-user",
+        tool: "text.echo",
+        input: { text: `pagination proof ${index}` }
+      });
+    }
+
+    const firstPage = await requestJson(`${gateway.base}/tasks?q=pagination-user&page=1&pageSize=5`);
+    const secondPage = await requestJson(`${gateway.base}/tasks?q=pagination-user&page=2&pageSize=5`);
+    assert.deepEqual(firstPage.pagination, { page: 1, pageSize: 5, pages: 3, total: 12, from: 1, to: 5 });
+    assert.deepEqual(secondPage.pagination, { page: 2, pageSize: 5, pages: 3, total: 12, from: 6, to: 10 });
+    assert.equal(firstPage.tasks.length, 5);
+    assert.equal(secondPage.tasks.length, 5);
+    assert.equal(firstPage.tasks.some((task: any) => secondPage.tasks.some((other: any) => other.id === task.id)), false);
 
     const visible = await requestJson(`${gateway.base}/tasks`);
     assert.equal(visible.tasks.some((task: any) => task.tool === "session.list"), false);

@@ -1,21 +1,14 @@
 # Ódinn Forge self-improvement
 
-Ódinn Forge includes a configurable autonomous evidence loop. It observes signed audit history, groups repeated failures, creates deduplicated proposals, and can apply allowlisted runtime tuning without waiting for a human decision.
+Ódinn Forge includes an automatic reliability loop. It watches audit history for repeated failures, asks the configured model for a plain-language assessment, and can apply narrowly allowlisted reliability tuning without waiting for a review decision.
 
-The default remains review-gated:
+It runs automatically by default:
 
 ```bash
 pnpm odinn config self-improvement show
-pnpm odinn config self-improvement set --enabled true --mode propose
-```
-
-Enable autonomous application explicitly:
-
-```bash
 pnpm odinn config self-improvement set \
   --enabled true \
   --mode auto \
-  --confirm-impact \
   --interval-ms 300000 \
   --max-changes 1
 ```
@@ -26,11 +19,13 @@ Disable the loop:
 pnpm odinn config self-improvement set --enabled false --mode disabled
 ```
 
-When the gateway is running in `auto` mode it performs a bounded analysis cycle on the configured interval. `improve.learn` can also run a cycle immediately. Applied changes capture the prior configuration under `.odinn/improvements/` and can be rolled back:
+When the gateway is running it performs a bounded analysis cycle on the configured interval. `improve.learn` can also run a cycle immediately. Applied changes capture the prior configuration under `.odinn/improvements/` and can be rolled back:
 
 ```bash
 pnpm odinn improve learn --limit 1000
 pnpm odinn improve rollback --improvement <id>
 ```
 
-Autonomy is deliberately narrow. The controller may tune only explicitly allowlisted reliability settings. It cannot disable approvals, expand network domains, grant capabilities, weaken Sentinel, install extensions, change credentials, edit source code, or approve arbitrary model-generated actions. Unknown recommendations remain proposals. Every application, failure, and rollback is persisted in the record and audit stores.
+No embedded model is currently bundled with Ódinn, so the loop uses the configured provider. Model output can improve the title, explanation, and priority of an observation, but it cannot choose or invent a configuration change.
+
+Autonomy is deliberately narrow. The controller may tune only explicitly allowlisted reliability settings. It cannot disable safeguards, expand network domains, grant permissions, install extensions, change credentials, edit source code, or apply arbitrary model-generated actions. Every application, failure, and rollback is persisted in the record and audit stores.

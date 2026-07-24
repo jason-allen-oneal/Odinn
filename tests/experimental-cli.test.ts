@@ -30,21 +30,25 @@ function expectOk(result: ReturnType<typeof invoke>) {
   return result.stdout.trim() ? JSON.parse(result.stdout) : undefined;
 }
 
-test("experimental CLI has a discoverable disabled-by-default control plane", async () => {
+test("experimental CLI keeps seven Labs off while automatic improvement starts on", async () => {
   const { workspace, state } = await fixture();
   const help = invoke(workspace, ["experimental", "help"]);
   assert.equal(help.status, 0, help.stderr || help.stdout);
   for (const feature of ["proof", "sentinel", "capabilities", "rewind", "capsules", "counterfactual", "darwin", "self-improvement"]) {
     assert.match(help.stdout, new RegExp(feature));
   }
-  assert.match(help.stdout, /disabled by default/);
+  assert.match(help.stdout, /seven Labs feature flags are off by default/);
+  assert.match(help.stdout, /Automatic improvement runs by default/);
 
   const initial = expectOk(invoke(workspace, ["experimental", "status", "--state", state]));
   assert.equal(initial.configured, false);
-  assert.equal(initial.disabledByDefault, true);
+  assert.equal(initial.disabledByDefault, false);
+  assert.equal(initial.experimentalFeaturesDisabledByDefault, true);
+  assert.equal(initial.automaticSelfImprovementDefault, true);
   assert.equal(initial.features.length, 8);
-  assert.ok(initial.features.every((feature: any) => feature.enabled === false));
-  assert.equal(initial.features.find((feature: any) => feature.id === "self-improvement").mode, "propose");
+  assert.ok(initial.features.filter((feature: any) => feature.id !== "self-improvement").every((feature: any) => feature.enabled === false));
+  assert.equal(initial.features.find((feature: any) => feature.id === "self-improvement").enabled, true);
+  assert.equal(initial.features.find((feature: any) => feature.id === "self-improvement").mode, "auto");
 
   const missingConfirmation = invoke(workspace, ["experimental", "enable", "proof", "--state", state]);
   assert.equal(missingConfirmation.status, 1);
@@ -56,12 +60,9 @@ test("experimental CLI has a discoverable disabled-by-default control plane", as
   assert.equal(proofStatus.features[0].enabled, true);
   assert.equal(proofStatus.features[0].configKey, "experimental.proof");
 
-  const improvementMissingConfirmation = invoke(workspace, ["experimental", "enable", "self-improvement", "--state", state]);
-  assert.equal(improvementMissingConfirmation.status, 1);
-  assert.match(improvementMissingConfirmation.stderr, /Autonomous self-improvement impact summary/);
-  const improvement = expectOk(invoke(workspace, ["experimental", "enable", "self-improvement", "--confirm-impact", "--state", state]));
+  const improvement = expectOk(invoke(workspace, ["experimental", "enable", "self-improvement", "--state", state]));
   assert.equal(improvement.selfImprovement.enabled, true);
-  assert.equal(improvement.selfImprovement.mode, "propose");
+  assert.equal(improvement.selfImprovement.mode, "auto");
 
   expectOk(invoke(workspace, ["experimental", "disable", "proof", "--state", state]));
   const persisted = JSON.parse(await readFile(join(state, "config.json"), "utf8"));

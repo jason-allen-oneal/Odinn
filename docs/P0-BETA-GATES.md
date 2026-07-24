@@ -40,7 +40,7 @@ These are implemented as local vertical slices and remain disabled by default:
 
 These slices do not claim to reverse arbitrary remote mutations or make nondeterministic model and remote-service results deterministic. Built-in tools and extension/MCP adapters route through the shared audited execution boundary; direct extension execution is rejected. Forked workers are crash containment, not a security sandbox. Remote hosting is application-level tenant isolation, not hostile-user OS isolation. External effects and nondeterministic provider behavior are outside full replay/rollback guarantees. See the [Beta 3 surface matrix](BETA-3-SURFACE-MATRIX.md) for the complete surface classification.
 
-The self-improvement loop defaults to review-gated proposals and can be explicitly configured for bounded autonomous application. Auto mode applies only allowlisted reliability tuning, captures a rollback snapshot, and cannot widen permissions, disable approvals, change credentials, install extensions, or weaken Sentinel.
+The self-improvement loop runs automatically by default. It applies only allowlisted reliability tuning, captures a rollback snapshot, and cannot widen permissions, disable safeguards, change credentials, install extensions, or weaken Sentinel.
 
 ## Required release proof
 

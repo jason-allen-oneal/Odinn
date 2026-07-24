@@ -9,6 +9,16 @@ import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
 const DEFAULT_REQUEST_MAX_BYTES = 65_536;
 const PUBLIC_DIR = fileURLToPath(new URL("../public/", import.meta.url));
+const PACKAGE_FILE = fileURLToPath(new URL("../../../package.json", import.meta.url));
+
+async function productVersion() {
+  try {
+    const pkg = JSON.parse(await readFile(PACKAGE_FILE, "utf8"));
+    return String(pkg.version || "development");
+  } catch {
+    return String(process.env.ODINN_VERSION || "development");
+  }
+}
 
 function createQuotaGate(value: any = {}) {
   const maximumActiveJobs = Math.max(1, Number(value.maximumActiveJobs ?? 8));
@@ -320,9 +330,12 @@ function queryAuditEvents(events: any[], url: URL) {
 }
 
 function classifyTask(run: any) {
-  const systemReadTools = new Set(["session.list", "session.read", "memory.search", "memory.browse", "memory.curate", "goal.list", "project.list", "job.healthcheck"]);
+  const systemReadTools = new Set([
+    "session.list", "session.read", "memory.search", "memory.browse", "memory.curate", "memory.candidates",
+    "goal.list", "project.list", "job.healthcheck", "browser.tabs", "browser.snapshot", "improve.list"
+  ]);
   if (run.actor === "gateway" && systemReadTools.has(run.tool)) return "system";
-  if (run.actor === "autonomous-controller" || run.actor === "cron") return "automation";
+  if (/^(?:autonomous|automatic|automation)/u.test(String(run.actor || "")) || run.actor === "cron") return "automation";
   if (run.actor === "agent" || run.tool === "agent.run" || run.tool === "model.chat") return "agent";
   return "user";
 }
@@ -330,9 +343,16 @@ function classifyTask(run: any) {
 function taskTitle(tool: string) {
   const labels: Record<string, string> = {
     "agent.run": "Agent response", "model.chat": "Model response", "web.search": "Web search", "web.fetch": "Read webpage",
-    "session.create": "Create session", "session.message": "Save message", "memory.remember": "Store memory", "memory.compact": "Compact session memory"
+    "session.create": "Create session", "session.message": "Save message", "memory.remember": "Store memory", "memory.compact": "Compact session memory", "memory.forget": "Forget memory"
   };
   return labels[tool] || String(tool || "Task").split(".").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" · ");
+}
+
+function taskStatusMatches(value: string, filter: string) {
+  if (!filter || filter === "all") return true;
+  if (filter === "active") return ["queued", "running", "cancelling", "awaiting_approval"].includes(value);
+  if (filter === "review") return ["failed", "denied", "blocked", "cancelled", "needs-review"].includes(value);
+  return value === filter;
 }
 
 function summarizeTasks(runs: any[], events: any[], jobs: any[], registry: any, includeSystem: boolean) {
@@ -477,6 +497,7 @@ export async function createGatewayServer({
 }: any = {}) {
   const state = resolve(stateDir);
   const root = resolve(workspaceRoot);
+  const version = await productVersion();
   await ensureSecureStateDirectory(state);
   const config = await readConfig(state);
   const featureFlags = normalizeExperimentalFlags(config.experimental);
@@ -498,12 +519,26 @@ export async function createGatewayServer({
   const agentStore = new AgentPackageStore(join(state, "agents.json"));
   const skillStore = new SkillPackageStore(state);
   const extensionRegistry = new ExtensionRegistry(join(state, "extensions.json"));
+  const runControlTask = (task: any) => executeTask({ task, auditStore, policy, registry });
   await supervisor.start();
   const cronTimer = setInterval(() => runDueCronJobs(cronStore, isolatedTaskExecutor).catch(() => undefined), 30_000);
   cronTimer.unref();
   const selfImprovement = normalizeSelfImprovementConfig(config.selfImprovement);
-  const improvementTimer = selfImprovement.enabled && selfImprovement.mode === "auto"
-    ? setInterval(() => runTask({ task: { tool: "improve.learn", input: { limit: 1000 }, actor: "autonomous-controller" } }).catch(() => undefined), selfImprovement.intervalMs)
+  let improvementCycle: Promise<any> | undefined;
+  const runImprovementCycle = () => {
+    if (improvementCycle) return improvementCycle;
+    improvementCycle = runControlTask({
+      tool: "improve.learn",
+      input: { limit: 1000 },
+      actor: "autonomous-improvement"
+    }).catch(() => undefined).finally(() => { improvementCycle = undefined; });
+    return improvementCycle;
+  };
+  const automaticImprovement = selfImprovement.enabled && selfImprovement.mode === "auto";
+  const improvementStartupTimer = automaticImprovement ? setTimeout(runImprovementCycle, 2_000) : undefined;
+  improvementStartupTimer?.unref?.();
+  const improvementTimer = automaticImprovement
+    ? setInterval(runImprovementCycle, selfImprovement.intervalMs)
     : undefined;
   improvementTimer?.unref?.();
 
@@ -517,7 +552,7 @@ export async function createGatewayServer({
         return image(response, 200, await readFile(join(PUBLIC_DIR, "odinn-logo.png")), "image/png");
       }
       if (request.method === "GET" && url.pathname === "/") {
-        return html(response, 200, renderConsoleHtml(), {
+        return html(response, 200, renderConsoleHtml(version), {
           "set-cookie": `odinn_gateway_token=${encodeURIComponent(gatewayToken)}; HttpOnly; SameSite=Strict; Path=/`,
           "x-odinn-auth": "bootstrap-cookie"
         });
@@ -532,6 +567,7 @@ export async function createGatewayServer({
       if (request.method === "GET" && url.pathname === "/status") {
         return json(response, 200, {
           ok: true,
+          version,
           state,
           workspaceRoot: root,
           tools: Array.from(registry.keys()),
@@ -546,7 +582,13 @@ export async function createGatewayServer({
           providers: await summarizeProviders(config, state),
           experimental: featureFlags,
           security: policy.security,
-          selfImprovement,
+          selfImprovement: {
+            ...selfImprovement,
+            automatic: automaticImprovement,
+            advisor: normalizeModelConfig(config).defaultModel
+              ? { source: "configured-provider", model: normalizeModelConfig(config).defaultModel }
+              : { source: "waiting-for-provider", model: "" }
+          },
           pendingApprovals: approvalStore.list()
         });
       }
@@ -812,15 +854,40 @@ export async function createGatewayServer({
       }
       if (request.method === "GET" && url.pathname === "/tasks") {
         const includeSystem = url.searchParams.get("includeSystem") === "true";
+        const page = Math.max(1, Number.parseInt(url.searchParams.get("page") ?? "1", 10) || 1);
+        const pageSize = Math.min(100, Math.max(5, Number.parseInt(url.searchParams.get("pageSize") ?? "25", 10) || 25));
+        const query = String(url.searchParams.get("q") || "").trim().toLowerCase();
+        const status = String(url.searchParams.get("status") || "all");
+        const category = String(url.searchParams.get("category") || "all");
         const [runs, events, jobs] = await Promise.all([auditStore.readRuns(), auditStore.readAll(), supervisor.list()]);
-        const tasks = summarizeTasks(runs, events, jobs, registry, includeSystem);
+        const allTasks = summarizeTasks(runs, events, jobs, registry, includeSystem);
+        const filtered = allTasks
+          .filter((task: any) => taskStatusMatches(task.status, status))
+          .filter((task: any) => category === "all" || task.category === category)
+          .filter((task: any) => !query || [task.title, task.tool, task.message, task.actor, task.category].some((value) => String(value || "").toLowerCase().includes(query)))
+          .sort((left: any, right: any) =>
+            String(right.updatedAt || "").localeCompare(String(left.updatedAt || ""))
+            || String(right.id || "").localeCompare(String(left.id || "")));
+        const total = filtered.length;
+        const pages = Math.max(1, Math.ceil(total / pageSize));
+        const currentPage = Math.min(page, pages);
+        const offset = (currentPage - 1) * pageSize;
+        const tasks = filtered.slice(offset, offset + pageSize).map(({ events: _events, ...task }: any) => task);
         return json(response, 200, {
           tasks,
           summary: {
-            total: tasks.length,
-            running: tasks.filter((task: any) => ["queued", "running", "cancelling", "awaiting_approval"].includes(task.status)).length,
-            completed: tasks.filter((task: any) => task.status === "completed").length,
-            needsReview: tasks.filter((task: any) => ["failed", "denied", "blocked", "cancelled", "needs-review"].includes(task.status)).length
+            total,
+            running: filtered.filter((task: any) => ["queued", "running", "cancelling", "awaiting_approval"].includes(task.status)).length,
+            completed: filtered.filter((task: any) => task.status === "completed").length,
+            needsReview: filtered.filter((task: any) => ["failed", "denied", "blocked", "cancelled", "needs-review"].includes(task.status)).length
+          },
+          pagination: {
+            page: currentPage,
+            pageSize,
+            pages,
+            total,
+            from: total ? offset + 1 : 0,
+            to: Math.min(offset + pageSize, total)
           }
         });
       }
@@ -892,8 +959,8 @@ export async function createGatewayServer({
           tool: registry.get(toolName)
         }).allowed;
         const agentRun = allows("agent.run");
-        const readAllowed = ["memory.curate", "memory.search", "memory.browse", "memory.open"].every((toolName) => allows(toolName));
-        const writeAllowed = ["memory.remember", "memory.correct"].every((toolName) => allows(toolName));
+        const readAllowed = ["memory.curate", "memory.search", "memory.browse", "memory.open", "memory.candidates"].every((toolName) => allows(toolName));
+        const writeAllowed = ["memory.remember", "memory.correct", "memory.forget", "memory.suggest", "memory.decide"].every((toolName) => allows(toolName));
         const integration = {
           agentRun,
           readAllowed,
@@ -901,7 +968,7 @@ export async function createGatewayServer({
           recallAllowed: allows("memory.recall"),
           compactAllowed: allows("memory.compact"),
           autoRecall: agentRun && allows("memory.recall") && config.memory?.autoRecall !== false,
-          autoLearn: agentRun && allows("memory.remember") && config.memory?.autoLearn !== false,
+          autoLearn: agentRun && allows("memory.suggest") && config.memory?.autoLearn !== false,
           autoCompact: agentRun && allows("memory.compact") && config.memory?.autoCompact !== false
         };
         if (!integration.readAllowed) return json(response, 200, { working: false, records: null, namespaces: null, latestAt: null, integration });
@@ -920,7 +987,7 @@ export async function createGatewayServer({
           integration
         });
       }
-      if (request.method === "GET" && url.pathname.startsWith("/memory/") && !["/memory/recall", "/memory/browse", "/memory/curated", "/memory/status"].includes(url.pathname)) {
+      if (request.method === "GET" && url.pathname.startsWith("/memory/") && !["/memory/recall", "/memory/browse", "/memory/curated", "/memory/status", "/memory/candidates"].includes(url.pathname)) {
         const id = decodeURIComponent(url.pathname.slice("/memory/".length));
         return json(response, 200, (await runTask({
           task: { tool: "memory.open", input: { id }, actor: "gateway" },
@@ -945,6 +1012,26 @@ export async function createGatewayServer({
           registry
         })).output);
       }
+      if (request.method === "GET" && url.pathname === "/memory/candidates") {
+        const status = url.searchParams.get("status") ?? "pending";
+        const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
+        return json(response, 200, (await runTask({
+          task: { tool: "memory.candidates", input: { status, limit }, actor: "gateway" },
+          auditStore,
+          policy,
+          registry
+        })).output);
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/memory/candidates/") && url.pathname.endsWith("/decision")) {
+        const candidateId = decodeURIComponent(url.pathname.slice("/memory/candidates/".length, -"/decision".length));
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, (await runTask({
+          task: { tool: "memory.decide", input: { ...body, candidateId }, actor: "gateway" },
+          auditStore,
+          policy,
+          registry
+        })).output);
+      }
       if (request.method === "POST" && url.pathname === "/memory") {
         return json(response, 200, (await runTask({
           task: { tool: "memory.remember", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
@@ -956,6 +1043,16 @@ export async function createGatewayServer({
       if (request.method === "POST" && url.pathname === "/memory/corrections") {
         return json(response, 200, (await runTask({
           task: { tool: "memory.correct", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
+          auditStore,
+          policy,
+          registry
+        })).output);
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/memory/") && url.pathname.endsWith("/forget")) {
+        const targetId = decodeURIComponent(url.pathname.slice("/memory/".length, -"/forget".length));
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        return json(response, 200, (await runTask({
+          task: { tool: "memory.forget", input: { ...body, targetId }, actor: "gateway" },
           auditStore,
           policy,
           registry
@@ -1058,45 +1155,28 @@ export async function createGatewayServer({
       }
       if (request.method === "GET" && url.pathname === "/improvements") {
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
-        return json(response, 200, (await runTask({
-          task: { tool: "improve.list", input: { limit }, actor: "gateway" },
-          auditStore,
-          policy,
-          registry
-        })).output);
+        return json(response, 200, (await runControlTask({ tool: "improve.list", input: { limit }, actor: "gateway" })).output);
       }
       if (request.method === "POST" && url.pathname === "/improvements") {
-        return json(response, 200, (await runTask({
-          task: { tool: "improve.propose", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
-          auditStore,
-          policy,
-          registry
-        })).output);
+        return json(response, 200, (await runControlTask({ tool: "improve.propose", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" })).output);
       }
       if (request.method === "POST" && url.pathname === "/improvements/learn") {
-        return json(response, 200, (await runTask({
-          task: { tool: "improve.learn", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" },
-          auditStore,
-          policy,
-          registry
-        })).output);
+        return json(response, 200, (await runControlTask({ tool: "improve.learn", input: await readJson(request, { maxBytes: requestMaxBytes }), actor: "gateway" })).output);
       }
       if (request.method === "POST" && url.pathname.startsWith("/improvements/") && url.pathname.endsWith("/decisions")) {
         const id = decodeURIComponent(url.pathname.slice("/improvements/".length, -"/decisions".length));
-        return json(response, 200, (await runTask({
-          task: { tool: "improve.decide", input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), improvementId: id }, actor: "gateway" },
-          auditStore,
-          policy,
-          registry
+        return json(response, 200, (await runControlTask({
+          tool: "improve.decide",
+          input: { ...(await readJson(request, { maxBytes: requestMaxBytes })), improvementId: id },
+          actor: "gateway"
         })).output);
       }
       if (request.method === "POST" && url.pathname.startsWith("/improvements/") && url.pathname.endsWith("/rollback")) {
         const id = decodeURIComponent(url.pathname.slice("/improvements/".length, -"/rollback".length));
-        return json(response, 200, (await runTask({
-          task: { tool: "improve.rollback", input: { improvementId: id, source: "gateway" }, actor: "gateway" },
-          auditStore,
-          policy,
-          registry
+        return json(response, 200, (await runControlTask({
+          tool: "improve.rollback",
+          input: { improvementId: id, source: "gateway" },
+          actor: "gateway"
         })).output);
       }
       if (request.method === "POST" && url.pathname === "/run/stream") {
@@ -1157,6 +1237,7 @@ export async function createGatewayServer({
 
   const close = server.close.bind(server);
   server.close = (callback: any) => {
+    if (improvementStartupTimer) clearTimeout(improvementStartupTimer);
     if (improvementTimer) clearInterval(improvementTimer);
     clearInterval(cronTimer);
     Promise.allSettled([supervisor.shutdown(), isolatedTaskExecutor.shutdown?.()])
@@ -1444,7 +1525,111 @@ async function oauthTokenExists(provider: any, state: any) {
   }
 }
 
-function renderConsoleHtml() {
+const EXPERIMENTAL_CONSOLE_PAGES = [
+  {
+    key: "proof",
+    view: "lab-run-checks",
+    title: "Run Checks",
+    technicalName: "Proof",
+    summary: "Confirm that completed work produced the files, responses, or repository state you expected.",
+    benefit: "Use this when an important run needs a clear pass-or-fail check.",
+    steps: ["Choose a recent run", "Pick what should be true", "Review the results"]
+  },
+  {
+    key: "sentinel",
+    view: "lab-safety-preview",
+    title: "Safety Preview",
+    technicalName: "Sentinel",
+    summary: "Preview whether a planned action fits your safety rules before anything runs.",
+    benefit: "Use this to understand why an action would be allowed or stopped.",
+    steps: ["Describe the planned action", "Preview the decision", "Adjust the plan if needed"]
+  },
+  {
+    key: "capabilities",
+    view: "lab-temporary-access",
+    title: "Temporary Access",
+    technicalName: "Capability Tokens",
+    summary: "Grant narrow, short-lived permission for one specific action.",
+    benefit: "Access expires automatically and can be revoked at any time.",
+    steps: ["Choose an action", "Set a short expiry", "Copy the access pass once"]
+  },
+  {
+    key: "rewind",
+    view: "lab-restore-points",
+    title: "Restore Points",
+    technicalName: "Rewind",
+    summary: "Save selected workspace files and preview a restore before changing anything.",
+    benefit: "Use this before risky local work or when you want an easy way back.",
+    steps: ["Create a restore point", "Preview what would change", "Restore only when ready"]
+  },
+  {
+    key: "capsules",
+    view: "lab-portable-runs",
+    title: "Portable Runs",
+    technicalName: "Capsules",
+    summary: "Package a completed run so it can be checked or replayed without live tools.",
+    benefit: "Useful for sharing, archiving, and reproducing work safely.",
+    steps: ["Choose a run", "Create a portable copy", "Check or replay the copy"]
+  },
+  {
+    key: "counterfactual",
+    view: "lab-scenario-compare",
+    title: "Compare Approaches",
+    technicalName: "Counterfactuals",
+    summary: "Try multiple approaches in separate workspace copies and compare the outcomes.",
+    benefit: "See the evidence side by side before choosing which result to keep.",
+    steps: ["Create alternatives", "Run each approach", "Preview and choose a result"]
+  },
+  {
+    key: "darwin",
+    view: "lab-model-routing",
+    title: "Smart Routing",
+    technicalName: "Darwin Router",
+    summary: "Learn which configured model works best for different kinds of tasks.",
+    benefit: "Recommendations improve as verified outcomes accumulate.",
+    steps: ["Record an outcome", "Review what has been learned", "Ask for a recommendation"]
+  }
+];
+
+function experimentalConsoleNavigation() {
+  return EXPERIMENTAL_CONSOLE_PAGES.map((feature) => `
+            <button data-view="${feature.view}" data-title="${feature.title}" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">${feature.title}</span></button>`).join("");
+}
+
+function experimentalConsolePages() {
+  return EXPERIMENTAL_CONSOLE_PAGES.map((feature) => `
+      <section id="view-${feature.view}" class="view" data-experimental-page="${feature.key}">
+        <div class="page oc-page">
+          <div class="page-head">
+            <div><div class="section-kicker">Experimental feature</div><h1>${feature.title}</h1><p>${feature.summary}</p></div>
+            <div class="row"><span class="chip warn" data-role="feature-status">Checking status</span><button class="secondary" data-refresh-experimental type="button">Refresh</button></div>
+          </div>
+          <div class="feature-hero panel">
+            <div><span class="feature-eyebrow">Why use it</span><h2>${feature.benefit}</h2></div>
+            <ol class="feature-steps">${feature.steps.map((step, index) => `<li><span>${index + 1}</span>${step}</li>`).join("")}</ol>
+          </div>
+          <div class="experimental-page-layout">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Choose an action</h2><span class="muted">Common workflows for ${feature.title.toLowerCase()}.</span></div></div>
+              <div class="feature-action-list" data-role="action-list"></div>
+            </div>
+            <div class="panel stack feature-workspace">
+              <div class="panel-head"><div><h2 data-role="action-title">Choose an action</h2><span class="muted" data-role="action-description">Select an option to get started.</span></div><span class="chip" data-role="action-risk">Guided</span></div>
+              <div class="field" data-role="target-field" hidden><label data-role="target-label">What should this use?</label><input data-role="target" autocomplete="off"></div>
+              <details class="advanced-options">
+                <summary>Advanced options</summary>
+                <p>These settings are intended for experienced users. The guided defaults are usually enough.</p>
+                <textarea data-role="payload" spellcheck="false">{}</textarea>
+              </details>
+              <div class="row"><button data-role="run" type="button" disabled>Choose an action</button></div>
+              <div class="friendly-result" data-role="result" aria-live="polite"><div class="empty-state"><strong>No result yet</strong><span>Your result will appear here in plain language.</span></div></div>
+            </div>
+          </div>
+        </div>
+      </section>`).join("");
+}
+
+function renderConsoleHtml(version = "development") {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -1479,6 +1664,7 @@ function renderConsoleHtml() {
       --muted: #b0bbca;
     }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     html, body { height: 100%; }
     body {
       margin: 0;
@@ -1504,6 +1690,14 @@ function renderConsoleHtml() {
       font-weight: 700;
     }
     button:hover { filter: brightness(1.08); }
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    textarea:focus-visible,
+    [role="button"]:focus-visible {
+      outline: 3px solid color-mix(in srgb, var(--blue) 70%, white);
+      outline-offset: 2px;
+    }
     button:disabled {
       cursor: not-allowed;
       opacity: 0.55;
@@ -1553,7 +1747,7 @@ function renderConsoleHtml() {
     h3 { font-size: 13px; }
     label {
       color: var(--muted);
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 750;
       letter-spacing: 0;
       text-transform: uppercase;
@@ -1571,6 +1765,7 @@ function renderConsoleHtml() {
       grid-area: nav;
       display: grid;
       grid-template-rows: auto 1fr auto;
+      min-height: 0;
       min-width: 0;
       border-right: 1px solid var(--line);
       background: #0d1117;
@@ -1632,12 +1827,13 @@ function renderConsoleHtml() {
     }
     .brand-title span {
       color: var(--muted);
-      font-size: 11px;
+      font-size: 12px;
     }
     .nav {
       display: grid;
       align-content: start;
       gap: 3px;
+      min-height: 0;
       padding: 12px 9px;
       overflow: auto;
     }
@@ -1699,7 +1895,7 @@ function renderConsoleHtml() {
     .nav-group-label {
       padding: 14px 9px 5px;
       color: #657286;
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 800;
       letter-spacing: .1em;
       text-transform: uppercase;
@@ -1713,11 +1909,14 @@ function renderConsoleHtml() {
     }
     .menu-chat {
       display: grid;
-      gap: 3px;
-      padding: 8px;
-      border: 1px solid transparent;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      min-height: 52px;
+      padding: 9px 10px;
+      border: 1px solid var(--line-soft);
       border-radius: 9px;
-      background: transparent;
+      background: #10151d;
       color: var(--text);
       cursor: pointer;
     }
@@ -1726,8 +1925,9 @@ function renderConsoleHtml() {
     }
     .menu-chat-actions {
       display: flex;
-      gap: 3px;
-      opacity: 0;
+      align-items: center;
+      gap: 2px;
+      opacity: .5;
       transition: opacity 120ms ease;
     }
     .menu-chat:hover .menu-chat-actions,
@@ -1737,9 +1937,9 @@ function renderConsoleHtml() {
     }
     .chat-action,
     .session-action {
-      min-width: 22px;
-      min-height: 22px;
-      padding: 2px;
+      min-width: 30px;
+      min-height: 30px;
+      padding: 5px;
       border: 0;
       border-radius: 6px;
       background: transparent;
@@ -1784,11 +1984,15 @@ function renderConsoleHtml() {
       white-space: nowrap;
     }
     .menu-chat strong {
-      font-size: 12px;
+      font-size: 13px;
     }
     .menu-chat span {
       color: var(--muted);
-      font-size: 11px;
+      font-size: 12px;
+    }
+    .menu-chat-main {
+      display: grid;
+      gap: 4px;
     }
     .sidebar-footer {
       display: grid;
@@ -1878,7 +2082,7 @@ function renderConsoleHtml() {
       background: #102820;
       color: var(--accent);
       border: 1px solid #245849;
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 700;
     }
     .pill.warn {
@@ -1902,7 +2106,7 @@ function renderConsoleHtml() {
       border-radius: 999px;
       background: #171d27;
       color: #cbd5e1;
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 750;
       white-space: nowrap;
     }
@@ -2098,7 +2302,7 @@ function renderConsoleHtml() {
       display: block;
       overflow: hidden;
       color: var(--muted);
-      font-size: 11px;
+      font-size: 12px;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
@@ -2210,7 +2414,7 @@ function renderConsoleHtml() {
       align-self: center;
     }
     .message-role {
-      font-size: 10px;
+      font-size: 11px;
       letter-spacing: 0;
     }
     .composer {
@@ -2253,7 +2457,7 @@ function renderConsoleHtml() {
       padding: 0 8px;
       border-color: transparent;
       background: transparent;
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 700;
     }
     .composer-tools .chip {
@@ -2266,7 +2470,7 @@ function renderConsoleHtml() {
       border-radius: 9px;
     }
     .chat-status {
-      font-size: 11px;
+      font-size: 12px;
     }
     .runtime-grid {
       display: grid;
@@ -2308,8 +2512,8 @@ function renderConsoleHtml() {
       background: linear-gradient(145deg, #171d27, #121720);
     }
     .stat-card strong { font-size: 23px; line-height: 1; }
-    .stat-card span { color: var(--muted); font-size: 11px; }
-    .section-kicker { color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .stat-card span { color: var(--muted); font-size: 12px; }
+    .section-kicker { color: var(--accent); font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
     .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
     .toolbar input { width: min(300px, 100%); }
     .filter-grid { display: grid; grid-template-columns: minmax(220px, 1fr) repeat(4, minmax(130px, .55fr)); gap: 10px; }
@@ -2365,6 +2569,18 @@ function renderConsoleHtml() {
       color: var(--muted);
     }
     .sidebar-toggle:hover { color: var(--text); background: var(--surface-2); }
+    .mobile-scrim {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      min-height: 100%;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: rgba(2, 6, 12, .72);
+      cursor: default;
+    }
     .shell.sidebar-collapsed { grid-template-columns: 68px minmax(0, 1fr); }
     .shell.sidebar-collapsed .brand { justify-content: center; padding: 0; }
     .shell.sidebar-collapsed .brand-title,
@@ -2398,13 +2614,47 @@ function renderConsoleHtml() {
     .capability-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
     .capabilities-page .stat-card strong { font-size: 17px; letter-spacing: .04em; }
     .browser-page-panel { padding: 10px; background: #0d1219; }
-    .browser-page-text { max-height: 260px; overflow: auto; color: #cbd5e1; line-height: 1.55; }
+    .browser-page-text { max-height: 260px; overflow: auto; color: #cbd5e1; line-height: 1.55; white-space: pre-wrap; }
     .browser-tab { cursor: pointer; }
     .browser-tab:hover { border-color: var(--accent); }
     .web-result a { color: var(--blue); font-weight: 750; }
     .web-result p { margin: 0; color: var(--muted); line-height: 1.45; }
     .approval-card { border-color: #735f25; background: #211e12; }
     .approval-card .approval-summary { color: #f3dda0; }
+    .provider-setup {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0 2px 8px;
+      padding: 10px 12px;
+      border: 1px solid #655722;
+      border-radius: 10px;
+      background: #242013;
+      color: #f1dfa6;
+      font-size: 13px;
+    }
+    .provider-setup code { color: #fff2bd; }
+    .toast-region {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      z-index: 120;
+      width: min(420px, calc(100vw - 36px));
+      min-height: 44px;
+      padding: 12px 14px;
+      border: 1px solid #396b5e;
+      border-radius: 10px;
+      background: #10231f;
+      color: #e7fff7;
+      box-shadow: 0 14px 38px rgba(0, 0, 0, .38);
+      opacity: 0;
+      transform: translateY(10px);
+      pointer-events: none;
+      transition: opacity .16s ease, transform .16s ease;
+    }
+    .toast-region.visible { opacity: 1; transform: translateY(0); }
+    .toast-region.error { border-color: #82404c; background: #311a21; color: #ffe3e8; }
 
     /* Chat surface polish: keep the workspace quiet and put attention on the conversation. */
     .content {
@@ -2471,7 +2721,7 @@ function renderConsoleHtml() {
     }
     .message-role {
       min-height: 24px;
-      font-size: 10px;
+      font-size: 11px;
       letter-spacing: .04em;
     }
     .message-assistant-head {
@@ -2514,12 +2764,48 @@ function renderConsoleHtml() {
     .nav-group-label {
       padding-top: 12px;
     }
+    .nav-labs {
+      margin: 2px 0;
+    }
+    .nav-labs > summary {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 40px;
+      padding: 7px 9px;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      color: #dfe6f0;
+      cursor: pointer;
+      list-style: none;
+    }
+    .nav-labs > summary::-webkit-details-marker { display: none; }
+    .nav-labs > summary:hover,
+    .nav-labs[open] > summary {
+      border-color: var(--line-soft);
+      background: var(--surface-2);
+    }
+    .nav-labs > summary .badge { margin-left: auto; }
+    .nav-labs > summary .nav-chevron {
+      color: var(--muted);
+      transition: transform .16s ease;
+    }
+    .nav-labs[open] > summary .nav-chevron { transform: rotate(180deg); }
     .nav-more { margin: 4px 0 2px; }
     .nav-more summary { display: flex; align-items: center; justify-content: space-between; padding: 10px 11px 5px; color: #66758b; cursor: pointer; list-style: none; text-transform: uppercase; }
     .nav-more summary::-webkit-details-marker { display: none; }
     .nav-more summary .nav-group-label { padding: 0; }
     .nav-chevron { color: #8b98aa; font-size: 15px; transition: transform .15s ease; }
     .nav-more:not([open]) .nav-chevron { transform: rotate(-90deg); }
+    .nav-more .nav-labs > summary {
+      justify-content: flex-start;
+      min-height: 40px;
+      padding: 7px 9px;
+      color: #dfe6f0;
+      text-transform: none;
+    }
+    .nav-more .nav-labs > summary .nav-group-label { display: flex; align-items: center; gap: 10px; }
+    .nav-more .nav-labs > summary .nav-chevron { display: inline; }
     .shell.sidebar-collapsed .nav-more summary { justify-content: center; padding: 10px 0 5px; }
     .shell.sidebar-collapsed .nav-more summary .nav-group-label { display: none; }
     .shell.sidebar-collapsed .nav-more summary .nav-chevron { display: none; }
@@ -2555,7 +2841,7 @@ function renderConsoleHtml() {
       justify-content: space-between;
       padding: 4px 2px 1px;
       color: #718096;
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 800;
       letter-spacing: .08em;
       text-transform: uppercase;
@@ -2567,7 +2853,7 @@ function renderConsoleHtml() {
       padding: 4px 8px 7px;
       color: #536175;
       content: "No pinned sessions";
-      font-size: 11px;
+      font-size: 12px;
     }
     .sidebar-footer-tools {
       display: flex;
@@ -2581,7 +2867,7 @@ function renderConsoleHtml() {
       gap: 7px;
       padding: 2px 4px 0;
       color: #69788c;
-      font-size: 10px;
+      font-size: 11px;
     }
     .status-dot {
       width: 7px;
@@ -2593,20 +2879,34 @@ function renderConsoleHtml() {
     .sidebar-version { margin-left: auto; color: #4f5d70; font-variant-numeric: tabular-nums; }
 
     @media (max-width: 980px) {
-      body { overflow: auto; }
+      body { overflow: hidden; }
       .shell {
-        min-height: 100vh;
-        height: 100vh;
+        min-height: 100dvh;
+        height: 100dvh;
         grid-template-columns: 1fr;
-        grid-template-rows: auto auto 1fr;
+        grid-template-rows: auto minmax(0, 1fr);
         grid-template-areas:
           "topbar"
-          "nav"
           "content";
       }
       .sidebar {
-        border-right: 0;
-        border-bottom: 1px solid var(--line);
+        position: fixed;
+        inset: 0 auto 0 0;
+        z-index: 90;
+        display: grid;
+        width: min(86vw, 328px);
+        max-width: 100%;
+        border-right: 1px solid var(--line);
+        background: #0d1117;
+        box-shadow: 18px 0 44px rgba(0, 0, 0, .36);
+        transform: translateX(-105%);
+        transition: transform .2s ease;
+      }
+      .shell.nav-open .sidebar {
+        transform: translateX(0);
+      }
+      .shell.nav-open .mobile-scrim {
+        display: block;
       }
       .topbar {
         min-height: 52px;
@@ -2621,47 +2921,56 @@ function renderConsoleHtml() {
       .topbar .row {
         flex-wrap: nowrap;
       }
-      #copy-status,
-      #quick-smoke {
-        display: none;
-      }
-      #health {
-        min-height: 20px;
-        padding: 2px 7px;
-        font-size: 10px;
-      }
-      .brand, .sidebar-footer { display: none; }
+      .brand, .sidebar-footer { display: flex; }
+      .sidebar-footer { display: grid; }
       .nav {
-        display: flex;
-        overflow-x: auto;
-        max-height: 154px;
-        align-items: flex-start;
+        display: grid;
+        overflow: auto;
+        max-height: none;
+        align-content: start;
       }
-      .nav button { width: auto; min-width: max-content; }
-      .nav button .badge { display: none; }
+      .nav button { width: 100%; min-width: 0; min-height: 44px; }
       .menu-chats {
         display: grid;
-        flex: 0 0 268px;
-        max-height: 150px;
-        margin: 0;
-        padding: 4px 0 8px;
+        max-height: none;
+        margin: 5px 0 2px;
+        padding: 0 0 10px;
       }
       .menu-chats .session-list {
-        max-height: 102px;
+        max-height: 190px;
       }
       .menu-chat {
-        width: 250px;
+        width: 100%;
       }
-      .overview-grid, .layout-grid, .split, .grid-2, .chat-shell, .stat-strip, .record-grid {
+      .overview-grid, .layout-grid, .split, .grid-2, .chat-shell, .capability-grid, .stat-strip, .record-grid {
         grid-template-columns: 1fr;
+      }
+      .stat-strip {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .page-head,
+      .experimental-warning,
+      .pagination {
+        align-items: stretch;
+        flex-direction: column;
+      }
+      .page-head > .row,
+      .page-head > div > .row {
+        width: 100%;
       }
       .content {
         min-height: 0;
-        padding: 0;
-        overflow: hidden;
+        padding: 12px;
+        overflow-y: auto;
+        overflow-x: hidden;
       }
       .view.active {
+        min-height: 100%;
+        height: auto;
+      }
+      #view-overview.active {
         height: 100%;
+        min-height: 0;
       }
       .chat-shell {
         height: 100%;
@@ -2686,6 +2995,43 @@ function renderConsoleHtml() {
       .message.user { max-width: 88%; margin-right: 0; }
       .chat-prompts { grid-template-columns: 1fr; width: min(100%, 360px); }
       .composer { width: calc(100% - 20px); margin-bottom: 10px; }
+      .composer-footer {
+        display: grid;
+        align-items: stretch;
+        grid-template-columns: 1fr;
+      }
+      .composer-footer > .row {
+        justify-content: space-between;
+      }
+      .composer-footer > .row:last-child {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+      }
+      .composer-footer > .row:last-child .chat-status {
+        grid-column: 1 / -1;
+        grid-row: 2;
+      }
+      .composer-tools select {
+        min-width: 0;
+        flex: 1 1 170px;
+      }
+      .composer-tools .chip {
+        display: none;
+      }
+      .table-panel {
+        max-width: 100%;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+      .data-table {
+        width: max-content;
+        min-width: 760px;
+        overflow: visible;
+      }
+      .provider-setup { align-items: flex-start; flex-direction: column; }
+      button, .sidebar-icon-button, .sidebar-toggle { min-height: 44px; }
+      .sidebar-icon-button, .sidebar-toggle { width: 44px; }
+      .toast-region { right: 10px; bottom: 10px; width: calc(100vw - 20px); }
     }
     @media (max-width: 980px) {
       .chat-thread { padding: 28px 14px 122px; }
@@ -2694,17 +3040,17 @@ function renderConsoleHtml() {
       .composer { width: calc(100% - 20px); margin-bottom: 10px; }
     }
     .oc-page { max-width: 1320px; }
-    .oc-page .page-head h1 { color: #ff6969; }
+    .oc-page .page-head h1 { color: var(--text); }
     .summary-bar { display: flex; align-items: center; gap: 34px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: #151a22; }
     .summary-bar span { display: flex; align-items: center; gap: 10px; }
-    .summary-bar small { color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .08em; }
+    .summary-bar small { color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .08em; }
     .summary-bar strong { color: var(--text); }
     .table-panel { padding: 14px 18px; }
     .data-table { min-width: 760px; overflow-x: auto; }
     .data-row { display: grid; grid-template-columns: minmax(260px, 2fr) 110px 120px 130px minmax(120px, 1fr) 160px; align-items: center; gap: 12px; min-height: 58px; padding: 8px 10px; border-bottom: 1px solid #242b35; }
     .data-row:last-child { border-bottom: 0; }
-    .data-head { min-height: 40px; color: var(--muted); background: #171c24; font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
-    .session-table .data-row { grid-template-columns: minmax(250px, 2fr) 150px 90px 100px 110px 120px 80px 280px; }
+    .data-head { min-height: 40px; color: var(--muted); background: #171c24; font-size: 11px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+    .session-table .data-row { grid-template-columns: minmax(250px, 2fr) 150px 100px 100px 120px 80px 280px; }
     .session-project-select { max-width: 130px; }
     .data-group { min-height: 40px; background: #101720; }
     .data-primary { display: grid; gap: 4px; min-width: 0; }
@@ -2714,12 +3060,97 @@ function renderConsoleHtml() {
     .session-filters { display: grid; grid-template-columns: minmax(240px, 1fr) 190px 150px 150px; gap: 10px; padding: 12px 0; }
     .session-detail { margin-top: 14px; }
     .usage-grid, .agent-layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(320px, .8fr); gap: 14px; }
+    .projects-page { gap: 10px; }
+    .project-layout { display: grid; grid-template-columns: minmax(280px, .8fr) minmax(0, 1.2fr); gap: 10px; align-items: start; }
+    .project-layout .panel { padding: 14px; }
+    .project-layout .empty-state { min-height: 120px; }
+    .project-card p { margin: 2px 0 5px; line-height: 1.45; }
+    .activity-tabs { display: flex; gap: 6px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: #0f141b; }
+    .activity-tabs button { flex: 1; background: transparent; }
+    .activity-tabs button.active { border-color: #2b6a5b; background: #173029; color: var(--accent); }
+    .activity-panel { display: none; }
+    .activity-panel.active { display: grid; gap: 14px; }
+    .compact-head { margin: 0; padding-top: 4px; }
+    .task-management { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0 2px; border-top: 1px solid var(--line-soft); flex-wrap: wrap; }
+    .task-management .row { gap: 6px; }
+    .task-select-label { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; align-items: center; min-width: 0; }
+    .task-select-label input { width: auto; min-height: auto; }
+    .task-select-copy { display: grid; gap: 4px; min-width: 0; }
+    .goal-board { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+    .goal-card { align-content: start; min-height: 180px; padding: 14px; }
+    .goal-card p { margin: 3px 0 6px; color: var(--muted); line-height: 1.5; }
+    .goal-card .goal-actions { margin-top: auto; padding-top: 8px; }
+    .goal-filter-bar { display: grid; grid-template-columns: minmax(220px, 1fr) 180px 200px; gap: 10px; }
+    .memory-page { gap: 12px; }
+    .memory-status-bar {
+      display: grid;
+      grid-template-columns: auto minmax(240px, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      padding: 13px 15px;
+    }
+    .memory-status-icon {
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border: 1px solid #2f6658;
+      border-radius: 50%;
+      color: #9ce3ca;
+      background: #153029;
+      font-size: 18px;
+      font-weight: 900;
+    }
+    .memory-status-copy { display: grid; gap: 4px; min-width: 0; }
+    .memory-status-copy .row { gap: 8px; }
+    .memory-status-copy p { margin: 0; color: var(--muted); line-height: 1.45; }
+    .memory-status-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .memory-status-summary span {
+      padding-left: 10px;
+      border-left: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .memory-status-summary strong { color: var(--text); }
+    .memory-tabs { display: flex; gap: 6px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: #0f141b; }
+    .memory-tabs button { display: flex; flex: 0 1 220px; align-items: center; justify-content: center; gap: 8px; background: transparent; }
+    .memory-tabs button.active { border-color: #2b6a5b; background: #173029; color: var(--accent); }
+    .memory-tabs .count-badge { background: rgba(255, 255, 255, .08); color: currentColor; }
+    .memory-tab-panel { display: grid; gap: 12px; }
+    .memory-tab-panel[hidden] { display: none; }
+    .memory-candidate-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
+    .memory-suggestion-card {
+      display: grid;
+      align-content: start;
+      gap: 11px;
+      min-width: 0;
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: linear-gradient(145deg, #171d26, #11171f);
+    }
+    .memory-suggestion-card h3 { margin: 0; font-size: 15px; line-height: 1.35; }
+    .memory-suggestion-card p { margin: 0; color: #dbe4ee; line-height: 1.5; }
+    .memory-suggestion-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .memory-destination { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: 0; text-transform: none; }
+    .memory-destination select { width: 100%; }
+    .memory-suggestion-actions { display: flex; gap: 8px; padding-top: 2px; }
+    .memory-suggestion-actions button { flex: 1; }
+    .memory-management-layout { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(300px, .8fr); gap: 10px; align-items: start; }
+    .memory-card { width: 100%; overflow: hidden; color: var(--text); text-align: left; white-space: normal; }
+    .memory-card .item-line strong { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+    .memory-card .item-line .chip { flex: 0 0 auto; }
+    .memory-card p { margin: 6px 0; color: #dbe4ee; line-height: 1.45; overflow-wrap: anywhere; white-space: normal; }
+    .memory-empty { min-height: 190px; }
+    .memory-empty .row { justify-content: center; margin-top: 6px; }
+    .memory-organization summary { display: flex; justify-content: space-between; gap: 12px; cursor: pointer; }
     .bar-chart { display: flex; align-items: end; gap: 8px; min-height: 220px; padding-top: 20px; }
-    .bar-column { display: grid; flex: 1; grid-template-rows: 1fr auto; align-items: end; gap: 8px; height: 190px; text-align: center; color: var(--muted); font-size: 10px; }
+    .bar-column { display: grid; flex: 1; grid-template-rows: 1fr auto; align-items: end; gap: 8px; height: 190px; text-align: center; color: var(--muted); font-size: 11px; }
     .bar-column i { display: block; width: 100%; min-height: 3px; border-radius: 5px 5px 2px 2px; background: linear-gradient(180deg, #58c9ac, #277d69); }
     .cron-card { display: grid; gap: 8px; padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: #12171f; }
     .cron-card .cron-meta { display: flex; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: 12px; }
-    .editor-dialog { width: min(760px, calc(100vw - 40px)); padding: 0; border: 1px solid var(--line); border-radius: 14px; background: #11161e; color: var(--text); }
+    .editor-dialog { width: min(760px, calc(100vw - 40px)); max-height: calc(100dvh - 24px); overflow: auto; padding: 0; border: 1px solid var(--line); border-radius: 14px; background: #11161e; color: var(--text); }
     .editor-dialog::backdrop { background: rgba(0, 0, 0, .68); }
     .editor-dialog form { display: grid; gap: 14px; padding: 20px; }
     .editor-dialog textarea { min-height: 150px; }
@@ -2795,12 +3226,157 @@ function renderConsoleHtml() {
     .experimental-config { max-height: none; color: #b9d7cc; }
     .experimental-run-card { cursor: pointer; }
     .experimental-run-card:hover { border-color: #456071; }
+    .labs-nav { margin: 4px 0 2px; padding-left: 8px; border-left: 1px solid var(--line); }
+    .labs-nav button { min-height: 34px; font-size: 12px; }
+    .feature-hero {
+      display: grid;
+      grid-template-columns: minmax(260px, .7fr) minmax(0, 1.3fr);
+      gap: 24px;
+      align-items: center;
+      background: linear-gradient(135deg, rgba(45, 105, 90, .2), rgba(17, 22, 30, .96));
+    }
+    .feature-hero h2 { max-width: 620px; margin-top: 6px; font-size: 18px; line-height: 1.4; }
+    .feature-eyebrow { color: var(--accent); font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .feature-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 0; padding: 0; list-style: none; }
+    .feature-steps li {
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      min-height: 58px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      color: #cbd5e1;
+      background: rgba(12, 17, 23, .62);
+      line-height: 1.35;
+    }
+    .feature-steps li span { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: #234b42; color: #b9f4df; font-weight: 800; }
+    .experimental-page-layout { display: grid; grid-template-columns: minmax(260px, .68fr) minmax(0, 1.32fr); gap: 14px; align-items: start; }
+    .feature-action-list { display: grid; gap: 8px; }
+    .feature-action {
+      display: grid;
+      width: 100%;
+      gap: 5px;
+      padding: 13px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      color: var(--text);
+      background: #141a23;
+      text-align: left;
+    }
+    .feature-action strong { font-size: 13px; }
+    .feature-action span { color: var(--muted); font-size: 12px; line-height: 1.4; }
+    .feature-action.selected { border-color: #4b9f88; background: #172a26; box-shadow: inset 3px 0 #70d6b7; }
+    .feature-workspace { min-height: 360px; }
+    .advanced-options { border-top: 1px solid var(--line-soft); padding-top: 12px; }
+    .advanced-options summary { color: var(--muted); cursor: pointer; font-size: 12px; }
+    .advanced-options p { margin: 8px 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .advanced-options textarea { min-height: 180px; }
+    .friendly-result { min-height: 140px; padding-top: 4px; }
+    .result-summary { display: grid; gap: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: #10161e; }
+    .result-summary.success { border-color: #2d6a58; background: #11231f; }
+    .result-summary.error { border-color: #753744; background: #24151a; }
+    .result-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+    .result-fact { display: grid; gap: 4px; padding: 10px; border-radius: 8px; background: rgba(9, 13, 18, .58); }
+    .result-fact small { color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+    .result-fact strong { overflow-wrap: anywhere; font-size: 13px; }
+    .human-list { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+    .human-list li { padding: 9px 10px; border: 1px solid var(--line-soft); border-radius: 8px; background: rgba(9, 13, 18, .42); }
+    .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; }
+    .detail-card { display: grid; gap: 5px; min-width: 0; padding: 10px; border: 1px solid var(--line-soft); border-radius: 8px; background: #0f141b; }
+    .detail-card span { color: var(--muted); font-size: 11px; }
+    .technical-token { font-family: inherit; overflow-wrap: anywhere; }
+    .technical-details pre { max-height: 260px; overflow: auto; margin-top: 8px; }
     @media (max-width: 900px) {
-      .usage-grid, .agent-layout, .workshop-grid, .experimental-workbench { grid-template-columns: 1fr; }
+      .usage-grid, .agent-layout, .project-layout, .memory-management-layout, .workshop-grid, .experimental-workbench, .experimental-page-layout, .feature-hero { grid-template-columns: 1fr; }
+      .feature-steps { grid-template-columns: 1fr; }
       .beta-boundary-grid { grid-template-columns: 1fr 1fr; }
       .session-filters { grid-template-columns: 1fr; }
       .filter-grid { grid-template-columns: 1fr 1fr; }
       .summary-bar { align-items: flex-start; flex-direction: column; gap: 10px; }
+      .goal-filter-bar { grid-template-columns: 1fr; }
+      .memory-status-bar { grid-template-columns: auto minmax(0, 1fr); }
+      .memory-status-summary { grid-column: 1 / -1; }
+      .memory-status-summary span:first-child { padding-left: 0; border-left: 0; }
+    }
+    @media (max-width: 600px) {
+      .beta-boundary-grid, .filter-grid { grid-template-columns: 1fr; }
+      .memory-status-bar { align-items: start; }
+      .memory-status-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 10px; }
+      .memory-status-summary span { padding: 0; border: 0; white-space: normal; }
+      .memory-tabs button { flex: 1; min-width: 0; padding-inline: 8px; }
+      .memory-candidate-list { grid-template-columns: 1fr; }
+      .memory-suggestion-actions { flex-direction: column; }
+      .memory-card.selected p,
+      .memory-card.selected .scope-label,
+      .memory-card.selected .muted { display: none; }
+      .task-table-panel {
+        overflow-x: visible;
+      }
+      .task-table-shell,
+      .session-table {
+        width: 100%;
+        min-width: 0;
+      }
+      .task-table-shell .data-head,
+      .session-table .data-head {
+        display: none;
+      }
+      .task-table-shell .task-row {
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 9px 12px;
+        min-width: 0;
+        padding: 14px 10px;
+      }
+      .task-table-shell .task-row > .data-primary {
+        grid-column: 1 / -1;
+      }
+      .task-table-shell .task-row > :nth-child(3) {
+        grid-column: 2;
+        grid-row: 2;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .task-table-shell .task-row > :nth-child(4) {
+        grid-column: 1;
+        grid-row: 3;
+      }
+      .task-table-shell .task-row > :nth-child(5) {
+        display: none;
+      }
+      .task-table-shell .task-row > :nth-child(6) {
+        grid-column: 2;
+        grid-row: 3;
+      }
+      .session-table .session-record {
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 10px 12px;
+        min-width: 0;
+        padding: 14px 10px;
+      }
+      .session-table .session-record > .data-primary,
+      .session-table .session-record > :nth-child(7) {
+        grid-column: 1 / -1;
+      }
+      .session-table .session-record > :nth-child(2) {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .session-table .session-record > :nth-child(5) {
+        grid-column: 1;
+      }
+      .session-table .session-record > :nth-child(6) {
+        display: none;
+      }
+      .session-table .session-record > :nth-child(7) {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+      }
+      .session-table .session-project-select {
+        width: 100%;
+        max-width: none;
+      }
     }
   </style>
 </head>
@@ -2834,7 +3410,7 @@ function renderConsoleHtml() {
     <symbol id="icon-moon" viewBox="0 0 24 24"><path d="M19 15.5A7.5 7.5 0 0 1 8.5 5 7.5 7.5 0 1 0 19 15.5z"></path></symbol>
   </svg>
   <div class="shell" id="shell">
-    <aside class="sidebar">
+    <aside class="sidebar" id="console-sidebar" aria-label="Primary navigation">
       <div class="brand">
         <div class="mark"><img src="/odinn-logo.png" alt="Ódinn Forge logo"></div>
         <div class="brand-title">
@@ -2847,42 +3423,49 @@ function renderConsoleHtml() {
       </div>
       <nav class="nav" aria-label="Console views">
         <button class="active" data-view="overview" data-title="Chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-chat"></use></svg></span><span class="nav-label">Chat</span><span class="badge ok" id="nav-health">...</span></button>
+        <button data-view="sessions" data-title="Sessions" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-session"></use></svg></span><span class="nav-label">Sessions</span></button>
         <div class="menu-chats">
-        <button class="secondary" id="new-chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-plus"></use></svg></span><span class="nav-label">New session</span></button>
+          <button class="secondary" id="new-chat" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-plus"></use></svg></span><span class="nav-label">New session</span></button>
           <div class="session-rail-label"><span>Pinned</span><span class="rail-count" id="pinned-count">0</span></div>
           <div id="pinned-chat-list" class="session-list pinned-list"></div>
-          <div class="session-rail-label"><span>Sessions</span><span class="rail-count" id="chat-session-count">0</span></div>
+          <div class="session-rail-label"><span>Recent</span><span class="rail-count" id="chat-session-count">0</span></div>
           <div id="chat-session-list" class="session-list"></div>
         </div>
         <details class="nav-more" open>
           <summary><span class="nav-group-label">More</span><span class="nav-chevron">⌄</span></summary>
-          <button data-view="sessions" data-title="Sessions" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-session"></use></svg></span><span class="nav-label">Sessions</span></button>
-          <button data-view="usage" data-title="Usage" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-usage"></use></svg></span><span class="nav-label">Usage</span></button>
-          <button data-view="cron" data-title="Cron Jobs" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-clock"></use></svg></span><span class="nav-label">Cron Jobs</span></button>
+          <button data-view="capabilities" data-title="Web tools" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-globe"></use></svg></span><span class="nav-label">Web tools</span></button>
+          <button data-view="usage" data-title="Activity" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-usage"></use></svg></span><span class="nav-label">Activity</span></button>
+          <button data-view="cron" data-title="Schedules" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-clock"></use></svg></span><span class="nav-label">Schedules</span></button>
           <button data-view="tasks" data-title="Tasks" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span><span class="nav-label">Tasks</span></button>
-          <button data-view="agents" data-title="Agents" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-agent"></use></svg></span><span class="nav-label">Agents</span></button>
-          <button data-view="skills" data-title="Skill SDK" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-skill"></use></svg></span><span class="nav-label">Skill SDK</span></button>
-          <button data-view="experiments" data-title="Experimental Lab" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-spark"></use></svg></span><span class="nav-label">Experimental Lab</span><span class="badge warn" id="nav-experimental-count">0/7</span></button>
+          <button data-view="agents" data-title="Agent SDK" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-agent"></use></svg></span><span class="nav-label">Agent SDK</span></button>
+          <button data-view="skills" data-title="Skills SDK" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-skill"></use></svg></span><span class="nav-label">Skills SDK</span></button>
+          <button data-view="automatic-improvements" data-title="Automatic improvements" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-refresh"></use></svg></span><span class="nav-label">Automatic improvements</span></button>
+          <details class="nav-labs">
+            <summary><span class="nav-group-label"><svg class="icon-svg"><use href="#icon-spark"></use></svg> Labs</span><span class="badge warn" id="nav-experimental-count">0/7</span><span class="nav-chevron">⌄</span></summary>
+            <div class="labs-nav">
+            ${experimentalConsoleNavigation()}
+            </div>
+          </details>
         </details>
         <div class="nav-group-label nav-advanced-label">Workspace</div>
         <button data-view="projects" data-title="Projects" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-project"></use></svg></span><span class="nav-label">Projects</span></button>
         <button data-view="memory" data-title="Memory" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-memory"></use></svg></span><span class="nav-label">Memory</span></button>
         <button data-view="goals" data-title="Goals" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-goal"></use></svg></span><span class="nav-label">Goals</span></button>
-        <button data-view="audit" data-title="Audit" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-audit"></use></svg></span><span class="nav-label">Audit</span></button>
       </nav>
       <div class="sidebar-footer">
         <div class="sidebar-footer-tools">
-          <button class="sidebar-icon-button" id="sidebar-settings" title="Runtime settings" aria-label="Runtime settings" type="button"><svg class="icon-svg"><use href="#icon-settings"></use></svg></button>
-          <button class="sidebar-icon-button" id="sidebar-console" title="Open runtime" aria-label="Open runtime" type="button"><svg class="icon-svg"><use href="#icon-monitor"></use></svg></button>
+          <button class="sidebar-icon-button" id="sidebar-settings" title="Open usage and provider status" aria-label="Open usage and provider status" type="button"><svg class="icon-svg"><use href="#icon-settings"></use></svg></button>
+          <button class="sidebar-icon-button" id="sidebar-console" title="Open Web and browser tools" aria-label="Open Web and browser tools" type="button"><svg class="icon-svg"><use href="#icon-monitor"></use></svg></button>
           <button class="sidebar-icon-button" id="sidebar-theme" title="Toggle theme" aria-label="Toggle theme" type="button"><svg class="icon-svg"><use href="#icon-moon"></use></svg></button>
           <button class="sidebar-icon-button" id="refresh" title="Refresh" aria-label="Refresh" type="button"><svg class="icon-svg"><use href="#icon-refresh"></use></svg></button>
         </div>
-        <div class="sidebar-status"><span class="status-dot"></span><span>Loopback beta</span><span class="sidebar-version">v0.1</span></div>
+        <div class="sidebar-status"><span class="status-dot"></span><span id="gateway-context">Local gateway</span><span class="sidebar-version" id="product-version">v${version}</span></div>
       </div>
     </aside>
+    <button class="mobile-scrim" id="mobile-scrim" type="button" aria-label="Close navigation" tabindex="-1"></button>
 
     <header class="topbar">
-      <button class="sidebar-toggle" id="sidebar-toggle" type="button" title="Collapse navigation" aria-label="Collapse navigation"><svg class="icon-svg"><use href="#icon-menu"></use></svg></button>
+      <button class="sidebar-toggle" id="sidebar-toggle" type="button" title="Collapse navigation" aria-label="Collapse navigation" aria-controls="console-sidebar" aria-expanded="true"><svg class="icon-svg"><use href="#icon-menu"></use></svg></button>
       <div class="topbar-title">
         <div class="breadcrumb-line">
           <strong>Ódinn Forge</strong>
@@ -2891,13 +3474,11 @@ function renderConsoleHtml() {
           <span class="breadcrumb-sep" id="chat-context-sep">/</span>
           <span class="current" id="chat-title">New chat</span>
         </div>
-        <span class="topbar-context" id="chat-subtitle">Local beta adapter</span>
-        <span class="topbar-context" id="workspace">Loading local runtime...</span>
+          <span class="topbar-context" id="chat-subtitle">Your local assistant</span>
+        <span class="topbar-context" id="workspace">Loading your workspace...</span>
       </div>
       <div class="row">
-        <span class="pill" id="health">Checking</span>
-        <button class="secondary" id="copy-status" title="Copy runtime status" type="button">Status</button>
-        <button id="quick-smoke" title="Run a local healthcheck" type="button">Smoke</button>
+        <button class="secondary" id="remote-signout" type="button" hidden>Sign out</button>
       </div>
     </header>
 
@@ -2907,19 +3488,22 @@ function renderConsoleHtml() {
           <div class="chat-column">
             <div id="chat-thread" class="chat-thread"></div>
             <div class="composer">
-              <textarea id="chat-input" placeholder="Message Ódinn Forge..."></textarea>
+              <div class="provider-setup" id="provider-cta" role="status">
+                <span>No connected model provider. Run <code>odinn onboard</code> in a terminal, then refresh this page.</span>
+                <div class="row"><button class="secondary" data-view-jump="usage" type="button">View provider status</button><button class="secondary" id="copy-onboard-command" type="button">Copy command</button></div>
+              </div>
+              <textarea id="chat-input" aria-label="Message Ódinn Forge" placeholder="Connect a provider to start chatting" disabled></textarea>
               <div class="composer-footer">
                 <div class="row composer-tools">
                   <button class="secondary" data-view-jump="tasks" title="Open tasks" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-tool"></use></svg></span></button>
-                  <select id="model-select" aria-label="Model">
+                  <select id="model-select" aria-label="Model" disabled>
                     <option value="">Configure a provider first</option>
                   </select>
                   <span class="chip warn" id="model-chip">no model configured</span>
                 </div>
                 <div class="row">
-                  <button class="secondary" id="chat-smoke" title="Run a local healthcheck" type="button">Health</button>
-                  <span class="muted chat-status" id="chat-status">Ready</span>
-                  <button class="send-action" id="send-chat" title="Send message" type="button">Send</button>
+                  <span class="muted chat-status" id="chat-status" role="status" aria-live="polite">Checking provider</span>
+                  <button class="send-action" id="send-chat" title="Send message" type="button" disabled>Send</button>
                 </div>
               </div>
             </div>
@@ -2929,192 +3513,195 @@ function renderConsoleHtml() {
 
       <section id="view-capabilities" class="view">
         <div class="page capabilities-page">
-          <div class="page-head"><div><div class="section-kicker">Agent capability layer</div><h1>Web &amp; browser</h1><p>Search the public web, read pages, and work inside logged-in accounts through an isolated browser profile.</p></div><span class="chip ok">approval-gated</span></div>
-          <div class="stat-strip"><div class="stat-card"><strong id="cap-web-status">READY</strong><span>public web access</span></div><div class="stat-card"><strong id="cap-browser-status">READY</strong><span>persistent browser</span></div><div class="stat-card"><strong id="cap-approval-count">0</strong><span>pending approvals</span></div><div class="stat-card"><strong id="cap-security-mode">SAFE</strong><span>default posture</span></div></div>
+          <div class="page-head"><div><div class="section-kicker">Current information and website work</div><h1>Web tools</h1><p>Use these when Ódinn needs up-to-date public information or has to work on a website for you.</p></div><span class="chip" id="browser-approval-mode">Checking safeguards</span></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="cap-web-status">CHECKING</strong><span>public web</span></div><div class="stat-card"><strong id="cap-browser-status">CHECKING</strong><span>browser workspace</span></div><div class="stat-card"><strong id="cap-approval-count">—</strong><span>waiting for you</span></div><div class="stat-card"><strong id="cap-security-mode">CHECKING</strong><span>action safeguards</span></div></div>
           <div class="capability-grid">
             <div class="panel stack">
-              <div class="panel-head"><div><h2>Search the web</h2><span class="muted">Read-only public search</span></div><button id="web-search-run" type="button">Search</button></div>
-              <div class="field"><label for="web-search-query">Query</label><input id="web-search-query" placeholder="Search current information..."></div>
-              <div id="web-search-results" class="list"><div class="empty-state"><strong>Nothing searched yet</strong><span>Results will appear here with source links and snippets.</span></div></div>
+              <div class="panel-head"><div><h2>Public web search</h2><span class="chip ok">read only</span></div><button id="web-search-run" type="button">Search</button></div>
+              <p>Find current facts, documentation, news, and public pages. This does not sign in or change anything.</p>
+              <div class="field"><label for="web-search-query">What do you want to find?</label><input id="web-search-query" placeholder="Search current information..."></div>
+              <div id="web-search-results" class="list"><div class="empty-state"><strong>Nothing searched yet</strong><span>Results will appear here with clear source links.</span></div></div>
             </div>
             <div class="panel stack">
-              <div class="panel-head"><div><h2>Browser workspace</h2><span class="muted">Separate profile · user login required</span></div><button class="secondary" id="browser-refresh" type="button">Refresh</button></div>
-              <div class="field"><label for="browser-url">Open URL</label><div class="row"><input id="browser-url" placeholder="https://example.com"><button id="browser-open" type="button">Open</button></div></div>
-              <div id="browser-tabs" class="list"><div class="empty-state"><strong>Browser is waiting</strong><span>Open a site to create the persistent beta profile.</span></div></div>
-              <div class="panel browser-page-panel"><div class="panel-head"><h3 id="browser-page-title">No page selected</h3><span class="chip" id="browser-page-url">—</span></div><pre id="browser-page-text" class="browser-page-text">Open or select a tab to inspect visible content.</pre></div>
+              <div class="panel-head"><div><h2>Signed-in browser</h2><span class="chip warn">asks before changes</span></div><button class="secondary" id="browser-refresh" type="button">Refresh</button></div>
+              <p>Open a separate browser workspace for sites that need an account, forms, or multi-step navigation. Ódinn pauses before actions that change an external account.</p>
+              <div class="field"><label for="browser-url">Website address</label><div class="row"><input id="browser-url" placeholder="https://example.com"><button id="browser-open" type="button">Open</button></div></div>
+              <div id="browser-tabs" class="list"><div class="empty-state"><strong>Browser is waiting</strong><span>Open a site to begin.</span></div></div>
+              <div class="panel browser-page-panel"><div class="panel-head"><h3 id="browser-page-title">No page selected</h3><span class="chip" id="browser-page-url">—</span></div><div id="browser-page-text" class="browser-page-text">Open or select a tab to inspect visible content.</div></div>
             </div>
           </div>
           <div class="panel stack">
-            <div class="panel-head"><div><h2>External action approvals</h2><span class="muted">Clicks, typing, and key presses stop here until you approve them.</span></div><span class="chip warn">human in the loop</span></div>
-            <div id="approval-list" class="list"><div class="empty-state"><strong>No pending actions</strong><span>Ódinn Forge will show approval requests here before changing an external account.</span></div></div>
+            <div class="panel-head"><div><h2>Actions waiting for you</h2><span class="muted" id="browser-approval-copy">Checking whether a browser action needs your confirmation.</span></div><span class="chip warn">you stay in control</span></div>
+            <div id="approval-list" class="list"><div class="empty-state"><strong>Nothing is waiting</strong><span>Ódinn will pause here before changing an external account.</span></div></div>
           </div>
         </div>
       </section>
 
       <section id="view-tasks" class="view">
         <div class="page oc-page">
-          <div class="page-head"><div><div class="section-kicker">Work queue &amp; execution history</div><h1>Tasks</h1><p>See meaningful work first. Routine console reads stay hidden unless you ask for the plumbing.</p></div><button class="secondary" id="refresh-tasks" type="button">Refresh</button></div>
-          <div class="stat-strip"><div class="stat-card"><strong id="task-total">0</strong><span>visible tasks</span></div><div class="stat-card"><strong id="task-running">0</strong><span>active or waiting</span></div><div class="stat-card"><strong id="task-passed">0</strong><span>completed</span></div><div class="stat-card"><strong id="task-failed">0</strong><span>needs review</span></div></div>
-          <div class="panel table-panel"><div class="toolbar"><input id="task-query" placeholder="Search task, tool, actor, or run ID"><div class="row"><select id="task-status-filter" aria-label="Task status"><option value="all">All statuses</option><option value="active">Active</option><option value="completed">Completed</option><option value="review">Needs review</option></select><select id="task-category-filter" aria-label="Task origin"><option value="all">All origins</option><option value="user">User</option><option value="agent">Agent</option><option value="automation">Automation</option></select><label class="switch-label"><input id="task-system-toggle" type="checkbox"> System activity</label></div></div><div class="data-table"><div class="data-row data-head"><span>Task</span><span>Status</span><span>Origin</span><span>Updated</span><span>Record</span><span>Actions</span></div><div id="task-table"></div></div></div>
-          <div class="panel stack"><div class="panel-head"><div><h2>Task detail</h2><span class="muted" id="task-detail-label">Select a task for its timeline, outcome, and proof.</span></div><div class="row"><button class="secondary" id="task-verify" type="button" disabled>Verify proof</button><button class="secondary" id="task-replay" type="button" disabled>Replay</button></div></div><div id="task-summary" class="record-grid"></div><div id="task-evidence" class="timeline task-timeline"><div class="empty-state"><strong>No task selected</strong><span>Choose Inspect from the history above.</span></div></div><details class="activity-details"><summary>Raw task record</summary><pre id="task-raw" class="output">No task selected.</pre></details></div>
+          <div class="page-head"><div><div class="section-kicker">Work in one place</div><h1>Tasks</h1><p>Find, stop, inspect, or run work again. Turn on System activity only when you need routine background updates.</p></div><button class="secondary" id="refresh-tasks" type="button">Refresh</button></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="task-total">0</strong><span>visible tasks</span></div><div class="stat-card"><strong id="task-running">0</strong><span>active or waiting</span></div><div class="stat-card"><strong id="task-passed">0</strong><span>completed</span></div><div class="stat-card"><strong id="task-failed">0</strong><span>need attention</span></div></div>
+          <div class="panel table-panel task-table-panel">
+            <div class="toolbar"><input id="task-query" aria-label="Search tasks" placeholder="Search tasks by name or area"><div class="row"><select id="task-status-filter" aria-label="Task status"><option value="all">All statuses</option><option value="active">Active</option><option value="completed">Completed</option><option value="review">Needs attention</option></select><select id="task-category-filter" aria-label="Task origin"><option value="all">Started by anyone</option><option value="user">You</option><option value="agent">Agent SDK</option><option value="automation">Automatic</option></select><label class="switch-label"><input id="task-system-toggle" type="checkbox"> System activity</label></div></div>
+            <div class="task-management"><label class="switch-label"><input id="task-select-page" type="checkbox"> Select this page</label><span class="muted" id="task-selection-count">No tasks selected</span><div class="row"><button class="secondary" id="task-rerun-selected" type="button" disabled>Run selected again</button><button class="secondary" id="task-cancel-selected" type="button" disabled>Stop selected</button><button class="secondary" id="task-clear-selection" type="button" disabled>Clear</button></div></div>
+            <div class="data-table task-table-shell"><div class="data-row data-head"><span>Task</span><span>Status</span><span>Started by</span><span>Updated</span><span>Updates</span><span>Actions</span></div><div id="task-table"></div></div>
+            <div class="pagination"><span class="muted" id="task-page-label">Page 1 of 1</span><div class="row"><label class="switch-label">Items <select id="task-page-size"><option>10</option><option selected>25</option><option>50</option></select></label><button class="secondary" id="task-prev" type="button">Previous</button><button class="secondary" id="task-next" type="button">Next</button></div></div>
+          </div>
+          <div class="panel stack"><div class="panel-head"><div><h2>Task detail</h2><span class="muted" id="task-detail-label">Select a task for its timeline and outcome.</span></div><div class="row"><button class="secondary" id="task-verify" type="button" disabled>Check record integrity</button><button class="secondary" id="task-cancel" type="button" disabled>Stop</button><button class="secondary" id="task-replay" type="button" disabled>Run again</button></div></div><div id="task-summary" class="record-grid"></div><div id="task-evidence" class="timeline task-timeline"><div class="empty-state"><strong>No task selected</strong><span>Choose Inspect from the history above.</span></div></div></div>
         </div>
       </section>
 
       <section id="view-cron" class="view">
         <div class="page oc-page">
-          <div class="page-head"><div><div class="section-kicker">Scheduled automation</div><h1>Cron Jobs</h1><p>Wakeups and recurring runs.</p></div><div class="row"><button id="new-cron" type="button">New Job</button><button class="secondary" id="refresh-cron" type="button">Refresh</button></div></div>
-          <div class="summary-bar"><span><small>ENABLED</small><strong id="cron-enabled">Yes</strong></span><span><small>JOBS</small><strong id="cron-count">0</strong></span><span><small>NEXT WAKE</small><strong id="cron-next">—</strong></span></div>
-          <div class="panel stack"><div class="panel-head"><div><h2>Jobs</h2><p class="muted">Persisted in the gateway and evaluated in each job's timezone.</p></div><span class="muted" id="cron-shown">0 shown</span></div><input id="cron-query" placeholder="Filter jobs"><div id="cron-list" class="list"></div></div>
-          <dialog id="cron-dialog" class="editor-dialog"><form method="dialog" id="cron-form"><div class="panel-head"><h2>Schedule a job</h2><button class="secondary" value="cancel" type="submit">Close</button></div><div class="grid-2"><div class="field"><label for="cron-name">Name</label><input id="cron-name" required></div><div class="field"><label for="cron-schedule">Cron expression</label><input id="cron-schedule" value="0 9 * * 1" required></div></div><div class="grid-2"><div class="field"><label for="cron-timezone">Timezone</label><input id="cron-timezone" value="America/New_York"></div><div class="field"><label for="cron-tool">Tool</label><select id="cron-tool"></select></div></div><div class="field"><label for="cron-input">Input JSON</label><textarea id="cron-input">{}</textarea></div><div class="row"><button id="save-cron" value="default" type="submit">Save Job</button></div></form></dialog>
+          <div class="page-head"><div><div class="section-kicker">Scheduled work</div><h1>Schedules</h1><p>Ask Ódinn to run a recurring action while the local gateway is online.</p></div><div class="row"><button id="new-cron" type="button">New schedule</button><button class="secondary" id="refresh-cron" type="button">Refresh</button></div></div>
+          <div class="summary-bar"><span><small>SCHEDULING</small><strong id="cron-enabled">On</strong></span><span><small>SCHEDULES</small><strong id="cron-count">0</strong></span><span><small>NEXT RUN</small><strong id="cron-next">—</strong></span></div>
+          <div class="panel stack"><div class="panel-head"><div><h2>Recurring actions</h2><p class="muted">Times follow the timezone saved with each schedule.</p></div><span class="muted" id="cron-shown">0 shown</span></div><input id="cron-query" aria-label="Filter schedules" placeholder="Filter schedules"><div id="cron-list" class="list"></div></div>
+          <dialog id="cron-dialog" class="editor-dialog"><form method="dialog" id="cron-form"><div class="panel-head"><h2>Create a schedule</h2><button class="secondary" value="cancel" type="submit">Close</button></div><div class="field"><label for="cron-name">Name</label><input id="cron-name" placeholder="Monday project check-in" required></div><div class="grid-2"><div class="field"><label for="cron-frequency">Repeat</label><select id="cron-frequency"><option value="daily">Every day</option><option value="weekdays">Weekdays</option><option value="weekly">Every week</option><option value="hourly">Every hour</option><option value="custom">Custom</option></select></div><div class="field" id="cron-time-field"><label for="cron-time">Time</label><input id="cron-time" type="time" value="09:00"></div></div><div class="field" id="cron-weekday-field" hidden><label for="cron-weekday">Day</label><select id="cron-weekday"><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="0">Sunday</option></select></div><details id="cron-custom-options" class="advanced-options"><summary>Custom timing</summary><div class="field"><label for="cron-schedule">Schedule pattern</label><input id="cron-schedule" value="0 9 * * *" required><span class="muted">Use this only when the common repeat options do not fit.</span></div></details><div class="grid-2"><div class="field"><label for="cron-timezone">Timezone</label><input id="cron-timezone" value="America/New_York"></div><div class="field"><label for="cron-tool">Action</label><select id="cron-tool"></select></div></div><details class="advanced-options"><summary>Advanced action input</summary><div class="field"><label for="cron-input">Structured input</label><textarea id="cron-input">{}</textarea></div></details><div class="row"><button id="save-cron" value="default" type="submit">Save schedule</button></div></form></dialog>
         </div>
       </section>
 
       <section id="view-projects" class="view">
-        <div class="page oc-page">
-          <div class="page-head"><div><div class="section-kicker">Organized workspaces</div><h1>Projects</h1><p>Group related sessions and give goals a real home instead of leaving them loose in the void.</p></div><div class="row"><button id="new-project" type="button">New Project</button><button class="secondary" id="refresh-projects" type="button">Refresh</button></div></div>
+        <div class="page oc-page projects-page">
+          <div class="page-head"><div><div class="section-kicker">Organized workspaces</div><h1>Projects</h1><p>Group related sessions and goals in one workspace.</p></div><div class="row"><button id="new-project" type="button">New Project</button><button class="secondary" id="refresh-projects" type="button">Refresh</button></div></div>
           <div class="stat-strip"><div class="stat-card"><strong id="project-total">0</strong><span>active projects</span></div><div class="stat-card"><strong id="project-session-count">0</strong><span>sessions</span></div><div class="stat-card"><strong id="project-goal-count">0</strong><span>goals</span></div><div class="stat-card"><strong id="project-active-goal-count">0</strong><span>active goals</span></div></div>
-          <div class="agent-layout"><div class="panel stack"><div class="panel-head"><h2>Project registry</h2><input id="project-query" placeholder="Filter projects"></div><div id="project-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Project detail</h2><span class="chip" id="project-detail-status">No selection</span></div><div id="project-detail" class="empty-state"><strong>Select a project</strong><span>Its sessions and scoped goals will appear here.</span></div><div class="row"><button class="secondary" id="project-open-sessions" type="button" disabled>Open Sessions</button><button class="secondary" id="project-open-goals" type="button" disabled>Open Goals</button><button class="danger-button" id="project-archive" type="button" disabled>Archive</button></div></div></div>
+          <div class="project-layout"><div class="panel stack"><div class="panel-head"><h2>Projects</h2><input id="project-query" aria-label="Filter projects" placeholder="Filter projects"></div><div id="project-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Project detail</h2><span class="chip" id="project-detail-status">No selection</span></div><div id="project-detail" class="empty-state"><strong>Select a project</strong><span>Its sessions and scoped goals will appear here.</span></div><div class="row"><button class="secondary" id="project-open-sessions" type="button" disabled>Open Sessions</button><button class="secondary" id="project-open-goals" type="button" disabled>Open Goals</button><button class="danger-button" id="project-archive" type="button" disabled>Archive</button></div></div></div>
           <dialog id="project-dialog" class="editor-dialog"><form method="dialog" id="project-form"><div class="panel-head"><div><h2>Create project</h2><span class="muted">Sessions and goals can be moved here after creation.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div class="field"><label for="project-name">Project name</label><input id="project-name" placeholder="Website launch" required></div><div class="field"><label for="project-description">Description</label><textarea id="project-description" placeholder="What belongs in this project?"></textarea></div><div class="row"><button value="default" type="submit">Create Project</button></div></form></dialog>
         </div>
       </section>
 
       <section id="view-memory" class="view">
-        <div class="page oc-page">
-          <div class="page-head"><div><div class="section-kicker">Persistent context</div><h1>Memory</h1><p>See what Ódinn remembers, where it applies, and why it is trusted.</p></div><div class="row"><span class="chip" id="memory-health">Checking</span><button class="secondary" id="refresh-memory-tree" type="button">Refresh</button></div></div>
-          <div class="stat-strip"><div class="stat-card"><strong id="memory-record-count">0</strong><span>active memories</span></div><div class="stat-card"><strong id="memory-namespace-count">0</strong><span>namespaces</span></div><div class="stat-card"><strong id="memory-recall-status">OFF</strong><span>automatic recall</span></div><div class="stat-card"><strong id="memory-last-update">—</strong><span>last update</span></div></div>
-          <div class="agent-layout">
-            <div class="panel stack"><div class="panel-head"><div><h2>Memory library</h2><span class="muted" id="memory-result-count">0 records</span></div><button id="memory-new-toggle" type="button">Add Memory</button></div><div class="filter-grid"><input id="memory-query" placeholder="Search remembered facts"><select id="memory-kind-filter"><option value="">All kinds</option><option>preference</option><option>project</option><option>person</option><option>artifact</option><option>procedure</option><option>decision</option><option>system</option></select><select id="memory-scope-filter"><option value="">All scopes</option><option value="global">Global</option><option value="project">Project</option><option value="session">Session</option></select></div><div id="memory-list" class="list"></div></div>
-            <div class="panel stack"><div class="panel-head"><h2>Memory detail</h2><span class="chip" id="memory-detail-kind">No selection</span></div><div id="memory-detail" class="empty-state"><strong>Select a memory</strong><span>Text, scope, source, authority, confidence, and provenance will appear here.</span></div><div class="row"><button class="secondary" id="memory-correct" type="button" disabled>Correct</button><button class="secondary" id="memory-recall-test" type="button">Test Recall</button></div></div>
+        <div class="page oc-page memory-page">
+          <div class="page-head"><div><div class="section-kicker">Context that improves with you</div><h1>Memory</h1><p>Review what Ódinn has noticed and manage the details it can use in future conversations.</p></div><div class="row"><button id="memory-new-toggle" type="button">Add memory</button><button class="secondary" id="refresh-memory-tree" type="button">Refresh</button></div></div>
+          <div class="panel memory-status-bar">
+            <div class="memory-status-icon" aria-hidden="true">✓</div>
+            <div class="memory-status-copy"><div class="row"><strong>Automatic memory</strong><span class="chip" id="memory-health">Checking</span></div><p id="memory-status-copy">Checking what Ódinn can remember and recall.</p></div>
+            <div class="memory-status-summary" aria-label="Memory summary"><span><strong id="memory-record-count">0</strong> saved</span><span><strong id="memory-candidate-count">0</strong> suggestions</span><span><strong id="memory-recall-status">Recall off</strong></span><span id="memory-last-update">No updates yet</span></div>
           </div>
-          <div class="panel stack"><div class="panel-head"><div><h2>Context map</h2><p class="muted">Global, project, and session context stay separated so one conversation does not poison another.</p></div></div><div id="memory-tree" class="record-grid"></div></div>
-          <dialog id="memory-dialog" class="editor-dialog"><form method="dialog" id="memory-form"><div class="panel-head"><div><h2>Remember something</h2><span class="muted">Store only durable context—not scratch notes.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div class="grid-2"><div class="field"><label for="memory-kind">Kind</label><select id="memory-kind"><option>preference</option><option>project</option><option>person</option><option>artifact</option><option>procedure</option><option>decision</option><option>system</option></select></div><div class="field"><label for="memory-subject">Subject</label><input id="memory-subject" placeholder="Deployment preferences" required></div></div><div class="grid-2"><div class="field"><label for="memory-scope-type">Applies to</label><select id="memory-scope-type"><option value="global">Everywhere</option><option value="project">One project</option><option value="session">One session</option></select></div><div class="field"><label for="memory-scope-id">Project or session</label><select id="memory-scope-id" disabled><option value="">Choose a scope first</option></select></div></div><div class="field"><label for="memory-text">What should Ódinn remember?</label><textarea id="memory-text" placeholder="State the durable fact, preference, or decision clearly." required></textarea></div><details><summary>Advanced metadata</summary><div class="grid-2"><div class="field"><label for="memory-namespace">Namespace</label><input id="memory-namespace" placeholder="preferences/development"></div><div class="field"><label for="memory-tier">Detail level</label><select id="memory-tier"><option value="l0">Summary</option><option value="l1" selected>Fact</option><option value="l2">Evidence</option></select></div></div><div class="field"><label for="memory-tags">Tags</label><input id="memory-tags" placeholder="typescript, workflow"></div></details><div class="row"><button value="default" type="submit">Remember</button></div></form></dialog>
-          <dialog id="memory-correction-dialog" class="editor-dialog"><form method="dialog" id="memory-correction-form"><div class="panel-head"><h2>Correct memory</h2><button class="secondary" value="cancel" type="submit">Close</button></div><div class="field"><label for="memory-correction-text">Corrected text</label><textarea id="memory-correction-text" required></textarea></div><div class="field"><label for="memory-correction-reason">Reason</label><input id="memory-correction-reason" placeholder="The previous record is outdated"></div><div class="row"><button value="default" type="submit">Save Correction</button></div></form></dialog>
+          <div class="memory-tabs" role="tablist" aria-label="Memory views"><button id="memory-tab-suggestions" class="active" type="button" role="tab" tabindex="0" aria-selected="true" aria-controls="memory-suggestions-panel" data-memory-tab="suggestions">Suggestions <span class="count-badge" id="memory-tab-suggestions-count">0</span></button><button id="memory-tab-saved" type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="memory-saved-panel" data-memory-tab="saved">Saved memories <span class="count-badge" id="memory-tab-saved-count">0</span></button></div>
+          <div id="memory-suggestions-panel" class="memory-tab-panel" role="tabpanel" aria-labelledby="memory-tab-suggestions">
+            <div class="panel stack">
+              <div class="panel-head"><div><h2>Review suggestions</h2><p class="muted">Keep useful details. Dismiss anything temporary, incorrect, or too personal.</p></div><span class="chip" id="memory-candidate-badge">0 to review</span></div>
+              <div id="memory-candidate-list" class="memory-candidate-list"><div class="empty-state memory-empty"><strong>You are all caught up</strong><span>New suggestions will appear here after Ódinn notices something useful in a conversation.</span></div></div>
+            </div>
+          </div>
+          <div id="memory-saved-panel" class="memory-tab-panel" role="tabpanel" aria-labelledby="memory-tab-saved" hidden>
+            <div class="memory-management-layout">
+              <div class="panel stack"><div class="panel-head"><div><h2>Saved memories</h2><span class="muted" id="memory-result-count">0 saved</span></div></div><div class="filter-grid"><input id="memory-query" aria-label="Search saved memories" placeholder="Search saved memories"><select id="memory-kind-filter" aria-label="Filter saved memories by type"><option value="">All types</option><option value="preference">Preferences</option><option value="project">Project details</option><option value="person">People</option><option value="artifact">Resources</option><option value="procedure">Routines</option><option value="decision">Decisions</option><option value="system">System settings</option></select><select id="memory-scope-filter" aria-label="Filter saved memories by where they apply"><option value="">All locations</option><option value="global">Available everywhere</option><option value="project">One project</option><option value="session">One conversation</option></select></div><div id="memory-list" class="list"></div></div>
+              <div class="panel stack" id="memory-detail-panel"><div class="panel-head"><h2>Selected memory</h2><span class="chip" id="memory-detail-kind">No selection</span></div><div id="memory-detail" class="empty-state"><strong>Choose a saved memory</strong><span>You will see what Ódinn remembers and where it can use it.</span></div><div class="row"><button class="secondary" id="memory-correct" type="button" disabled>Edit memory</button><button class="secondary" id="memory-recall-test" type="button">Test recall</button><button class="danger-button" id="memory-forget" type="button" disabled>Forget memory</button></div><div id="memory-recall-result" class="result-summary" role="status" aria-live="polite" hidden></div></div>
+            </div>
+            <details class="panel stack memory-organization"><summary><strong>Memory organization</strong><span class="muted">See how saved context is grouped</span></summary><div id="memory-tree" class="record-grid"></div></details>
+          </div>
+          <dialog id="memory-dialog" class="editor-dialog"><form method="dialog" id="memory-form"><div class="panel-head"><div><h2>Add a memory</h2><span class="muted">Save a lasting detail that will be useful in future conversations.</span></div><button class="secondary" id="memory-dialog-close" type="button">Close</button></div><div class="grid-2"><div class="field"><label for="memory-kind">What kind of detail is this?</label><select id="memory-kind"><option value="preference">Preference</option><option value="project">Project detail</option><option value="person">Person</option><option value="artifact">Resource</option><option value="procedure">Routine</option><option value="decision">Decision</option><option value="system">System setting</option></select></div><div class="field"><label for="memory-subject">Short title</label><input id="memory-subject" placeholder="Deployment preferences" required></div></div><div class="grid-2"><div class="field"><label for="memory-scope-type">Where can Ódinn use it?</label><select id="memory-scope-type"><option value="global">Everywhere</option><option value="project">One project</option><option value="session">One conversation</option></select></div><div class="field" id="memory-scope-target-field" hidden><label for="memory-scope-id">Choose the project or conversation</label><select id="memory-scope-id" disabled><option value="">Available everywhere</option></select></div></div><div class="field"><label for="memory-text">What should Ódinn remember?</label><textarea id="memory-text" placeholder="Write the preference, fact, or decision in plain language." required></textarea></div><details><summary>Advanced organization</summary><div class="grid-2"><div class="field"><label for="memory-namespace">Group</label><input id="memory-namespace" placeholder="preferences/development"></div><div class="field"><label for="memory-tier">Level of detail</label><select id="memory-tier"><option value="l0">Summary</option><option value="l1" selected>Key detail</option><option value="l2">Supporting detail</option></select></div></div><div class="field"><label for="memory-tags">Labels</label><input id="memory-tags" placeholder="typescript, workflow"></div></details><div class="row"><button value="default" type="submit">Save memory</button></div></form></dialog>
+          <dialog id="memory-correction-dialog" class="editor-dialog"><form method="dialog" id="memory-correction-form"><div class="panel-head"><div><h2>Edit saved memory</h2><span class="muted">Ódinn keeps the previous version in its private history.</span></div><button class="secondary" id="memory-correction-dialog-close" type="button">Close</button></div><div class="field"><label for="memory-correction-text">What should Ódinn remember instead?</label><textarea id="memory-correction-text" required></textarea></div><div class="field"><label for="memory-correction-reason">Why did this change? <span class="muted">(optional)</span></label><input id="memory-correction-reason" placeholder="The earlier detail is out of date"></div><div class="row"><button value="default" type="submit">Save change</button></div></form></dialog>
         </div>
       </section>
 
       <section id="view-sessions" class="view">
         <div class="page oc-page">
-          <div class="page-head"><div><div class="section-kicker">Conversation archive</div><h1>Sessions</h1><p>Active sessions and defaults.</p></div><div class="row"><button id="create-session" type="button">New Session</button><button class="secondary" id="refresh-sessions" type="button">Refresh</button></div></div>
-          <div class="panel table-panel"><div class="panel-head"><div><h2>Sessions <span class="count-badge" id="session-count-badge">0</span></h2><span class="muted" id="session-page-count">Loading</span></div></div><div class="session-filters"><input id="session-query" placeholder="Filter title, source, or ID"><select id="session-project-filter"><option value="all">All projects</option></select><select id="session-status-filter"><option value="all">All statuses</option><option value="open">Open</option><option value="closed">Closed</option></select><select id="session-group"><option value="none">No grouping</option><option value="project">Group by project</option><option value="source">Group by source</option><option value="status">Group by status</option></select></div><div class="data-table session-table"><div class="data-row data-head"><span>Session</span><span>Project</span><span>Kind</span><span>Status</span><span>Runtime</span><span>Updated</span><span>Messages</span><span>Actions</span></div><div id="session-list"></div></div></div>
+          <div class="page-head"><div><div class="section-kicker">Conversation archive</div><h1>Sessions</h1><p>Browse conversations, move them between projects, and see which model was used.</p></div><div class="row"><button id="create-session" type="button">New Session</button><button class="secondary" id="refresh-sessions" type="button">Refresh</button></div></div>
+          <div class="panel table-panel"><div class="panel-head"><div><h2>Sessions <span class="count-badge" id="session-count-badge">0</span></h2><span class="muted" id="session-page-count">Loading</span></div></div><div class="session-filters"><input id="session-query" aria-label="Filter sessions" placeholder="Filter by title or source"><select id="session-project-filter" aria-label="Filter sessions by project"><option value="all">All projects</option></select><select id="session-status-filter" aria-label="Filter sessions by status"><option value="all">All statuses</option><option value="open">Open</option><option value="closed">Closed</option></select><select id="session-group" aria-label="Group sessions"><option value="none">No grouping</option><option value="project">Group by project</option><option value="source">Group by source</option><option value="status">Group by status</option></select></div><div class="data-table session-table"><div class="data-row data-head"><span>Session</span><span>Project</span><span>Source</span><span>Status</span><span>Updated</span><span>Messages</span><span>Actions</span></div><div id="session-list"></div></div></div>
           <div class="panel stack session-detail"><div class="panel-head"><h2>Selected transcript</h2><span class="chip" id="selected-session-route">No session selected</span></div><div id="session-transcript" class="timeline"><div class="empty-state"><strong>Select a session</strong><span>Its messages and model route will appear here.</span></div></div></div>
         </div>
       </section>
 
       <section id="view-goals" class="view">
         <div class="page oc-page">
-          <div class="page-head"><div><div class="section-kicker">Scoped objectives</div><h1>Goals</h1><p>Every goal belongs to a project or one specific session. No more orphan objectives floating in static.</p></div><button class="secondary" id="refresh-goals" type="button">Refresh</button></div>
-          <div class="stat-strip"><div class="stat-card"><strong id="goal-active-count">0</strong><span>active</span></div><div class="stat-card"><strong id="goal-blocked-count">0</strong><span>blocked</span></div><div class="stat-card"><strong id="goal-completed-count">0</strong><span>completed</span></div><div class="stat-card"><strong>∞</strong><span>no hard expiry</span></div></div>
-          <div class="split">
-            <div class="panel stack"><div class="panel-head"><h2>New goal</h2><button id="create-goal" type="button">Create</button></div>
-            <div class="field"><label for="goal-title">Objective</label><input id="goal-title" placeholder="Ship the onboarding release"></div>
-            <div class="grid-2"><div class="field"><label for="goal-scope-type">Belongs to</label><select id="goal-scope-type"><option value="project">Project</option><option value="session">Session</option></select></div><div class="field"><label for="goal-scope-id">Target</label><select id="goal-scope-id"></select></div></div>
-            <div class="field"><label for="goal-description">Success looks like</label><textarea id="goal-description" placeholder="Define the concrete outcome."></textarea></div>
-            <div class="field"><label for="goal-note">Progress update</label><input id="goal-note" placeholder="What changed?"></div>
-            <div class="row">
-              <select id="goal-status" aria-label="Goal status">
-                <option>active</option>
-                <option>completed</option>
-                <option>blocked</option>
-                <option>paused</option>
-                <option>cancelled</option>
-              </select>
-              <button class="secondary" id="update-goal" type="button">Update Selected</button>
-            </div>
-          </div>
-            <div class="panel stack"><div class="panel-head"><h2>Goal board</h2><select id="goal-project-filter" aria-label="Filter goals by project"><option value="all">All projects</option></select></div><div id="goal-list" class="list"></div></div>
+          <div class="page-head"><div><div class="section-kicker">Outcomes you care about</div><h1>Goals</h1><p>Keep important outcomes visible, update progress quickly, and pause work without losing context.</p></div><div class="row"><button id="new-goal" type="button">New goal</button><button class="secondary" id="refresh-goals" type="button">Refresh</button></div></div>
+          <div class="stat-strip"><div class="stat-card"><strong id="goal-active-count">0</strong><span>active</span></div><div class="stat-card"><strong id="goal-paused-count">0</strong><span>paused</span></div><div class="stat-card"><strong id="goal-blocked-count">0</strong><span>blocked</span></div><div class="stat-card"><strong id="goal-completed-count">0</strong><span>completed</span></div></div>
+          <div class="panel goal-filter-bar"><input id="goal-query" aria-label="Search goals" placeholder="Search goals"><select id="goal-status-filter" aria-label="Filter goals by status"><option value="all">All statuses</option><option value="active">Active</option><option value="paused">Paused</option><option value="blocked">Blocked</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option></select><select id="goal-project-filter" aria-label="Filter goals by project"><option value="all">All projects</option></select></div>
+          <div id="goal-list" class="goal-board"></div>
+          <dialog id="goal-dialog" class="editor-dialog">
+            <form method="dialog" id="goal-form">
+              <div class="panel-head"><div><h2 id="goal-editor-title">Create goal</h2><span class="muted">Write a clear outcome and where it belongs.</span></div><button class="secondary" id="goal-cancel-edit" value="cancel" type="submit">Close</button></div>
+              <div class="field"><label for="goal-title">Objective</label><input id="goal-title" placeholder="Finish the onboarding flow" required></div>
+              <div class="grid-2"><div class="field"><label for="goal-scope-type">Belongs to</label><select id="goal-scope-type"><option value="project">Project</option><option value="session">Session</option></select></div><div class="field"><label for="goal-scope-id">Target</label><select id="goal-scope-id"></select></div></div>
+              <div class="field"><label for="goal-description">Success looks like</label><textarea id="goal-description" placeholder="Define the concrete outcome."></textarea></div>
+              <div id="goal-status-field" class="grid-2" hidden><div class="field"><label for="goal-status">Status</label><select id="goal-status"><option>active</option><option>completed</option><option>blocked</option><option>paused</option><option>cancelled</option></select></div><div class="field" id="goal-note-field"><label for="goal-note">Progress update</label><input id="goal-note" placeholder="What changed?"></div></div>
+              <div class="row"><button id="create-goal" value="default" type="submit">Create goal</button><button class="secondary" id="update-goal" value="default" type="submit" hidden>Save changes</button></div>
+            </form>
+          </dialog>
+        </div>
+      </section>
+
+      <section id="view-automatic-improvements" class="view">
+        <div class="page oc-page">
+          <div class="page-head"><div><div class="section-kicker">Automatic care</div><h1>Automatic improvements</h1><p>Ódinn watches for recurring reliability problems, asks the connected model for a plain-language assessment, and applies only a small set of reversible reliability adjustments.</p></div><div class="row"><span class="chip warn" id="improvement-mode-chip">Starting</span><button class="secondary" id="refresh-improvements" type="button">Refresh</button><button id="learn-improvements" type="button">Check now</button></div></div>
+          <div class="summary-bar"><span><small>AUTOMATION</small><strong id="improvement-controller-state">ON</strong></span><span><small>MODEL</small><strong id="improvement-mode">CONNECTING</strong></span><span><small>OBSERVATIONS</small><strong id="improvement-count">0</strong></span><span><small>APPLIED</small><strong id="improvement-review-count">0</strong></span></div>
+          <div class="panel detail-grid" id="self-improvement-config"><div class="detail-card"><span>Learning schedule</span><strong>Checking…</strong></div><div class="detail-card"><span>Model</span><strong id="self-improvement-model">Checking…</strong></div><div class="detail-card"><span>Changes per check</span><strong id="self-improvement-limit">1 maximum</strong></div><div class="detail-card"><span>Recovery</span><strong>Keeps a restore point</strong></div></div>
+          <div class="agent-layout">
+            <div class="panel stack"><div class="panel-head"><div><h2>What Ódinn has noticed</h2><span class="muted">Runs quietly in the background.</span></div></div><div id="improvement-list" class="list"><div class="empty-state"><strong>Nothing needs attention</strong><span>Ódinn will keep watching in the background.</span></div></div></div>
+            <div class="panel stack"><div class="panel-head"><h2>Improvement detail</h2><span class="chip" id="improvement-detail-status">No selection</span></div><div id="improvement-detail" class="empty-state"><strong>Select an observation</strong><span>The reason, result, and recovery option will appear here.</span></div><div class="row"><button class="danger" id="improvement-rollback" type="button" disabled>Undo applied change</button></div></div>
           </div>
         </div>
       </section>
 
-      <section id="view-experiments" class="view">
-        <div class="page oc-page">
-          <div class="page-head"><div><div class="section-kicker">Operator-controlled preview systems</div><h1>Experimental Lab</h1><p>Inspect feature gates and exercise the real Proof, Sentinel, Rewind, Capsule, Capability, Counterfactual, and Darwin APIs.</p></div><div class="row"><span class="chip warn">experimental · off by default</span><button class="secondary" id="refresh-experiments" type="button">Refresh</button></div></div>
-          <div class="panel experimental-warning">
-            <div><h2>Sharp machinery. Deliberate switches.</h2><p>These systems can verify runs, issue scoped credentials, restore files, replay capsules, or replace a workspace. Flags are read from <code id="experimental-config-path">.odinn/config.json</code> at startup; this console never enables them silently.</p></div>
-            <span class="pill warn" id="experimental-overall-state">DISABLED</span>
-          </div>
-          <section class="panel beta-boundary" id="beta-boundary" aria-labelledby="beta-boundary-title">
-            <div class="panel-head"><div><div class="section-kicker">Beta 3 boundary</div><h2 id="beta-boundary-title">Know what this runtime guarantees</h2><span class="muted">The matrix distinguishes shipped local behavior from experiments, dependencies, and hard limits.</span></div><span class="chip">stabilization</span></div>
-            <div class="beta-boundary-grid">
-              <article class="beta-boundary-card verified" data-boundary-class="verified-local"><strong>Verified local behavior</strong><p>Supported local operator paths, audited execution, and release/install workflows covered by the current gates.</p></article>
-              <article class="beta-boundary-card experimental" data-boundary-class="experimental-disabled"><strong>Experimental and disabled by default</strong><p>Proof, Sentinel, Capability Tokens, Rewind, Capsules, Counterfactuals, Darwin, and self-improvement.</p></article>
-              <article class="beta-boundary-card dependent" data-boundary-class="provider-platform"><strong>Provider- or platform-dependent</strong><p>Live provider services, browser sites, external authentication, and operating-system behavior outside local gates.</p></article>
-              <article class="beta-boundary-card unsupported" data-boundary-class="explicitly-unsupported"><strong>Explicitly unsupported</strong><p>Hostile-code containment, public exposure of the single-user gateway, and deterministic rollback of arbitrary remote effects.</p></article>
-            </div>
-            <ul class="beta-boundary-limits">
-              <li>Forked workers are crash containment, not a security sandbox.</li>
-              <li>Remote hosting is application-level tenant isolation, not hostile-user OS isolation.</li>
-              <li>External effects and nondeterministic provider behavior are outside full replay/rollback guarantees.</li>
-            </ul>
-          </section>
-          <div class="stat-strip"><div class="stat-card"><strong id="experimental-enabled-count">0</strong><span>features enabled</span></div><div class="stat-card"><strong id="experimental-disabled-count">7</strong><span>features locked</span></div><div class="stat-card"><strong id="experimental-run-count">0</strong><span>ledger runs</span></div><div class="stat-card"><strong>RESTART</strong><span>required after flag changes</span></div></div>
-          <div id="experimental-feature-grid" class="experimental-grid"><div class="empty-state"><strong>Reading feature gates</strong><span>Waiting for gateway status.</span></div></div>
-          <div class="panel stack">
-            <div class="page-head"><div><div class="section-kicker">Separate review-gated control plane</div><h2>Self-improvement</h2><p>Mine repeated failures into proposals, require an operator decision by default, and roll back the narrow runtime tuning allowed in auto mode.</p></div><div class="row"><span class="chip warn" id="improvement-mode-chip">review-gated</span><button class="secondary" id="refresh-improvements" type="button">Refresh proposals</button><button id="learn-improvements" type="button">Learn from audit</button><button id="new-improvement" type="button">New proposal</button></div></div>
-            <div class="summary-bar"><span><small>CONTROLLER</small><strong id="improvement-controller-state">OFF</strong></span><span><small>MODE</small><strong id="improvement-mode">PROPOSE</strong></span><span><small>PROPOSALS</small><strong id="improvement-count">0</strong></span><span><small>NEEDS REVIEW</small><strong id="improvement-review-count">0</strong></span></div>
-            <div class="agent-layout">
-              <div class="stack"><pre id="self-improvement-config" class="output experimental-config">&quot;selfImprovement&quot;: { &quot;enabled&quot;: false, &quot;mode&quot;: &quot;propose&quot; }</pre><div id="improvement-list" class="list"><div class="empty-state"><strong>No proposals loaded</strong><span>Refresh or mine the audit ledger for repeated failures.</span></div></div></div>
-              <div class="panel stack"><div class="panel-head"><h3>Proposal review</h3><span class="chip" id="improvement-detail-status">No selection</span></div><div id="improvement-detail" class="empty-state"><strong>Select a proposal</strong><span>Evidence, target, decisions, and rollback state will appear here.</span></div><div class="row"><button id="improvement-approve" type="button" disabled>Approve</button><button class="secondary" id="improvement-reject" type="button" disabled>Reject</button><button class="danger" id="improvement-rollback" type="button" disabled>Rollback applied change</button></div></div>
-            </div>
-            <dialog id="improvement-dialog" class="editor-dialog"><form method="dialog" id="improvement-form"><div class="panel-head"><div><h2>Propose an improvement</h2><span class="muted">Recording a proposal never applies it.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div class="field"><label for="improvement-title">Title</label><input id="improvement-title" required></div><div class="field"><label for="improvement-rationale">Rationale</label><textarea id="improvement-rationale" required></textarea></div><div class="grid-2"><div class="field"><label for="improvement-target">Target</label><input id="improvement-target" value="runtime"></div><div class="field"><label for="improvement-priority">Priority</label><select id="improvement-priority"><option>normal</option><option>high</option><option>low</option></select></div></div><div class="row"><button value="default" type="submit">Record proposal</button></div></form></dialog>
-          </div>
-          <div class="experimental-workbench">
-            <div class="stack">
-              <div class="panel stack">
-                <div class="panel-head"><div><h2>Enable intentionally</h2><span class="muted">Copy into the existing config, choose only what you intend, then restart.</span></div><button class="secondary" id="copy-experimental-config" type="button">Copy JSON</button></div>
-                <pre id="experimental-config" class="output experimental-config">&quot;experimental&quot;: {
-  &quot;proof&quot;: false,
-  &quot;rewind&quot;: false,
-  &quot;sentinel&quot;: false,
-  &quot;capsules&quot;: false,
-  &quot;darwin&quot;: false,
-  &quot;capabilities&quot;: false,
-  &quot;counterfactual&quot;: false
-}</pre>
-              </div>
-              <div class="panel stack">
-                <div class="panel-head"><div><h2>Recent experimental runs</h2><span class="muted">Backed by the persisted runtime ledger.</span></div></div>
-                <div id="experimental-recent-runs" class="list"><div class="empty-state"><strong>No runtime records loaded</strong><span>Refresh the lab to inspect the ledger.</span></div></div>
-              </div>
-            </div>
-            <div class="panel experimental-controls">
-              <div class="panel-head"><div><h2>Operator workbench</h2><span class="muted" id="experimental-action-description">Choose a feature and action.</span></div><span class="chip" id="experimental-action-risk">read/write API</span></div>
-              <div class="grid-2"><div class="field"><label for="experimental-feature-select">Feature</label><select id="experimental-feature-select"></select></div><div class="field"><label for="experimental-action-select">Action</label><select id="experimental-action-select"></select></div></div>
-              <div class="field" id="experimental-target-field" hidden><label for="experimental-target" id="experimental-target-label">Target</label><input id="experimental-target" autocomplete="off"></div>
-              <div class="field"><label for="experimental-payload">Request JSON</label><textarea id="experimental-payload" spellcheck="false">{}</textarea></div>
-              <div class="row"><button id="experimental-run" type="button" disabled>Feature disabled</button><span class="muted" id="experimental-endpoint">Select an action</span></div>
-              <div class="field"><label for="experimental-result">Result</label><pre id="experimental-result" class="output experimental-result" aria-live="polite">No experimental action has run.</pre></div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section id="view-audit" class="view">
-        <div class="page oc-page">
-          <div class="page-head"><div><div class="section-kicker">Signed evidence trail</div><h1>Audit</h1><p>Filter the ledger, inspect exact events, and verify that its integrity chain is intact.</p></div><div class="row"><button class="secondary" id="audit-verify" type="button">Verify Chain</button><button class="secondary" id="refresh-audit" type="button">Refresh</button><button class="secondary" id="copy-audit" type="button">Copy Page</button><button class="secondary" id="export-audit" type="button">Export JSON</button></div></div>
-          <div class="stat-strip"><div class="stat-card"><strong id="audit-count">0</strong><span>total events</span></div><div class="stat-card"><strong id="audit-run-count">0</strong><span>distinct runs</span></div><div class="stat-card"><strong id="audit-model-count">0</strong><span>model runs</span></div><div class="stat-card"><strong id="audit-error-count">0</strong><span>failed or denied</span></div></div>
-          <div class="panel audit-filter-panel"><div class="filter-grid"><input id="audit-query" placeholder="Search event content"><select id="audit-type-filter"><option value="">All event types</option></select><select id="audit-tool-filter"><option value="">All tools</option></select><select id="audit-actor-filter"><option value="">All actors</option></select><select id="audit-outcome-filter"><option value="">All outcomes</option></select></div><div class="toolbar"><div class="row"><input id="audit-from" type="date" aria-label="From date"><input id="audit-to" type="date" aria-label="To date"><button class="secondary" id="audit-reset" type="button">Reset filters</button></div><span class="chip" id="audit-integrity">Not verified</span></div></div>
-          <div class="panel stack"><div class="panel-head"><h2>Events</h2><span class="muted" id="audit-showing">0 events</span></div><div id="audit-events" class="list"></div><div class="pagination"><span class="muted" id="audit-page-label">Page 1 of 1</span><div class="row"><label class="switch-label">Rows <select id="audit-page-size"><option>10</option><option selected>25</option><option>50</option><option>100</option></select></label><button class="secondary" id="audit-prev" type="button">Previous</button><button class="secondary" id="audit-next" type="button">Next</button></div></div><pre id="audit-log" class="output" hidden>No audit loaded.</pre></div>
-        </div>
-      </section>
+      ${experimentalConsolePages()}
 
       <section id="view-usage" class="view">
-        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Runtime consumption</div><h1>Usage</h1><p>One accounting path for model tokens, distinct runs, and failures—the same signed ledger used by Audit.</p></div><span class="pill" id="status-pill">Unknown</span></div><div class="stat-strip"><div class="stat-card"><strong id="usage-total-tokens">0</strong><span>recorded tokens</span></div><div class="stat-card"><strong id="usage-model-calls">0</strong><span>completed model runs</span></div><div class="stat-card"><strong id="metric-runs">0</strong><span>distinct runs</span></div><div class="stat-card"><strong id="usage-errors">0</strong><span>failed or denied</span></div></div><div class="usage-grid"><div class="panel stack"><div class="panel-head"><h2>Ledger events by day</h2><span class="muted">last 14 days</span></div><div id="usage-chart" class="bar-chart"></div></div><div class="panel stack"><div class="panel-head"><h2>Provider routes</h2><span class="muted">credentials never shown</span></div><div id="provider-list" class="list"></div></div></div><div class="panel table-panel"><div class="panel-head"><h2>Recent metered runs</h2><button class="secondary" data-view-jump="audit" type="button">Open Audit</button></div><div id="runs" class="list"></div></div><div hidden><span id="metric-tools"></span><span id="metric-completed"></span><span id="metric-policy"></span><span id="runtime-chips"></span><span id="status-workspace"></span><span id="status-state"></span><span id="tool-count"></span><select id="tool"></select><div id="tool-list"></div><div id="run-history"></div><span id="plan-run-count"></span><span id="plan-last-status"></span><div id="plan-runs"></div></div><div class="panel" hidden><button id="clear-output" type="button">Clear</button><pre id="output">Ready.</pre></div></div>
+        <div class="page oc-page activity-page">
+          <div class="page-head"><div><div class="section-kicker">A clear view of what Ódinn has been doing</div><h1>Activity</h1><p>See model use, recent work, and a searchable history in one place. Token totals are recorded activity, not a provider bill.</p></div><span class="pill" id="status-pill">Unknown</span></div>
+          <div class="activity-tabs" role="tablist" aria-label="Activity views"><button id="activity-tab-overview" class="active" role="tab" aria-selected="true" aria-controls="activity-overview" type="button">Overview</button><button id="activity-tab-history" role="tab" aria-selected="false" aria-controls="activity-history" type="button">History</button></div>
+          <div id="activity-overview" class="activity-panel active" role="tabpanel" aria-labelledby="activity-tab-overview">
+            <div class="stat-strip"><div class="stat-card"><strong id="usage-total-tokens">0</strong><span>tokens recorded</span></div><div class="stat-card"><strong id="usage-model-calls">0</strong><span>model conversations</span></div><div class="stat-card"><strong id="metric-runs">0</strong><span>pieces of work</span></div><div class="stat-card"><strong id="usage-errors">0</strong><span>need attention</span></div></div>
+            <div class="usage-grid"><div class="panel stack"><div class="panel-head"><h2>Activity by day</h2><span class="muted">last 14 days</span></div><div id="usage-chart" class="bar-chart"></div></div><div class="panel stack"><div class="panel-head"><h2>Model connections</h2><span class="muted">Account details stay hidden</span></div><div id="provider-list" class="list"></div></div></div>
+            <div class="panel table-panel"><div class="panel-head"><div><h2>Recent model activity</h2><span class="muted">Latest four conversations</span></div></div><div id="runs" class="list"></div></div>
+          </div>
+          <div id="activity-history" class="activity-panel" role="tabpanel" aria-labelledby="activity-tab-history" hidden>
+            <div class="page-head compact-head"><div><h2>Searchable history</h2><p>Find completed work, automatic actions, and problems that may need attention.</p></div><div class="row"><button class="secondary" id="audit-verify" type="button">Check history integrity</button><button class="secondary" id="refresh-audit" type="button">Refresh</button><button class="secondary" id="copy-audit" type="button">Copy summary</button><button class="secondary" id="export-audit" type="button">Download records</button></div></div>
+            <div class="stat-strip"><div class="stat-card"><strong id="audit-count">0</strong><span>activity updates</span></div><div class="stat-card"><strong id="audit-run-count">0</strong><span>pieces of work</span></div><div class="stat-card"><strong id="audit-model-count">0</strong><span>model conversations</span></div><div class="stat-card"><strong id="audit-error-count">0</strong><span>need attention</span></div></div>
+            <div class="panel audit-filter-panel"><div class="filter-grid"><input id="audit-query" aria-label="Search activity" placeholder="Search activity"><select id="audit-type-filter" aria-label="Filter by activity type"><option value="">All activity types</option></select><select id="audit-tool-filter" aria-label="Filter by area"><option value="">All areas</option></select><select id="audit-actor-filter" aria-label="Filter by who started it"><option value="">Started by anyone</option></select><select id="audit-outcome-filter" aria-label="Filter by result"><option value="">All results</option></select></div><div class="toolbar"><div class="row"><input id="audit-from" type="date" aria-label="From date"><input id="audit-to" type="date" aria-label="To date"><button class="secondary" id="audit-reset" type="button">Reset filters</button></div><span class="chip" id="audit-integrity">Not checked</span></div></div>
+            <div class="panel stack"><div class="panel-head"><h2>History</h2><span class="muted" id="audit-showing">0 updates</span></div><div id="audit-events" class="list"></div><div class="pagination"><span class="muted" id="audit-page-label">Page 1 of 1</span><div class="row"><label class="switch-label">Items <select id="audit-page-size"><option>10</option><option selected>25</option><option>50</option><option>100</option></select></label><button class="secondary" id="audit-prev" type="button">Previous</button><button class="secondary" id="audit-next" type="button">Next</button></div></div><pre id="audit-log" class="output" hidden>No history loaded.</pre></div>
+          </div>
+          <div hidden><span id="metric-tools"></span><span id="metric-completed"></span><span id="metric-policy"></span><span id="runtime-chips"></span><span id="status-workspace"></span><span id="status-state"></span><span id="tool-count"></span><select id="tool"></select><div id="tool-list"></div><div id="run-history"></div><span id="plan-run-count"></span><span id="plan-last-status"></span><div id="plan-runs"></div></div><div class="panel" hidden><button id="clear-output" type="button">Clear</button><pre id="output">Ready.</pre></div>
+        </div>
       </section>
 
       <section id="view-agents" class="view">
-        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Agent SDK v0.3</div><h1>Agents</h1><p>Create, validate, inspect, and explicitly enable permissioned agent packages.</p></div><div class="row"><button id="new-agent" type="button">Create Manifest</button><button class="secondary" id="refresh-agents" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="agent-total">0</strong><span>packages</span></div><div class="stat-card"><strong id="agent-enabled">0</strong><span>enabled</span></div><div class="stat-card"><strong id="agent-quarantined">0</strong><span>quarantined</span></div><div class="stat-card"><strong>v0.3</strong><span>SDK contract</span></div></div><div class="agent-layout"><div class="panel stack"><div class="panel-head"><h2>Package registry</h2><input id="agent-query" placeholder="Filter agents"></div><div id="agent-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Package inspector</h2><span class="chip" id="agent-detail-status">No selection</span></div><div id="agent-detail" class="empty-state"><strong>Select an agent package</strong><span>Identity, permissions, integrity, and tests will appear here.</span></div><div class="row"><button id="agent-enable" type="button" disabled>Enable</button><button class="secondary" id="agent-disable" type="button" disabled>Disable</button><button class="danger-button" id="agent-quarantine" type="button" disabled>Quarantine</button></div></div></div>
-          <dialog id="agent-dialog" class="editor-dialog"><form method="dialog" id="agent-form"><div class="panel-head"><div><h2>Create Agent SDK manifest</h2><span class="muted">New packages install disabled until explicitly enabled.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div id="manifest-fields" class="manifest-fields"><div class="grid-2"><div class="field"><label for="agent-id">Package ID</label><input id="agent-id" pattern="[a-z0-9][a-z0-9._\\-]{1,63}" value="example-agent" required></div><div class="field"><label for="agent-version">Version</label><input id="agent-version" value="1.0.0" required></div></div><div class="field"><label for="agent-name">Display name</label><input id="agent-name" value="Example Agent" required></div><div class="field"><label for="agent-identity">Identity name</label><input id="agent-identity" value="Example"></div><div class="field"><label for="agent-instructions">Instruction files <span class="muted">comma-separated</span></label><input id="agent-instructions" value="AGENTS.md"></div><div class="field"><label for="agent-tools">Tools <span class="muted">comma-separated</span></label><input id="agent-tools" value="workspace.readText"></div><div class="grid-2"><div class="field"><label for="agent-plugins">Plugins</label><input id="agent-plugins"></div><div class="field"><label for="agent-secrets">Secret names</label><input id="agent-secrets"></div></div><div class="grid-2"><div class="field"><label for="agent-sandbox">Sandbox mode</label><select id="agent-sandbox"><option value="workspace-write">workspace-write</option><option value="workspace-read">workspace-read</option><option value="container">container</option></select></div><div class="field"><label for="agent-network">Network allowlist</label><input id="agent-network" placeholder="api.example.com"></div></div></div><div class="manifest-advanced"><label class="switch-label"><input type="checkbox" id="agent-advanced-toggle"> Edit full manifest JSON</label><div id="agent-manifest-error" class="inline-error" role="alert"></div><textarea id="agent-manifest" class="manifest-editor" hidden></textarea></div><div class="row"><button id="validate-agent" value="default" type="submit">Validate &amp; Install</button></div></form></dialog>
+        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Build reusable agents</div><h1>Agent SDK</h1><p>Create and manage specialized agents for recurring kinds of work. Making one available does not start work by itself.</p></div><div class="row"><button id="new-agent" type="button">Add agent</button><button class="secondary" id="refresh-agents" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="agent-total">0</strong><span>agent packages</span></div><div class="stat-card"><strong id="agent-enabled">0</strong><span>available</span></div><div class="stat-card"><strong id="agent-quarantined">0</strong><span>set aside</span></div><div class="stat-card"><strong>Local</strong><span>stored in this workspace</span></div></div><div class="agent-layout"><div class="panel stack"><div class="panel-head"><h2>Your agents</h2><input id="agent-query" aria-label="Filter agents" placeholder="Filter agents"></div><div id="agent-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Agent details</h2><span class="chip" id="agent-detail-status">No selection</span></div><div id="agent-detail" class="empty-state"><strong>Select an agent</strong><span>Its purpose, access, and setup will appear here.</span></div><div class="row"><button id="agent-enable" type="button" disabled>Make available</button><button class="secondary" id="agent-disable" type="button" disabled>Turn off</button><button class="danger-button" id="agent-quarantine" type="button" disabled>Set aside</button></div></div></div>
+          <dialog id="agent-dialog" class="editor-dialog">
+            <form method="dialog" id="agent-form">
+              <div class="panel-head"><div><h2>Add an Agent SDK package</h2><span class="muted">It will stay off until you choose to make it available.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div>
+              <div id="manifest-fields" class="manifest-fields">
+                <div class="field"><label for="agent-name">Agent name</label><input id="agent-name" value="Example Agent" required></div>
+                <div class="field"><label for="agent-identity">Short name</label><input id="agent-identity" value="Example"></div>
+                <details class="advanced-options">
+                  <summary>Advanced setup</summary>
+                  <div class="grid-2"><div class="field"><label for="agent-id">Internal name</label><input id="agent-id" pattern="[a-z0-9][a-z0-9._\\-]{1,63}" value="example-agent" required></div><div class="field"><label for="agent-version">Version</label><input id="agent-version" value="1.0.0" required></div></div>
+                  <div class="field"><label for="agent-instructions">Instruction files <span class="muted">separate with commas</span></label><input id="agent-instructions" value="AGENTS.md"></div>
+                  <div class="field"><label for="agent-tools">Things it may use <span class="muted">separate with commas</span></label><input id="agent-tools" value="workspace.readText"></div>
+                  <div class="grid-2"><div class="field"><label for="agent-plugins">Add-ons</label><input id="agent-plugins"></div><div class="field"><label for="agent-secrets">Saved accounts it may request</label><input id="agent-secrets"></div></div>
+                  <div class="grid-2"><div class="field"><label for="agent-sandbox">Workspace access</label><select id="agent-sandbox"><option value="workspace-write">Read and edit</option><option value="workspace-read">Read only</option><option value="container">Separate container</option></select></div><div class="field"><label for="agent-network">Websites it may contact</label><input id="agent-network" placeholder="api.example.com"></div></div>
+                </details>
+              </div>
+              <div class="manifest-advanced"><label class="switch-label"><input type="checkbox" id="agent-advanced-toggle"> Developer setup</label><div id="agent-manifest-error" class="inline-error" role="alert"></div><textarea id="agent-manifest" class="manifest-editor" hidden></textarea></div>
+              <div class="row"><button id="validate-agent" value="default" type="submit">Save agent</button></div>
+            </form>
+          </dialog>
         </div>
       </section>
 
       <section id="view-skills" class="view">
-        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Skill SDK v0.1</div><h1>Skills</h1><p>Package reusable instructions with declared requirements, integrity verification, and explicit lifecycle controls.</p></div><div class="row"><button id="new-skill" type="button">Create Skill</button><button class="secondary" id="refresh-skills" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="skill-total">0</strong><span>packages found</span></div><div class="stat-card"><strong id="skill-enabled">0</strong><span>enabled</span></div><div class="stat-card"><strong id="skill-unmanaged">0</strong><span>unmanaged</span></div><div class="stat-card"><strong id="skill-quarantined">0</strong><span>quarantined</span></div></div><div class="agent-layout"><div class="panel stack"><div class="toolbar"><input id="skill-query" placeholder="Filter skill packages"><select id="skill-status-filter"><option value="all">All statuses</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="unmanaged">Unmanaged</option><option value="quarantined">Quarantined</option></select></div><div id="skills-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Package inspector</h2><span class="chip" id="skill-detail-status">No selection</span></div><div id="skill-detail" class="empty-state"><strong>Select a skill</strong><span>Requirements, source, integrity, and lifecycle will appear here.</span></div><div class="row"><button id="skill-enable" type="button" disabled>Enable</button><button class="secondary" id="skill-disable" type="button" disabled>Disable</button><button class="secondary" id="skill-verify" type="button" disabled>Verify</button><button class="danger-button" id="skill-quarantine" type="button" disabled>Quarantine</button></div></div></div>
-          <dialog id="skill-dialog" class="editor-dialog"><form method="dialog" id="skill-form"><div class="panel-head"><div><h2>Create Skill SDK package</h2><span class="muted">Installed packages start disabled and untrusted.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div><div class="grid-2"><div class="field"><label for="skill-id">Package ID</label><input id="skill-id" pattern="[a-z0-9][a-z0-9\\-]{1,63}" placeholder="release-verifier" required></div><div class="field"><label for="skill-version">Version</label><input id="skill-version" value="1.0.0" required></div></div><div class="field"><label for="skill-name">Display name</label><input id="skill-name" placeholder="Release Verifier" required></div><div class="field"><label for="skill-description">When should it run?</label><textarea id="skill-description" placeholder="Use when a release needs a repeatable verification pass." required></textarea></div><div class="field"><label for="skill-instructions">Instructions</label><textarea id="skill-instructions" class="workshop-editor" placeholder="## Workflow&#10;&#10;1. Inspect the release..." required></textarea></div><div class="grid-2"><div class="field"><label for="skill-tools">Requested tools</label><input id="skill-tools" placeholder="workspace.readText"></div><div class="field"><label for="skill-capabilities">Requested capabilities</label><input id="skill-capabilities" placeholder="workspace.read"></div></div><div class="grid-2"><div class="field"><label for="skill-secrets">Requested secrets</label><input id="skill-secrets"></div><div class="field"><label for="skill-network">Network allowlist</label><input id="skill-network" placeholder="github.com"></div></div><div class="row"><button value="default" type="submit">Validate &amp; Install</button></div></form></dialog>
+        <div class="page oc-page"><div class="page-head"><div><div class="section-kicker">Build reusable workflows</div><h1>Skills SDK</h1><p>Build, review, and manage reusable instructions that teach Ódinn how to handle repeatable work.</p></div><div class="row"><button id="new-skill" type="button">Create skill</button><button class="secondary" id="refresh-skills" type="button">Refresh</button></div></div><div class="stat-strip"><div class="stat-card"><strong id="skill-total">0</strong><span>skill packages</span></div><div class="stat-card"><strong id="skill-enabled">0</strong><span>available</span></div><div class="stat-card"><strong id="skill-unmanaged">0</strong><span>found locally</span></div><div class="stat-card"><strong id="skill-quarantined">0</strong><span>set aside</span></div></div><div class="agent-layout"><div class="panel stack"><div class="toolbar"><input id="skill-query" aria-label="Filter skills" placeholder="Filter skills"><select id="skill-status-filter" aria-label="Filter skills by status"><option value="all">All statuses</option><option value="enabled">Available</option><option value="disabled">Off</option><option value="unmanaged">Found locally</option><option value="quarantined">Set aside</option></select></div><div id="skills-list" class="list"></div></div><div class="panel stack"><div class="panel-head"><h2>Skills SDK details</h2><span class="chip" id="skill-detail-status">No selection</span></div><div id="skill-detail" class="empty-state"><strong>Select a skill</strong><span>Its purpose and requested access will appear here.</span></div><div class="row"><button id="skill-enable" type="button" disabled>Make available</button><button class="secondary" id="skill-disable" type="button" disabled>Turn off</button><button class="secondary" id="skill-verify" type="button" disabled>Check package</button><button class="danger-button" id="skill-quarantine" type="button" disabled>Set aside</button></div></div></div>
+          <dialog id="skill-dialog" class="editor-dialog">
+            <form method="dialog" id="skill-form">
+              <div class="panel-head"><div><h2>Create a Skills SDK package</h2><span class="muted">It will stay off until you choose to make it available.</span></div><button class="secondary" value="cancel" type="submit">Close</button></div>
+              <div class="field"><label for="skill-name">Skill name</label><input id="skill-name" placeholder="Project check" required></div>
+              <div class="field"><label for="skill-description">When should Ódinn use it?</label><textarea id="skill-description" placeholder="Use when a project needs a repeatable check." required></textarea></div>
+              <div class="field"><label for="skill-instructions">What should Ódinn do?</label><textarea id="skill-instructions" class="workshop-editor" placeholder="## Steps&#10;&#10;1. Inspect the project..." required></textarea></div>
+              <details class="advanced-options">
+                <summary>Advanced setup</summary>
+                <div class="grid-2"><div class="field"><label for="skill-id">Internal name</label><input id="skill-id" pattern="[a-z0-9][a-z0-9\\-]{1,63}" placeholder="created from the skill name"></div><div class="field"><label for="skill-version">Version</label><input id="skill-version" value="1.0.0" required></div></div>
+                <div class="grid-2"><div class="field"><label for="skill-tools">Things it may use</label><input id="skill-tools" placeholder="workspace.readText"></div><div class="field"><label for="skill-capabilities">Extra permissions</label><input id="skill-capabilities" placeholder="workspace.read"></div></div>
+                <div class="grid-2"><div class="field"><label for="skill-secrets">Saved accounts it may request</label><input id="skill-secrets"></div><div class="field"><label for="skill-network">Websites it may contact</label><input id="skill-network" placeholder="github.com"></div></div>
+              </details>
+              <div class="row"><button value="default" type="submit">Save skill</button></div>
+            </form>
+          </dialog>
         </div>
       </section>
     </main>
   </div>
+  <div class="toast-region" id="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
   <script>
     const $ = (id) => document.getElementById(id);
     const state = {
@@ -3125,12 +3712,16 @@ function renderConsoleHtml() {
       selectedSessionId: "",
       activeChatId: "",
       messages: [],
+      sessions: [],
       modelOverride: "",
       audit: [],
       auditPage: 1,
       auditPagination: { page: 1, pages: 1 },
       browserTabId: "",
       selectedTaskId: "",
+      taskPage: 1,
+      taskPagination: { page: 1, pages: 1, total: 0, from: 0, to: 0 },
+      taskSelection: new Map(),
       selectedAgentId: "",
       agents: [],
       skills: [],
@@ -3138,104 +3729,115 @@ function renderConsoleHtml() {
       projects: [],
       selectedProjectId: "",
       memories: [],
+      memoryCandidates: [],
       selectedMemoryId: "",
+      memoryTab: "suggestions",
+      memoryTabInitialized: false,
       memoryHealth: null,
       agentManifestDraft: null,
       experimentalRuns: [],
-      improvements: []
+      experimentalActions: {},
+      improvements: [],
+      lastCapabilityToken: "",
+      hosted: false,
+      hostUser: "",
+      activityTab: "overview",
+      activeView: "overview"
     };
     const experimentalFeatures = {
       proof: {
-        title: "Proof",
-        summary: "Verify file, HTTP, Git, and explicitly allowlisted command assertions against a persisted run.",
+        title: "Run Checks",
+        technicalName: "Proof",
+        view: "lab-run-checks",
+        summary: "Confirm that a completed run produced the result you expected.",
         endpoint: "/proof",
         actions: [
-          { id: "verify", label: "Verify contract", method: "POST", path: "/proof", description: "Run a versioned verification contract against an existing ledger run.", sample: () => ({ schemaVersion: 1, id: "ui-proof-" + Date.now(), runId: defaultExperimentalRunId(), assertions: [{ id: "readme-exists", type: "file", path: "README.md", expect: { exists: true } }] }) },
-          { id: "inspect", label: "Inspect assertions", method: "GET", path: "/proof/{target}", target: "Run ID", description: "Read persisted assertion results for one run.", availableWhenDisabled: true, sample: () => ({}) }
+          { id: "verify", label: "Run a check", method: "POST", path: "/proof", description: "Check whether a recent piece of work produced the result you expected.", sample: () => ({ schemaVersion: 1, id: "ui-proof-" + Date.now(), runId: defaultExperimentalRunId(), assertions: [{ id: "readme-exists", type: "file", path: "README.md", expect: { exists: true } }] }) },
+          { id: "inspect", label: "View check results", method: "GET", path: "/proof/{target}", target: "Run ID", description: "Review the checks already recorded for a piece of work.", availableWhenDisabled: true, sample: () => ({}) }
         ]
       },
       sentinel: {
-        title: "Sentinel",
-        summary: "Evaluate runtime inputs against explicit invariants before privileged behavior crosses the boundary.",
+        title: "Safety Preview",
+        technicalName: "Sentinel",
+        view: "lab-safety-preview",
+        summary: "Preview whether a planned action fits your safety rules.",
         endpoint: "/policy/evaluate",
         actions: [
-          { id: "evaluate", label: "Evaluate policy", method: "POST", path: "/policy/evaluate", description: "Evaluate one tool input against a concrete policy without executing the tool.", sample: () => ({ runId: "ui-sentinel-" + Date.now(), toolName: "text.echo", input: { text: "safe input" }, policy: { version: 1, invariants: [{ id: "deny-example", type: "command.deny-pattern", values: ["never-match"], enforcement: "block" }] } }) }
+          { id: "evaluate", label: "Preview a decision", method: "POST", path: "/policy/evaluate", description: "See whether a planned action would be allowed without actually running it.", sample: () => ({ runId: "ui-sentinel-" + Date.now(), toolName: "text.echo", input: { text: "safe input" }, policy: { version: 1, invariants: [{ id: "deny-example", type: "command.deny-pattern", values: ["never-match"], enforcement: "block" }] } }) }
         ]
       },
       capabilities: {
-        title: "Capability Tokens",
-        summary: "Issue short-lived, signed, scoped credentials and audit their use or revocation.",
+        title: "Temporary Access",
+        technicalName: "Capability Tokens",
+        view: "lab-temporary-access",
+        summary: "Grant narrow, short-lived permission for one action.",
         endpoint: "/capabilities",
         actions: [
-          { id: "issue", label: "Issue token", method: "POST", path: "/capabilities/issue", description: "Issue a one-use token bound to a run, step, tool, and scope.", sample: () => ({ runId: "ui-capability-" + Date.now(), stepId: "operator-step", toolName: "text.echo", scopes: ["text:echo"], expiresInMs: 60000, maxUses: 1 }) },
-          { id: "consume", label: "Consume token", method: "POST", path: "/capabilities/use", description: "Validate and consume a token. Paste the token returned by Issue token.", sample: () => ({ token: "paste-issued-token", runId: "replace-with-token-run-id", toolName: "text.echo", resource: {} }) },
-          { id: "list", label: "List for run", method: "GET", path: "/capabilities/{target}", target: "Run ID", description: "List redacted capability records for one run.", availableWhenDisabled: true, sample: () => ({}) },
-          { id: "revoke", label: "Revoke token", method: "POST", path: "/capabilities/{target}/revoke", target: "Capability ID", description: "Permanently revoke an issued capability by ID.", dangerous: true, availableWhenDisabled: true, sample: () => ({}) }
+          { id: "issue", label: "Create an access pass", method: "POST", path: "/capabilities/issue", description: "Create short-lived permission for one specific action.", sample: () => ({ runId: "ui-capability-" + Date.now(), stepId: "operator-step", toolName: "text.echo", scopes: ["text:echo"], expiresInMs: 60000, maxUses: 1 }) },
+          { id: "consume", label: "Use an access pass", method: "POST", path: "/capabilities/use", description: "Use a pass once for the action it was created for.", sample: () => ({ token: "paste-issued-token", runId: "replace-with-token-run-id", toolName: "text.echo", resource: {} }) },
+          { id: "list", label: "View active passes", method: "GET", path: "/capabilities/{target}", target: "Run ID", description: "See the access passes associated with a piece of work.", availableWhenDisabled: true, sample: () => ({}) },
+          { id: "revoke", label: "Cancel an access pass", method: "POST", path: "/capabilities/{target}/revoke", target: "Capability ID", description: "Make an access pass unusable immediately.", dangerous: true, availableWhenDisabled: true, sample: () => ({}) }
         ]
       },
       rewind: {
-        title: "Rewind",
-        summary: "Snapshot selected workspace paths, preview a restore plan, and apply it only on explicit command.",
+        title: "Restore Points",
+        technicalName: "Rewind",
+        view: "lab-restore-points",
+        summary: "Save selected files and preview a restore before changing anything.",
         endpoint: "/checkpoints · /rewind",
         actions: [
-          { id: "checkpoint", label: "Create checkpoint", method: "POST", path: "/checkpoints", description: "Capture selected workspace paths into the content-addressed artifact store.", sample: () => ({ runId: "ui-rewind-" + Date.now(), stepId: "operator-checkpoint", paths: ["README.md"], label: "operator checkpoint" }) },
-          { id: "preview", label: "Preview restore", method: "POST", path: "/rewind/{target}", target: "Snapshot ID", description: "Build the restore plan without touching workspace files.", sample: () => ({ apply: false }) },
-          { id: "apply", label: "Apply restore", method: "POST", path: "/rewind/{target}", target: "Snapshot ID", description: "Restore the snapshot to its recorded workspace. This changes files.", dangerous: true, sample: () => ({ apply: true }) }
+          { id: "checkpoint", label: "Create a restore point", method: "POST", path: "/checkpoints", description: "Save the selected workspace files so you can return to them later.", sample: () => ({ runId: "ui-rewind-" + Date.now(), stepId: "operator-checkpoint", paths: ["README.md"], label: "operator checkpoint" }) },
+          { id: "preview", label: "Preview a restore", method: "POST", path: "/rewind/{target}", target: "Snapshot ID", description: "See which files would change without changing them.", sample: () => ({ apply: false }) },
+          { id: "apply", label: "Restore files", method: "POST", path: "/rewind/{target}", target: "Snapshot ID", description: "Return the saved files to their earlier state.", dangerous: true, sample: () => ({ apply: true }) }
         ]
       },
       capsules: {
-        title: "Capsules",
-        summary: "Export a portable run record, verify its checksums, and replay recorded boundaries without live tools.",
+        title: "Portable Runs",
+        technicalName: "Capsules",
+        view: "lab-portable-runs",
+        summary: "Package a completed run so it can be checked or replayed later.",
         endpoint: "/capsules",
         actions: [
-          { id: "export", label: "Export run", method: "POST", path: "/capsules/export", description: "Export one persisted ledger run into the gateway capsule store.", sample: () => ({ runId: defaultExperimentalRunId() }) },
-          { id: "verify", label: "Verify capsule", method: "POST", path: "/capsules/verify", description: "Verify a capsule path returned by Export run.", sample: () => ({ path: "paste-exported-capsule-path" }) },
-          { id: "replay", label: "Replay capsule", method: "POST", path: "/capsules/replay", description: "Replay recorded boundaries in tool-mocked mode; external tools do not execute.", sample: () => ({ path: "paste-exported-capsule-path", mode: "tool-mocked" }) }
+          { id: "export", label: "Create a portable copy", method: "POST", path: "/capsules/export", description: "Package a completed piece of work for later use.", sample: () => ({ runId: defaultExperimentalRunId() }) },
+          { id: "verify", label: "Check a portable copy", method: "POST", path: "/capsules/verify", description: "Confirm that a saved copy is complete and unchanged.", sample: () => ({ path: "paste-exported-capsule-path" }) },
+          { id: "replay", label: "Replay safely", method: "POST", path: "/capsules/replay", description: "Replay the saved steps without running external actions.", sample: () => ({ path: "paste-exported-capsule-path", mode: "tool-mocked" }) }
         ]
       },
       counterfactual: {
-        title: "Counterfactuals",
-        summary: "Fork up to four isolated candidate workspaces, execute plans, compare evidence, and select deliberately.",
+        title: "Compare Approaches",
+        technicalName: "Counterfactuals",
+        view: "lab-scenario-compare",
+        summary: "Try multiple approaches in separate workspace copies and compare the outcomes.",
         endpoint: "/counterfactual",
         actions: [
-          { id: "create", label: "Create candidates", method: "POST", path: "/counterfactual", description: "Create two isolated candidate workspaces from an existing source run.", sample: () => ({ sourceRunId: defaultExperimentalRunId(), sourceStepId: "operator-branch", plans: [{ id: "read", title: "Inspect README", summary: "Read the project README", tasks: [{ tool: "workspace.readText", input: { path: "README.md", maxBytes: 2048 }, readOnly: true }] }, { id: "echo", title: "Echo probe", summary: "Run a bounded echo probe", tasks: [{ tool: "text.echo", input: { text: "counterfactual probe" }, readOnly: true }] }] }) },
-          { id: "inspect", label: "Compare candidates", method: "GET", path: "/counterfactual/{target}", target: "Group ID", description: "Read candidate state, plans, and verification summaries.", sample: () => ({}) },
-          { id: "execute", label: "Execute candidates", method: "POST", path: "/counterfactual/{target}/execute", target: "Group ID", description: "Execute every candidate plan inside its isolated workspace.", dangerous: true, sample: () => ({}) },
-          { id: "select", label: "Preview selection", method: "POST", path: "/counterfactual/{target}/select", target: "Group ID", description: "Preview selecting a completed candidate without replacing the source workspace.", sample: () => ({ runId: "paste-candidate-run-id", apply: false }) },
-          { id: "apply", label: "Apply selection", method: "POST", path: "/counterfactual/{target}/select", target: "Group ID", description: "Replace the source workspace with a completed candidate. Review the dry-run first.", dangerous: true, sample: () => ({ runId: "paste-candidate-run-id", apply: true }) }
+          { id: "create", label: "Create alternatives", method: "POST", path: "/counterfactual", description: "Make separate workspace copies for two different approaches.", sample: () => ({ sourceRunId: defaultExperimentalRunId(), sourceStepId: "operator-branch", plans: [{ id: "read", title: "Inspect README", summary: "Read the project README", tasks: [{ tool: "workspace.readText", input: { path: "README.md", maxBytes: 2048 }, readOnly: true }] }, { id: "echo", title: "Echo probe", summary: "Run a bounded echo probe", tasks: [{ tool: "text.echo", input: { text: "counterfactual probe" }, readOnly: true }] }] }) },
+          { id: "inspect", label: "Compare results", method: "GET", path: "/counterfactual/{target}", target: "Group ID", description: "See the approaches and outcomes side by side.", sample: () => ({}) },
+          { id: "execute", label: "Try every approach", method: "POST", path: "/counterfactual/{target}/execute", target: "Group ID", description: "Run each approach in its own workspace copy.", dangerous: true, sample: () => ({}) },
+          { id: "select", label: "Preview your choice", method: "POST", path: "/counterfactual/{target}/select", target: "Group ID", description: "See what choosing one result would change.", sample: () => ({ runId: "paste-candidate-run-id", apply: false }) },
+          { id: "apply", label: "Keep this result", method: "POST", path: "/counterfactual/{target}/select", target: "Group ID", description: "Replace the original workspace with the result you chose.", dangerous: true, sample: () => ({ runId: "paste-candidate-run-id", apply: true }) }
         ]
       },
       darwin: {
-        title: "Darwin Router",
-        summary: "Observe verified outcomes and choose routes from persisted reliability, speed, cost, and tool-use evidence.",
+        title: "Smart Routing",
+        technicalName: "Darwin Router",
+        view: "lab-model-routing",
+        summary: "Learn which configured model works best for different kinds of work.",
         endpoint: "/routing",
         actions: [
-          { id: "observe", label: "Record outcome", method: "POST", path: "/routing/observe", description: "Record one model outcome for a task class.", sample: () => ({ runId: defaultExperimentalRunId(), providerId: "operator", modelId: "candidate", taskClass: "general", verified: true, durationMs: 1000, toolCalls: 1, toolErrors: 0 }) },
-          { id: "stats", label: "View statistics", method: "GET", path: "/routing/stats?taskClass={target}", target: "Task class", defaultTarget: "general", description: "Read accumulated route statistics for one task class.", sample: () => ({}) },
-          { id: "choose", label: "Choose route", method: "POST", path: "/routing/choose", description: "Ask the evidence-weighted router to choose a model for a task class.", sample: () => ({ taskClass: "general" }) }
+          { id: "observe", label: "Record an outcome", method: "POST", path: "/routing/observe", description: "Tell Ódinn how a model performed on one kind of work.", sample: () => ({ runId: defaultExperimentalRunId(), providerId: "operator", modelId: "candidate", taskClass: "general", verified: true, durationMs: 1000, toolCalls: 1, toolErrors: 0 }) },
+          { id: "stats", label: "See what was learned", method: "GET", path: "/routing/stats?taskClass={target}", target: "Task class", defaultTarget: "general", description: "Compare model results for this kind of work.", sample: () => ({}) },
+          { id: "choose", label: "Recommend a model", method: "POST", path: "/routing/choose", description: "Ask Ódinn which configured model has performed best here.", sample: () => ({ taskClass: "general" }) }
         ]
       }
     };
-    const planTemplates = {
-      smoke: {
-        id: "plan_console_smoke",
-        name: "console-smoke",
-        steps: [
-          { id: "health", tool: "job.healthcheck" },
-          { id: "echo", tool: "text.echo", input: { text: "ODINN_CONSOLE_OK" } }
-        ]
-      },
-      readme: {
-        id: "plan_console_readme",
-        name: "readme-read",
-        steps: [
-          { id: "readme", tool: "workspace.readText", input: { path: "README.md", maxBytes: 2048 } }
-        ]
-      }
-    };
-
     async function api(path, options) {
       const response = await fetch(path, options);
+      if (response.headers.get("x-odinn-hosted") === "true") {
+        state.hosted = true;
+        state.hostUser = response.headers.get("x-odinn-host-user") || "";
+        $("remote-signout").hidden = false;
+        $("gateway-context").textContent = state.hostUser ? "Remote tenant · " + state.hostUser : "Remote tenant gateway";
+      }
       const data = await response.json();
       if (!response.ok || data.ok === false) throw new Error(data.error || response.statusText);
       return data;
@@ -3268,8 +3870,23 @@ function renderConsoleHtml() {
       return result;
     }
 
+    let toastTimer;
+    function showToast(message, tone = "status") {
+      const toast = $("toast-region");
+      const text = String(message || "").trim();
+      if (!toast || !text) return;
+      toast.textContent = text.length > 260 ? text.slice(0, 257) + "..." : text;
+      toast.className = "toast-region visible" + (tone === "error" ? " error" : "");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { toast.className = "toast-region"; }, tone === "error" ? 7000 : 4200);
+    }
+
     function showOutput(value) {
       $("output").textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      const message = typeof value === "string"
+        ? value
+        : value?.error || value?.message || (value?.ok === false ? "Action failed." : "Action completed.");
+      showToast(message, /error|fail|denied|unavailable|offline|invalid/i.test(String(message)) ? "error" : "status");
     }
 
     function escapeHtml(value) {
@@ -3380,14 +3997,48 @@ function renderConsoleHtml() {
       button.disabled = busy;
     }
 
-    function switchView(name) {
+    function viewFromHash() {
+      const params = new URLSearchParams(location.hash.replace(/^#/, ""));
+      const candidate = params.get("view") || "overview";
+      if (candidate === "audit" || candidate === "experiments") return candidate;
+      return document.getElementById("view-" + candidate) ? candidate : "overview";
+    }
+
+    function closeMobileNavigation() {
+      $("shell").classList.remove("nav-open");
+      const mobile = matchMedia("(max-width: 980px)").matches;
+      const collapsed = $("shell").classList.contains("sidebar-collapsed");
+      const label = mobile ? "Open navigation" : collapsed ? "Expand navigation" : "Collapse navigation";
+      $("sidebar-toggle").title = label;
+      $("sidebar-toggle").setAttribute("aria-label", label);
+      $("sidebar-toggle").setAttribute("aria-expanded", String(!mobile && !collapsed));
+    }
+
+    function switchView(name, options = {}) {
+      if (name === "audit") {
+        name = "usage";
+        options = { ...options, activityTab: "history" };
+      }
+      if (name === "experiments") name = "lab-run-checks";
+      if (!document.getElementById("view-" + name)) name = "overview";
+      state.activeView = name;
       document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === "view-" + name));
       document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === name));
+      if (name.startsWith("lab-")) document.querySelector(".nav-labs").open = true;
       const button = document.querySelector('[data-view="' + name + '"]');
-      $("view-title").textContent = button?.dataset.title || button?.textContent?.trim() || "Chat";
+      const title = button?.dataset.title || button?.textContent?.trim() || "Chat";
+      $("view-title").textContent = title;
+      document.title = title + " · Ódinn Forge";
       $("chat-context-sep").style.display = name === "overview" ? "" : "none";
       $("chat-title").style.display = name === "overview" ? "" : "none";
-      if (name === "audit") refreshAudit();
+      if (options.updateHash !== false) {
+        const nextHash = "#view=" + encodeURIComponent(name);
+        if (location.hash !== nextHash) {
+          if (options.replace === true) history.replaceState(null, "", nextHash);
+          else history.pushState(null, "", nextHash);
+        }
+      }
+      if (matchMedia("(max-width: 980px)").matches) closeMobileNavigation();
       if (name === "capabilities") {
         refreshApprovals().catch((error) => showOutput(error.message));
         refreshBrowser().catch((error) => showOutput(error.message));
@@ -3397,57 +4048,67 @@ function renderConsoleHtml() {
         else $("session-list").innerHTML = '<div class="empty-state"><strong>Sessions are disabled by policy</strong><span>Add session.read/session.write to this gateway policy to manage conversations.</span></div>';
       }
       if (name === "tasks") refreshTasks().catch((error) => showOutput(error.message));
-      if (name === "usage") refreshUsage().catch((error) => showOutput(error.message));
+      if (name === "usage") {
+        setActivityTab(options.activityTab || "overview");
+        refreshUsage().catch((error) => showOutput(error.message));
+      }
       if (name === "cron") refreshCron().catch((error) => showOutput(error.message));
       if (name === "agents") refreshAgents().catch((error) => showOutput(error.message));
       if (name === "skills") refreshSkills().catch((error) => showOutput(error.message));
-      if (name === "experiments") refreshExperiments().catch((error) => showOutput(error.message));
+      if (name === "automatic-improvements" || name.startsWith("lab-")) refreshExperiments().catch((error) => showOutput(error.message));
       if (name === "projects") refreshProjects().catch((error) => showOutput(error.message));
       if (name === "memory") refreshMemory().catch((error) => showOutput(error.message));
       if (name === "goals") refreshGoals().catch((error) => showOutput(error.message));
     }
 
+    function setActivityTab(tab) {
+      const next = tab === "history" ? "history" : "overview";
+      state.activityTab = next;
+      const history = next === "history";
+      $("activity-tab-overview").classList.toggle("active", !history);
+      $("activity-tab-overview").setAttribute("aria-selected", String(!history));
+      $("activity-tab-history").classList.toggle("active", history);
+      $("activity-tab-history").setAttribute("aria-selected", String(history));
+      $("activity-overview").classList.toggle("active", !history);
+      $("activity-overview").hidden = history;
+      $("activity-history").classList.toggle("active", history);
+      $("activity-history").hidden = !history;
+      if (history) refreshAudit().catch((error) => showOutput(error.message));
+    }
+
     function defaultExperimentalRunId() {
-      return state.experimentalRuns[0]?.id || "replace-with-runtime-run-id";
+      return state.experimentalRuns[0]?.id || "";
     }
 
-    function selectedExperimentalFeature() {
-      return experimentalFeatures[$("experimental-feature-select").value] || experimentalFeatures.proof;
+    function experimentalPage(featureKey) {
+      return document.querySelector('[data-experimental-page="' + featureKey + '"]');
     }
 
-    function selectedExperimentalAction() {
-      const feature = selectedExperimentalFeature();
-      return feature.actions.find((action) => action.id === $("experimental-action-select").value) || feature.actions[0];
+    function selectedExperimentalAction(featureKey) {
+      const feature = experimentalFeatures[featureKey];
+      const selected = state.experimentalActions?.[featureKey];
+      return feature?.actions.find((action) => action.id === selected) || feature?.actions[0];
     }
 
-    function experimentalPath(action, requireTarget = false) {
-      const target = $("experimental-target").value.trim();
-      if (action.target && requireTarget && !target) throw new Error(action.target + " is required");
-      return action.path.replace("{target}", encodeURIComponent(target || "target"));
-    }
-
-    function renderExperimentalRuns() {
-      $("experimental-run-count").textContent = String(state.experimentalRuns.length);
-      $("experimental-recent-runs").innerHTML = state.experimentalRuns.slice(0, 8).map((run) => {
-        const tone = ["verified", "completed-unverified", "passed"].includes(run.status) ? "ok" : ["failed", "denied"].includes(run.status) ? "danger" : "warn";
-        return '<div class="item experimental-run-card" data-experimental-run-id="' + escapeHtml(run.id) + '">' +
-          '<div class="item-line"><span class="item-title">' + escapeHtml(run.objective || run.id) + '</span><span class="chip ' + tone + '">' + escapeHtml(run.status) + '</span></div>' +
-          '<div class="muted">' + escapeHtml(run.id) + '</div>' +
-          '<div class="muted">' + escapeHtml(run.createdAt || "") + '</div></div>';
-      }).join("") || '<div class="empty-state"><strong>No runtime runs yet</strong><span>Use a workbench action to create the first persisted record.</span></div>';
+    function experimentalPath(action, target = "", requireTarget = false) {
+      const effectiveTarget = target || (action.target === "Run ID" ? defaultExperimentalRunId() : "");
+      if (action.target && requireTarget && !effectiveTarget) throw new Error("Choose the item you want to use first.");
+      return action.path.replace("{target}", encodeURIComponent(effectiveTarget || "target"));
     }
 
     function renderSelfImprovementStatus(status) {
-      const settings = status?.selfImprovement || { enabled: false, mode: "propose", intervalMs: 300000, maxChangesPerCycle: 1, rollbackOnFailure: true };
+      const settings = status?.selfImprovement || { enabled: true, mode: "auto", intervalMs: 300000, maxChangesPerCycle: 1, rollbackOnFailure: true };
       const automatic = settings.enabled === true && settings.mode === "auto";
-      $("improvement-controller-state").textContent = automatic ? "ON" : "OFF";
-      $("improvement-mode").textContent = String(settings.mode || "propose").toUpperCase();
-      $("improvement-mode-chip").textContent = automatic ? "auto · allowlisted only" : "review-gated";
-      $("improvement-mode-chip").className = "chip " + (automatic ? "danger" : "warn");
-      $("self-improvement-config").textContent = '"selfImprovement": ' + JSON.stringify(settings, null, 2);
+      $("improvement-controller-state").textContent = automatic ? "Running" : "Paused";
+      const model = settings.advisor?.model || "";
+      $("improvement-mode").textContent = model ? modelDisplayName(model) : "Waiting for model";
+      $("improvement-mode-chip").textContent = automatic ? "Working automatically" : "Paused";
+      $("improvement-mode-chip").className = "chip " + (automatic ? "ok" : "warn");
+      $("self-improvement-model").textContent = model ? modelDisplayName(model) + " · configured provider" : "Connect a provider";
+      $("self-improvement-limit").textContent = String(settings.maxChangesPerCycle || 1) + " maximum per check";
+      $("self-improvement-config").querySelector(".detail-card strong").textContent = describeInterval(settings.intervalMs);
       const canWrite = status?.allowedCapabilities?.includes("improve.write") === true;
-      $("learn-improvements").disabled = !canWrite;
-      $("new-improvement").disabled = !canWrite;
+      $("learn-improvements").disabled = !canWrite || !automatic;
     }
 
     function selectedImprovement() {
@@ -3460,46 +4121,41 @@ function renderConsoleHtml() {
         $("improvement-detail-status").textContent = "No selection";
         $("improvement-detail-status").className = "chip";
         $("improvement-detail").className = "empty-state";
-        $("improvement-detail").innerHTML = '<strong>Select a proposal</strong><span>Evidence, target, decisions, and rollback state will appear here.</span>';
-        $("improvement-approve").disabled = true;
-        $("improvement-reject").disabled = true;
+        $("improvement-detail").innerHTML = '<strong>Select an observation</strong><span>The reason, result, and recovery option will appear here.</span>';
         $("improvement-rollback").disabled = true;
         return;
       }
       const status = improvement.status || "proposed";
       const tone = ["approved", "applied"].includes(status) ? "ok" : ["rejected", "failed"].includes(status) ? "danger" : "warn";
-      $("improvement-detail-status").textContent = status;
+      $("improvement-detail-status").textContent = friendlyImprovementStatus(status);
       $("improvement-detail-status").className = "chip " + tone;
       $("improvement-detail").className = "agent-inspector";
-      $("improvement-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(improvement.title) + '</strong><p>' + escapeHtml(improvement.rationale) + '</p></div>' +
-        '<div class="record-grid">' +
-          '<div class="record"><small>TARGET</small><strong>' + escapeHtml(improvement.target || "runtime") + '</strong></div>' +
-          '<div class="record"><small>PRIORITY</small><strong>' + escapeHtml(improvement.priority || "normal") + '</strong></div>' +
-          '<div class="record"><small>EVIDENCE</small><strong>' + escapeHtml(String((improvement.evidence || []).length)) + '</strong></div>' +
-          '<div class="record"><small>UPDATED</small><strong>' + escapeHtml(improvement.updatedAt || "—") + '</strong></div></div>' +
-        '<details class="activity-details"><summary>Evidence and decision history</summary><pre>' + escapeHtml(JSON.stringify({ evidence: improvement.evidence || [], action: improvement.action, decisions: improvement.decisions || [] }, null, 2)) + '</pre></details>';
+      $("improvement-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(friendlyImprovementTitle(improvement)) + '</strong><p>' + escapeHtml(improvement.rationale) + '</p></div>' +
+        '<div class="detail-grid">' +
+          '<div class="detail-card"><span>Area</span><strong>' + escapeHtml(friendlyArea(improvement.target)) + '</strong></div>' +
+          '<div class="detail-card"><span>Importance</span><strong>' + escapeHtml(friendlyStatus(improvement.priority || "normal")) + '</strong></div>' +
+          '<div class="detail-card"><span>Similar occurrences</span><strong>' + escapeHtml(String((improvement.evidence || []).length)) + '</strong></div>' +
+          '<div class="detail-card"><span>Last updated</span><strong>' + escapeHtml(relativeTime(improvement.updatedAt)) + '</strong></div></div>' +
+        renderImprovementHistory(improvement);
       const canWrite = state.status?.allowedCapabilities?.includes("improve.write") === true;
-      const canDecide = canWrite && status === "proposed";
-      $("improvement-approve").disabled = !canDecide;
-      $("improvement-reject").disabled = !canDecide;
       $("improvement-rollback").disabled = !canWrite || status !== "applied";
     }
 
     function renderImprovements() {
       $("improvement-count").textContent = String(state.improvements.length);
-      $("improvement-review-count").textContent = String(state.improvements.filter((item) => item.status === "proposed").length);
+      $("improvement-review-count").textContent = String(state.improvements.filter((item) => item.status === "applied").length);
       $("improvement-list").innerHTML = state.improvements.map((improvement) => {
         const selected = improvement.id === state.selectedImprovementId;
         const tone = ["approved", "applied"].includes(improvement.status) ? "ok" : ["rejected", "failed"].includes(improvement.status) ? "danger" : "warn";
-        return '<div class="item clickable ' + (selected ? "selected" : "") + '" data-improvement-id="' + escapeHtml(improvement.id) + '"><div class="item-line"><strong>' + escapeHtml(improvement.title) + '</strong><span class="chip ' + tone + '">' + escapeHtml(improvement.status || "proposed") + '</span></div><div class="muted">' + escapeHtml(improvement.target || "runtime") + ' · ' + escapeHtml(improvement.priority || "normal") + '</div><div>' + renderItemText(improvement.rationale, "No rationale") + '</div></div>';
-      }).join("") || '<div class="empty-state"><strong>No proposals yet</strong><span>Record one directly or mine repeated failures from the audit ledger.</span></div>';
+        return '<div class="item clickable ' + (selected ? "selected" : "") + '" role="button" tabindex="0" data-improvement-id="' + escapeHtml(improvement.id) + '"><div class="item-line"><strong>' + escapeHtml(friendlyImprovementTitle(improvement)) + '</strong><span class="chip ' + tone + '">' + escapeHtml(friendlyImprovementStatus(improvement.status || "proposed")) + '</span></div><div class="muted">' + escapeHtml(friendlyArea(improvement.target)) + ' · ' + escapeHtml(relativeTime(improvement.updatedAt)) + '</div><div>' + renderItemText(improvement.rationale, "Ódinn is monitoring this pattern.") + '</div></div>';
+      }).join("") || '<div class="empty-state"><strong>Nothing needs attention</strong><span>Ódinn will keep watching in the background.</span></div>';
       renderImprovementDetail();
     }
 
     async function refreshImprovements() {
       if (state.status?.allowedCapabilities?.includes("improve.read") !== true) {
         state.improvements = [];
-        $("improvement-list").innerHTML = '<div class="empty-state"><strong>Improvement review is disabled by policy</strong><span>Add improve.read to inspect proposals.</span></div>';
+        $("improvement-list").innerHTML = '<div class="empty-state"><strong>Improvement history is unavailable</strong><span>This workspace does not allow improvement history to be read.</span></div>';
         renderImprovementDetail();
         return;
       }
@@ -3509,131 +4165,328 @@ function renderConsoleHtml() {
       renderImprovements();
     }
 
-    async function decideImprovement(decision) {
-      const improvement = selectedImprovement();
-      if (!improvement) throw new Error("select an improvement proposal first");
-      const note = window.prompt(decision === "approved" ? "Approval note" : "Rejection reason", "") ?? "";
-      const result = await api("/improvements/" + encodeURIComponent(improvement.id) + "/decisions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ decision, note, source: "experimental-lab" }) });
-      showOutput(result);
-      await refreshImprovements();
-    }
-
     async function rollbackImprovement() {
       const improvement = selectedImprovement();
       if (!improvement) throw new Error("select an applied improvement first");
-      if (!window.confirm("Restore the captured pre-change configuration for " + improvement.title + "?")) return;
+      if (!window.confirm("Undo the automatic change for “" + improvement.title + "” and restore the previous setting?")) return;
       const result = await api("/improvements/" + encodeURIComponent(improvement.id) + "/rollback", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-      showOutput(result);
+      showOutput("The previous setting was restored.");
       await refreshImprovements();
     }
 
     async function learnImprovements() {
-      const automatic = state.status?.selfImprovement?.enabled === true && state.status?.selfImprovement?.mode === "auto";
-      if (automatic && !window.confirm("Auto mode may apply allowlisted runtime tuning immediately. Continue mining the audit ledger?")) return;
       const button = $("learn-improvements");
       setBusy(button, true);
       try {
         const result = await api("/improvements/learn", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: 1000 }) });
-        showOutput(result);
+        const applied = result.applied?.length || 0;
+        showOutput(applied ? "Ódinn found and applied " + applied + " reversible improvement." : "Automatic check complete. No change was needed.");
         await refreshImprovements();
       } finally { setBusy(button, false); }
     }
 
-    function updateExperimentalWorkbench({ resetPayload = true, resetTarget = true } = {}) {
-      const featureKey = $("experimental-feature-select").value || "proof";
+    function renderExperimentalFeaturePage(featureKey) {
+      const page = experimentalPage(featureKey);
       const feature = experimentalFeatures[featureKey];
-      const action = selectedExperimentalAction();
+      if (!page || !feature) return;
+      state.experimentalActions ||= {};
+      if (!state.experimentalActions[featureKey]) state.experimentalActions[featureKey] = feature.actions[0]?.id;
+      const action = selectedExperimentalAction(featureKey);
       const enabled = state.status?.experimental?.[featureKey] === true;
       const available = enabled || action.availableWhenDisabled === true;
-      const targetField = $("experimental-target-field");
+      const status = page.querySelector('[data-role="feature-status"]');
+      status.textContent = enabled ? "Available" : "Currently off";
+      status.className = "chip " + (enabled ? "ok" : "warn");
+      const list = page.querySelector('[data-role="action-list"]');
+      list.innerHTML = feature.actions.map((item) =>
+        '<button class="feature-action ' + (item.id === action.id ? "selected" : "") + '" data-feature-action="' + escapeHtml(item.id) + '" type="button"><strong>' + escapeHtml(item.label) + '</strong><span>' + escapeHtml(item.description) + '</span></button>'
+      ).join("");
+      page.querySelector('[data-role="action-title"]').textContent = action.label;
+      page.querySelector('[data-role="action-description"]').textContent = action.description;
+      const risk = page.querySelector('[data-role="action-risk"]');
+      risk.textContent = action.dangerous ? "Changes local state" : action.method === "GET" ? "View only" : "Reversible or recorded";
+      risk.className = "chip " + (action.dangerous ? "danger" : action.method === "GET" ? "ok" : "warn");
+      const targetField = page.querySelector('[data-role="target-field"]');
       targetField.hidden = !action.target;
-      $("experimental-target-label").textContent = action.target || "Target";
-      if (resetTarget) $("experimental-target").value = action.defaultTarget || (action.target === "Run ID" ? defaultExperimentalRunId() : "");
-      const payloadField = $("experimental-payload").parentElement;
-      payloadField.hidden = action.method === "GET";
-      if (resetPayload) $("experimental-payload").value = JSON.stringify(action.sample(), null, 2);
-      $("experimental-action-description").textContent = action.description;
-      $("experimental-action-risk").textContent = action.dangerous ? "changes persisted state" : action.method === "GET" ? "read only" : "audited mutation";
-      $("experimental-action-risk").className = "chip " + (action.dangerous ? "danger" : action.method === "GET" ? "ok" : "warn");
-      $("experimental-endpoint").textContent = action.method + " " + experimentalPath(action, false);
-      $("experimental-run").disabled = !available;
-      $("experimental-run").className = action.dangerous ? "danger" : "";
-      $("experimental-run").textContent = available ? action.label : "Feature disabled";
-    }
-
-    function populateExperimentalActions() {
-      const feature = selectedExperimentalFeature();
-      $("experimental-action-select").innerHTML = feature.actions.map((action) => '<option value="' + escapeHtml(action.id) + '">' + escapeHtml(action.label) + '</option>').join("");
-      updateExperimentalWorkbench();
+      page.querySelector('[data-role="target-label"]').textContent = friendlyTargetLabel(action.target);
+      const target = page.querySelector('[data-role="target"]');
+      if (target.dataset.action !== action.id) {
+        target.dataset.action = action.id;
+        target.value = action.defaultTarget || "";
+      }
+      const advanced = page.querySelector(".advanced-options");
+      advanced.hidden = action.method === "GET";
+      const payload = page.querySelector('[data-role="payload"]');
+      if (payload.dataset.action !== action.id) {
+        payload.dataset.action = action.id;
+        payload.value = JSON.stringify(action.sample(), null, 2);
+      }
+      const run = page.querySelector('[data-role="run"]');
+      run.disabled = !available;
+      run.className = action.dangerous ? "danger" : "";
+      run.textContent = available ? action.label : "Turn on this Lab to continue";
     }
 
     function renderExperimentalHome(status) {
       const entries = Object.entries(experimentalFeatures);
       const flags = status?.experimental || {};
       const enabledCount = entries.filter(([key]) => flags[key] === true).length;
-      $("experimental-enabled-count").textContent = String(enabledCount);
-      $("experimental-disabled-count").textContent = String(entries.length - enabledCount);
-      $("experimental-overall-state").textContent = enabledCount === 0 ? "DISABLED" : enabledCount === entries.length ? "ALL ENABLED" : enabledCount + " / " + entries.length + " ENABLED";
-      $("experimental-overall-state").className = "pill " + (enabledCount === entries.length ? "" : "warn");
       $("nav-experimental-count").textContent = enabledCount + "/" + entries.length;
       $("nav-experimental-count").className = "badge " + (enabledCount ? "ok" : "warn");
-      $("experimental-config").textContent = '"experimental": ' + JSON.stringify(Object.fromEntries(entries.map(([key]) => [key, flags[key] === true])), null, 2);
-      $("experimental-config-path").textContent = (status?.state || ".odinn") + "/config.json";
       renderSelfImprovementStatus(status);
-      $("experimental-feature-grid").innerHTML = entries.map(([key, feature]) => {
-        const enabled = flags[key] === true;
-        return '<article class="experimental-card ' + (enabled ? "enabled" : "disabled") + '"><div class="panel-head"><h2>' + escapeHtml(feature.title) + '</h2><span class="chip ' + (enabled ? "ok" : "warn") + '">' + (enabled ? "enabled" : "off") + '</span></div><p>' + escapeHtml(feature.summary) + '</p><div class="row"><code>' + escapeHtml(feature.endpoint) + '</code><button class="secondary" data-experimental-feature="' + escapeHtml(key) + '" type="button">Open workbench</button></div></article>';
-      }).join("");
-      const featureSelect = $("experimental-feature-select");
-      if (!featureSelect.options.length) {
-        featureSelect.innerHTML = entries.map(([key, feature]) => '<option value="' + escapeHtml(key) + '">' + escapeHtml(feature.title) + '</option>').join("");
-        populateExperimentalActions();
-      } else {
-        updateExperimentalWorkbench({ resetPayload: false, resetTarget: false });
-      }
-    }
-
-    async function refreshExperimentalRuns() {
-      state.experimentalRuns = await api("/runtime/runs?limit=100");
-      renderExperimentalRuns();
+      entries.forEach(([key]) => renderExperimentalFeaturePage(key));
     }
 
     async function refreshExperiments() {
       state.status = await api("/status");
       renderExperimentalHome(state.status);
-      await Promise.all([refreshExperimentalRuns(), refreshImprovements()]);
-      updateExperimentalWorkbench();
+      await refreshImprovements();
     }
 
-    async function runExperimentalAction() {
-      const featureKey = $("experimental-feature-select").value;
-      const action = selectedExperimentalAction();
-      if (state.status?.experimental?.[featureKey] !== true && action.availableWhenDisabled !== true) throw new Error("experimental " + featureKey + " feature is disabled; enable it in config and restart the gateway");
-      if (action.dangerous && !window.confirm(action.description + " Continue?")) return;
-      const path = experimentalPath(action, true);
+    async function runExperimentalAction(featureKey) {
+      const page = experimentalPage(featureKey);
+      const action = selectedExperimentalAction(featureKey);
+      if (!page || !action) return;
+      if (state.status?.experimental?.[featureKey] !== true && action.availableWhenDisabled !== true) throw new Error("This Lab is currently off. Turn it on in Odinn settings and restart before using this action.");
+      const target = page.querySelector('[data-role="target"]').value.trim();
+      const path = experimentalPath(action, target, true);
+      if (action.dangerous && !window.confirm('Continue with “' + action.label + '”? ' + action.description + " A preview is recommended whenever one is available.")) return;
       const options = { method: action.method };
       if (action.method !== "GET") {
         let payload;
-        try { payload = JSON.parse($("experimental-payload").value || "{}"); }
-        catch (error) { throw new Error("request JSON is invalid: " + error.message); }
+        try { payload = JSON.parse(page.querySelector('[data-role="payload"]').value || "{}"); }
+        catch { throw new Error("The advanced options are not valid. Reset them or correct the formatting."); }
         options.headers = { "content-type": "application/json" };
         options.body = JSON.stringify(payload);
       }
-      const button = $("experimental-run");
+      const button = page.querySelector('[data-role="run"]');
+      const resultArea = page.querySelector('[data-role="result"]');
       setBusy(button, true);
-      $("experimental-result").textContent = "Running " + action.method + " " + path + "...";
+      resultArea.innerHTML = '<div class="empty-state"><strong>Working…</strong><span>Ódinn is completing ' + escapeHtml(action.label.toLowerCase()) + '.</span></div>';
       try {
         const result = await api(path, options);
-        $("experimental-result").textContent = JSON.stringify(result, null, 2);
-        showOutput(result);
-        await refreshExperimentalRuns();
+        renderFriendlyResult(resultArea, result, featureKey, action);
+        showOutput(action.label + " completed.");
       } catch (error) {
-        $("experimental-result").textContent = "ERROR\\n" + error.message;
+        resultArea.innerHTML = '<div class="result-summary error"><strong>That did not work</strong><p>' + escapeHtml(error.message) + '</p></div>';
         throw error;
       } finally {
         setBusy(button, false);
-        updateExperimentalWorkbench({ resetPayload: false, resetTarget: false });
+        renderExperimentalFeaturePage(featureKey);
       }
+    }
+
+    function friendlyStatus(value) {
+      const text = String(value || "unknown");
+      const labels = {
+        "completed-unverified": "Completed",
+        verified: "Verified",
+        completed: "Completed",
+        passed: "Passed",
+        failed: "Needs attention",
+        denied: "Stopped safely",
+        running: "In progress",
+        proposed: "Observed",
+        applied: "Applied",
+        rejected: "Dismissed",
+        "rolled-back": "Undone",
+        high: "High",
+        normal: "Normal",
+        low: "Low"
+      };
+      return labels[text] || text.replace(/[._-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+    }
+
+    function friendlyImprovementStatus(value) {
+      const labels = {
+        proposed: "Watching",
+        approved: "Ready",
+        applied: "Improved automatically",
+        failed: "Change not applied",
+        rejected: "Dismissed",
+        "rolled-back": "Undone"
+      };
+      return labels[value] || friendlyStatus(value);
+    }
+
+    function friendlyImprovementTitle(improvement) {
+      if (/^Improve reliability for /i.test(improvement?.title || "")) {
+        return "Make " + friendlyArea(improvement.target).toLowerCase() + " more reliable";
+      }
+      return improvement?.title || "Reliability observation";
+    }
+
+    function friendlyEventTitle(event) {
+      const labels = {
+        "task.policy": "Safety check",
+        "task.started": "Started",
+        "task.completed": "Completed",
+        "task.failed": "Needs attention",
+        "task.blocked": "Stopped safely",
+        "task.approval_required": "Waiting for approval",
+        "task.cancelled": "Cancelled",
+        "provider.attempt": "Connected to model",
+        "memory.curate": "Memory updated"
+      };
+      return labels[event?.type] || (event?.tool ? friendlyArea(event.tool) : friendlyStatus(event?.type || "Update"));
+    }
+
+    function friendlyActor(value) {
+      const text = String(value || "Odinn");
+      if (/autonomous|automation|cron|scheduler/i.test(text)) return "Automatic workflow";
+      if (/gateway|console|user/i.test(text)) return "You";
+      if (/agent/i.test(text)) return "Agent SDK";
+      return friendlyStatus(text);
+    }
+
+    function friendlyErrorMessage(value) {
+      const text = String(value || "");
+      if (!text) return "";
+      if (/429|rate.?limit/i.test(text)) return "The model service was busy. Ódinn will retry automatically.";
+      if (/timed? ?out|timeout/i.test(text)) return "The operation took too long and stopped safely.";
+      if (/policy|capability|approval|denied|blocked/i.test(text)) return "A safety rule stopped this action.";
+      if (/provider|model/i.test(text) && /failed|error|unavailable|returned|empty|assistant content/i.test(text)) return "The connected model did not return a usable response.";
+      if (/policy allowed task/i.test(text)) return "The action passed its safety checks.";
+      return "This action did not complete as expected.";
+    }
+
+    function friendlyArea(value) {
+      const key = String(value || "").replace(/^runtime\\//, "");
+      const labels = {
+        "model.chat": "Model conversations",
+        "agent.run": "Agent work",
+        "web.fetch": "Web reading",
+        "web.search": "Web search",
+        "session.create": "Conversation setup",
+        "session.list": "Conversations",
+        "session.read": "Conversation history",
+        "session.delete": "Conversation cleanup",
+        "project.list": "Projects",
+        "project.create": "Projects",
+        "project.update": "Projects",
+        "goal.list": "Goals",
+        "goal.create": "Goals",
+        "goal.update": "Goals",
+        "memory.search": "Memory search",
+        "memory.recall": "Memory recall",
+        "memory.remember": "Memory",
+        "memory.forget": "Memory",
+        "memory.browse": "Memory library",
+        "memory.curate": "Memory organization",
+        "improve.learn": "Automatic improvements",
+        "improve.list": "Automatic improvements",
+        "improve.rollback": "Automatic improvements",
+        runtime: "General reliability"
+      };
+      return labels[key] || key.replace(/[._/-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase()) || "General reliability";
+    }
+
+    function friendlyTaskTitle(task) {
+      const labels = {
+        "improve.learn": "Automatic improvement check",
+        "improve.rollback": "Undo an automatic improvement",
+        "model.chat": "Model conversation",
+        "agent.run": "Agent SDK work",
+        "memory.search": "Search memory",
+        "memory.recall": "Find useful memories",
+        "memory.remember": "Save a memory",
+        "memory.forget": "Forget a memory",
+        "memory.curate": "Organize memory",
+        "memory.browse": "Browse memory",
+        "session.create": "Start a conversation",
+        "session.list": "Review conversations",
+        "session.read": "Open a conversation",
+        "session.delete": "Delete a conversation"
+      };
+      return labels[task?.tool] || task?.title || friendlyArea(task?.tool);
+    }
+
+    function friendlyTaskOrigin(value) {
+      const labels = { user: "You", agent: "Agent SDK", automation: "Automatic", system: "System" };
+      return labels[value] || friendlyStatus(value);
+    }
+
+    function describeInterval(value) {
+      const minutes = Math.max(1, Math.round(Number(value || 300000) / 60000));
+      return minutes === 1 ? "Every minute" : "Every " + minutes + " minutes";
+    }
+
+    function modelDisplayName(value) {
+      const text = String(value || "");
+      return text.includes(":") ? text.slice(text.indexOf(":") + 1) : text || "Connected model";
+    }
+
+    function friendlyTargetLabel(value) {
+      const labels = {
+        "Run ID": "Run to use (leave blank for the most recent)",
+        "Snapshot ID": "Restore point reference",
+        "Group ID": "Comparison reference",
+        "Capability ID": "Access pass reference",
+        "Task class": "Kind of work"
+      };
+      return labels[value] || "Item to use";
+    }
+
+    function renderImprovementHistory(improvement) {
+      const decisions = improvement.decisions || [];
+      if (!decisions.length) return '<div class="agent-section"><strong>Current result</strong><p>Ódinn is watching this pattern. No runtime setting has been changed.</p></div>';
+      return '<div class="agent-section"><strong>What happened</strong><ul class="human-list">' + decisions.map((decision) => {
+        let description = decision.note || friendlyImprovementStatus(decision.decision);
+        if (decision.action?.path === "runtime.modelRetries") {
+          description = decision.decision === "applied"
+            ? "Ódinn increased the retry buffer from " + decision.action.previousValue + " to " + decision.action.value + "."
+            : description;
+        }
+        return '<li><strong>' + escapeHtml(friendlyImprovementStatus(decision.decision)) + '</strong><div class="muted">' + escapeHtml(description) + ' · ' + escapeHtml(relativeTime(decision.at)) + '</div></li>';
+      }).join("") + '</ul></div>';
+    }
+
+    function renderFriendlyResult(target, result, featureKey, action) {
+      if (featureKey === "capabilities" && typeof result?.token === "string") state.lastCapabilityToken = result.token;
+      const facts = [];
+      const labels = {
+        status: "Status",
+        decision: "Decision",
+        verified: "Verified",
+        provider: "Provider",
+        model: "Model",
+        taskClass: "Kind of work",
+        maxUses: "Maximum uses",
+        remainingUses: "Uses remaining",
+        durationMs: "Duration",
+        selected: "Selected option",
+        assertions: "Checks",
+        candidates: "Approaches",
+        records: "Records"
+      };
+      for (const [key, value] of Object.entries(result || {})) {
+        if (!labels[key] || value === undefined || value === null) continue;
+        const display = typeof value === "boolean"
+          ? value ? "Yes" : "No"
+          : Array.isArray(value) ? value.length + " total"
+            : key === "durationMs" ? formatDuration(value)
+              : key === "model" ? modelDisplayName(value)
+                : typeof value === "object" ? Object.keys(value).length + " items" : friendlyStatus(value);
+        facts.push('<div class="result-fact"><small>' + escapeHtml(labels[key]) + '</small><strong>' + escapeHtml(display) + '</strong></div>');
+      }
+      const message = result?.message || result?.summary || action.label + " completed successfully.";
+      const tokenNotice = state.lastCapabilityToken && featureKey === "capabilities" && action.id === "issue"
+        ? '<div class="agent-section"><strong>Your access pass is ready</strong><p>For safety, it is not displayed on this page. Copy it now and store it only where it is needed.</p><button class="secondary" data-copy-access-pass type="button">Copy access pass</button></div>'
+        : "";
+      const list = Array.isArray(result?.assertions)
+        ? '<ul class="human-list">' + result.assertions.map((item) => '<li><strong>' + escapeHtml(item.passed === false ? "Needs attention" : "Passed") + '</strong><div class="muted">' + escapeHtml(item.message || item.id || "Check completed") + '</div></li>').join("") + '</ul>'
+        : "";
+      const safeDetails = redactTechnicalResult(result);
+      target.innerHTML = '<div class="result-summary success"><div><strong>' + escapeHtml(action.label + " complete") + '</strong><p>' + escapeHtml(message) + '</p></div>' +
+        (facts.length ? '<div class="result-grid">' + facts.join("") + '</div>' : "") + tokenNotice + list +
+        '<details class="activity-details technical-details"><summary>Developer details</summary><pre>' + escapeHtml(JSON.stringify(safeDetails, null, 2)) + '</pre></details></div>';
+    }
+
+    function redactTechnicalResult(value, key = "") {
+      if (/token|secret|password|authorization|cookie/i.test(key)) return "[hidden]";
+      if (Array.isArray(value)) return value.map((item) => redactTechnicalResult(item));
+      if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, redactTechnicalResult(item, name)]));
+      return value;
     }
 
     function renderItemText(text, fallback) {
@@ -3643,11 +4496,10 @@ function renderConsoleHtml() {
 
     function renderRun(run) {
       const tone = run.status === "completed" ? "ok" : run.status === "running" ? "warn" : "danger";
-      return '<div class="item clickable" data-run-id="' + escapeHtml(run.id) + '">' +
-        '<div class="item-line"><span class="item-title">' + escapeHtml(run.tool || run.id) + '</span>' +
-        '<span class="chip ' + tone + '">' + escapeHtml(run.status) + '</span></div>' +
-        '<div class="muted">' + escapeHtml(run.id) + '</div>' +
-        '<div class="muted">' + escapeHtml(run.message || run.capability || "") + '</div>' +
+      return '<div class="item clickable" role="button" tabindex="0" data-run-id="' + escapeHtml(run.id) + '">' +
+        '<div class="item-line"><span class="item-title">' + escapeHtml(friendlyArea(run.tool) || "Odinn activity") + '</span>' +
+        '<span class="chip ' + tone + '">' + escapeHtml(friendlyStatus(run.status)) + '</span></div>' +
+        '<div class="muted">' + escapeHtml(friendlyErrorMessage(run.message) || "Completed work") + '</div>' +
       '</div>';
     }
 
@@ -3656,30 +4508,37 @@ function renderConsoleHtml() {
       const isError = ["failed", "denied"].includes(outcome);
       const isModel = ["model.chat", "agent.run"].includes(event.tool);
       const tone = isError ? "danger" : isModel ? "ok" : "";
-      const kind = event.type || event.event || "audit event";
-      const labels = {
-        "task.policy": "Policy decision", "task.started": "Task started", "task.completed": "Task completed",
-        "task.failed": "Task failed", "task.approval_required": "Approval required", "task.cancelled": "Task cancelled",
-        "model.request": "Model request", "model.response": "Model response", "memory.curate": "Memory curation"
-      };
-      const title = labels[kind] || event.tool || kind;
-      const subject = event.tool ? "Tool " + event.tool : event.capability ? "Capability " + event.capability : "Runtime event";
-      const summary = event.message || (event.decision ? "Decision: " + event.decision : event.status ? "Status: " + event.status : subject);
-      const metadata = [event.actor && "Actor: " + event.actor, event.runId && "Run: " + event.runId, event.capability && "Capability: " + event.capability, event.tool && "Tool: " + event.tool].filter(Boolean);
-      return '<div class="item activity-event ' + (isError ? "error" : "") + '"><div class="item-line"><strong>' + escapeHtml(title) + '</strong><span class="chip ' + tone + '">' + escapeHtml(outcome) + '</span></div><div class="muted">' + escapeHtml(event.at || event.timestamp || "") + ' · ' + escapeHtml(kind) + '</div><p class="activity-summary">' + escapeHtml(summary) + '</p><div class="activity-meta">' + metadata.map((value) => '<span>' + escapeHtml(value) + '</span>').join("") + '</div><details class="activity-details"><summary>Show event details</summary><pre>' + escapeHtml(JSON.stringify(event, null, 2)) + '</pre></details></div>';
+      const title = friendlyEventTitle(event);
+      const summary = event.type === "task.policy" && event.decision !== "deny"
+        ? "The action passed its safety checks."
+        : event.type === "task.started"
+          ? "Work began."
+          : event.type === "task.completed"
+            ? "Work finished successfully."
+            : friendlyErrorMessage(event.message) || friendlyArea(event.tool);
+      const metadata = [event.actor && "Started by " + friendlyActor(event.actor), event.tool && friendlyArea(event.tool)].filter(Boolean);
+      return '<div class="item activity-event ' + (isError ? "error" : "") + '"><div class="item-line"><strong>' + escapeHtml(title) + '</strong><span class="chip ' + tone + '">' + escapeHtml(friendlyStatus(outcome)) + '</span></div><div class="muted">' + escapeHtml(relativeTime(event.at || event.timestamp)) + '</div><p class="activity-summary">' + escapeHtml(summary) + '</p><div class="activity-meta">' + metadata.map((value) => '<span>' + escapeHtml(value) + '</span>').join("") + '</div><details class="activity-details"><summary>More context</summary><div class="detail-grid"><div class="detail-card"><span>When</span><strong>' + escapeHtml(new Date(event.at || event.timestamp || Date.now()).toLocaleString()) + '</strong></div><div class="detail-card"><span>Started by</span><strong>' + escapeHtml(friendlyActor(event.actor)) + '</strong></div><div class="detail-card"><span>Area</span><strong>' + escapeHtml(friendlyArea(event.tool)) + '</strong></div><div class="detail-card"><span>Result</span><strong>' + escapeHtml(friendlyStatus(event.decision || outcome)) + '</strong></div></div></details></div>';
     }
 
     function renderProvider(provider) {
-      const configured = provider.configured;
-      const auth = provider.authMode || "api-key";
-      return '<div class="provider-card"><div class="provider-head"><strong>' + escapeHtml(provider.name) + '</strong><span class="chip ' + (configured ? "ok" : "warn") + '">' + (configured ? "ready" : "auth required") + '</span></div><div class="chip-row"><span class="chip">' + escapeHtml(auth) + '</span><span class="chip">' + escapeHtml(provider.type || "provider") + '</span><span class="chip">' + escapeHtml((provider.models || []).length + " models") + '</span></div><div class="muted">' + escapeHtml(provider.baseUrl || "managed transport") + '</div></div>';
+      const configured = provider.configured && (provider.models || []).length > 0;
+      const status = configured ? "Ready" : provider.configured ? "Choose a model" : "Connect account";
+      const connection = provider.name === "ollama" || provider.name === "lmstudio" ? "On this computer" : "Connected service";
+      return '<div class="provider-card"><div class="provider-head"><strong>' + escapeHtml(friendlyStatus(provider.name)) + '</strong><span class="chip ' + (configured ? "ok" : "warn") + '">' + status + '</span></div><div class="chip-row"><span class="chip">' + escapeHtml(connection) + '</span><span class="chip">' + escapeHtml((provider.models || []).length + " model" + ((provider.models || []).length === 1 ? "" : "s")) + '</span></div><div class="muted">' + escapeHtml(configured ? "Available for chat and automatic improvements." : "Finish setup to use this provider.") + '</div></div>';
+    }
+
+    function providerReady(status = state.status) {
+      const readyProviders = new Set((status?.providers || [])
+        .filter((provider) => provider.configured && (provider.models || []).length > 0)
+        .map((provider) => provider.name));
+      return (status?.models || []).some((model) => readyProviders.has(model.provider));
     }
 
     function renderSessionTranscript(detail) {
       const messages = detail?.messages || [];
       $("selected-session-route").textContent = detail?.session?.title || "Selected session";
       $("session-transcript").innerHTML = messages.length
-        ? messages.map((message) => '<div class="timeline-row"><span class="timeline-dot"></span><div class="item"><div class="item-line"><strong>' + escapeHtml(message.role || "message") + '</strong><span class="chip">' + escapeHtml([message.provider, message.model].filter(Boolean).join(":") || "unrouted") + '</span></div><div class="markdown-body">' + renderMarkdown(message.content) + '</div></div></div>').join("")
+        ? messages.map((message) => '<div class="timeline-row"><span class="timeline-dot"></span><div class="item"><div class="item-line"><strong>' + escapeHtml(message.role === "user" ? "You" : message.role === "assistant" ? "Ódinn" : friendlyStatus(message.role || "message")) + '</strong><span class="chip">' + escapeHtml(message.model ? modelDisplayName(message.model) : "Default model") + '</span></div><div class="markdown-body">' + renderMarkdown(message.content) + '</div></div></div>').join("")
         : '<div class="empty-state"><strong>No messages yet</strong><span>Send the first message from Chat.</span></div>';
     }
 
@@ -3687,10 +4546,9 @@ function renderConsoleHtml() {
       const attrs = 'data-chat-session-id="' + escapeHtml(session.id) + '"';
       const active = session.id === state.activeChatId ? " active" : "";
       return '<div class="menu-chat' + active + '" ' + attrs + '>' +
-        '<div class="item-line"><div class="menu-chat-main"><strong>' + renderItemText(session.title, "Untitled chat") + '</strong>' +
-        '<span>' + escapeHtml(session.lastMessageRole || "open") + '</span></div>' +
-        '<span class="badge">' + escapeHtml(session.messageCount || 0) + '</span></div>' +
-        '<div class="menu-chat-actions"><button class="chat-action" data-session-action="rename" data-session-id="' + escapeHtml(session.id) + '" title="Rename chat" aria-label="Rename chat"><svg class="icon-svg"><use href="#icon-edit"></use></svg></button><button class="chat-action delete" data-session-action="delete" data-session-id="' + escapeHtml(session.id) + '" title="Delete chat" aria-label="Delete chat"><svg class="icon-svg"><use href="#icon-trash"></use></svg></button></div>' +
+        '<div class="menu-chat-main"><strong>' + renderItemText(session.title, "Untitled chat") + '</strong>' +
+        '<span>' + escapeHtml(session.lastMessageRole === "assistant" ? "Ódinn replied" : session.lastMessageRole === "user" ? "Waiting for Ódinn" : "Ready") + ' · ' + escapeHtml((session.messageCount || 0) + ((session.messageCount || 0) === 1 ? " message" : " messages")) + '</span></div>' +
+        '<div class="menu-chat-actions"><button class="chat-action" data-session-action="rename" data-session-id="' + escapeHtml(session.id) + '" title="Rename chat" aria-label="Rename chat" type="button"><svg class="icon-svg"><use href="#icon-edit"></use></svg></button><button class="chat-action delete" data-session-action="delete" data-session-id="' + escapeHtml(session.id) + '" title="Delete chat" aria-label="Delete chat" type="button"><svg class="icon-svg"><use href="#icon-trash"></use></svg></button></div>' +
       '</div>';
     }
 
@@ -3698,17 +4556,24 @@ function renderConsoleHtml() {
       const updated = session.updatedAt || session.createdAt || "";
       const project = state.projects.find((entry) => entry.id === session.projectId);
       const knownProjectOptions = state.projects.filter((entry) => entry.status === "active" || entry.id === session.projectId).map((entry) => '<option value="' + escapeHtml(entry.id) + '"' + (entry.id === session.projectId ? " selected" : "") + '>' + escapeHtml(entry.name + (entry.status === "archived" ? " (archived)" : "")) + '</option>').join("");
-      const projectOptions = project ? knownProjectOptions : '<option value="' + escapeHtml(session.projectId) + '" selected>' + escapeHtml(session.projectId + " (unavailable)") + '</option>' + knownProjectOptions;
+      const projectOptions = project ? knownProjectOptions : '<option value="' + escapeHtml(session.projectId) + '" selected>Unavailable project</option>' + knownProjectOptions;
       return '<div class="data-row clickable session-record" data-session-id="' + escapeHtml(session.id) + '">' +
-        '<span class="data-primary"><strong>' + renderItemText(session.title, "Untitled session") + '</strong><small>' + escapeHtml(session.id) + '</small></span>' +
-        '<span>' + escapeHtml(project?.name || session.projectId || "Workspace") + (project?.status === "archived" ? ' <span class="chip">archived</span>' : '') + '</span>' +
-        '<span class="chip">' + escapeHtml(session.source || "direct") + '</span>' +
-        '<span class="chip ' + (session.status === "archived" ? "" : "ok") + '">' + escapeHtml(session.status || "open") + '</span>' +
-        '<span>' + escapeHtml(session.runtime || "odinn") + '</span>' +
+        '<span class="data-primary"><strong>' + renderItemText(session.title, "Untitled session") + '</strong><small>' + escapeHtml(modelDisplayName(session.model || session.route || "") || "Default model") + '</small></span>' +
+        '<span>' + escapeHtml(project?.name || "Workspace") + (project?.status === "archived" ? ' <span class="chip">archived</span>' : '') + '</span>' +
+        '<span class="chip">' + escapeHtml(friendlySessionSource(session.source)) + '</span>' +
+        '<span class="chip ' + (session.status === "archived" ? "" : "ok") + '">' + escapeHtml(friendlyStatus(session.status || "open")) + '</span>' +
         '<span class="muted">' + escapeHtml(relativeTime(updated)) + '</span>' +
         '<span>' + escapeHtml(session.messageCount || 0) + '</span>' +
-        '<span class="row"><select class="session-project-select" data-session-project="' + escapeHtml(session.id) + '" aria-label="Move session to project">' + projectOptions + '</select><button class="session-action" data-session-action="rename" data-session-id="' + escapeHtml(session.id) + '" title="Rename session" aria-label="Rename session">Rename</button><button class="session-action delete" data-session-action="delete" data-session-id="' + escapeHtml(session.id) + '" title="Delete session" aria-label="Delete session">Delete</button></span>' +
+        '<span class="row"><select class="session-project-select" data-session-project="' + escapeHtml(session.id) + '" aria-label="Move session to project">' + projectOptions + '</select><button class="session-action" data-session-action="rename" data-session-id="' + escapeHtml(session.id) + '" title="Rename session" aria-label="Rename session" type="button">Rename</button><button class="session-action delete" data-session-action="delete" data-session-id="' + escapeHtml(session.id) + '" title="Delete session" aria-label="Delete session" type="button">Delete</button></span>' +
       '</div>';
+    }
+
+    function friendlySessionSource(value) {
+      const text = String(value || "direct");
+      if (/chat|console/i.test(text)) return "Chat";
+      if (/agent/i.test(text)) return "Agent";
+      if (/cron|schedule|automation/i.test(text)) return "Automatic";
+      return friendlyStatus(text);
     }
 
     function relativeTime(value) {
@@ -3721,9 +4586,12 @@ function renderConsoleHtml() {
       return Math.floor(seconds / 86400) + "d ago";
     }
 
+    function sessionDisplayTitle(sessionId) {
+      return state.sessions.find((session) => session.id === sessionId)?.title || "Untitled chat";
+    }
+
     async function renameChat(sessionId) {
-      const detail = await api("/sessions/" + encodeURIComponent(sessionId));
-      const title = window.prompt("Rename chat", detail.session?.title || "Untitled chat");
+      const title = window.prompt("Rename chat", sessionDisplayTitle(sessionId));
       if (title === null || !title.trim()) return;
       await api("/sessions/" + encodeURIComponent(sessionId), {
         method: "PATCH",
@@ -3738,15 +4606,14 @@ function renderConsoleHtml() {
     }
 
     async function deleteChat(sessionId) {
-      const detail = await api("/sessions/" + encodeURIComponent(sessionId));
-      const title = detail.session?.title || "Untitled chat";
-      if (!window.confirm('Delete chat "' + title + '"? This removes it from the chat list.')) return;
+      const title = sessionDisplayTitle(sessionId);
+      if (!window.confirm('Remove session "' + title + '" from active lists? Its append-only history remains stored, but this console does not currently provide a restore action.')) return;
       await api("/sessions/" + encodeURIComponent(sessionId), { method: "DELETE" });
       if (state.activeChatId === sessionId) {
         state.activeChatId = "";
         state.messages = [];
         $("chat-title").textContent = "New chat";
-        $("chat-subtitle").textContent = "Local beta adapter";
+        $("chat-subtitle").textContent = "Your local assistant";
       }
       if (state.selectedSessionId === sessionId) {
         state.selectedSessionId = "";
@@ -3758,20 +4625,20 @@ function renderConsoleHtml() {
 
     function renderChatMessages(messages) {
       if (!messages.length) {
-        const configured = state.status?.models?.length;
+        const configured = providerReady(state.status);
         $("chat-thread").innerHTML = '<div class="chat-empty">' +
           '<div class="chat-avatar"><img src="/odinn-logo.png" alt=""></div>' +
           '<h1>Ódinn Forge</h1>' +
-          '<span class="pill ' + (configured ? "" : "warn") + '">' + (configured ? "Ready to chat" : "Provider required") + '</span>' +
+          '<span class="pill ' + (configured ? "" : "warn") + '">' + (configured ? "Provider connected" : "Connect a model provider") + '</span>' +
           '<p>' + (configured
-            ? 'Ask anything · current web context and browser access are available from Capabilities'
-            : 'Configure a model provider, then refresh this page.') + '</p>' +
+            ? 'Choose a model and send a message. Use Web tools when you need current information or work on a website.'
+            : 'Run odinn onboard in a terminal, then refresh this page.') + '</p>' +
           (configured
             ? '<div class="chat-prompts">' +
               '<button class="chat-prompt" data-chat-prompt="What can you do?">What can you do?</button>' +
-              '<button class="chat-prompt" data-chat-prompt="Search the web for the latest Ódinn Forge beta release notes.">Search the web</button>' +
+              '<button class="chat-prompt" data-chat-prompt="Search the web for current information about Ódinn Forge.">Search the web</button>' +
               '<button class="chat-prompt" data-chat-prompt="Open the browser workspace and show me the current page.">Open browser workspace</button>' +
-              '<button class="chat-prompt" data-chat-prompt="Check the current runtime health.">Check runtime health</button>' +
+              '<button class="chat-prompt" data-chat-prompt="Summarize my recent activity and tasks.">Review recent activity</button>' +
             '</div>'
             : "") +
           '</div>';
@@ -3789,7 +4656,7 @@ function renderConsoleHtml() {
       $("chat-thread").scrollTop = $("chat-thread").scrollHeight;
     }
 
-    async function createChat(title = "Beta chat") {
+    async function createChat(title = "New chat") {
       const selectedProject = state.projects.find((project) => project.id === state.selectedProjectId && project.status === "active");
       const session = await api("/sessions", {
         method: "POST",
@@ -3798,7 +4665,6 @@ function renderConsoleHtml() {
       });
       state.activeChatId = session.id;
       state.selectedSessionId = session.id;
-      $("send-chat").disabled = false;
       await loadChat(session.id);
       await refreshSessions();
       await refreshRuns();
@@ -3811,14 +4677,15 @@ function renderConsoleHtml() {
       state.selectedSessionId = sessionId;
       state.messages = detail.messages || [];
       $("chat-title").textContent = detail.session?.title || "Untitled chat";
-      $("chat-subtitle").textContent = detail.session?.id || "local model gateway";
+      $("chat-subtitle").textContent = detail.session?.projectId && detail.session.projectId !== "project_default"
+        ? "Saved with a project"
+        : "Saved in this workspace";
       renderChatMessages(state.messages);
-      showOutput(detail);
     }
 
     async function ensureChat() {
       if (state.activeChatId) return state.activeChatId;
-      const session = await createChat("Gateway beta chat");
+      const session = await createChat("New chat");
       return session.id;
     }
 
@@ -3833,6 +4700,10 @@ function renderConsoleHtml() {
     async function sendChatMessage(text, options = {}) {
       const content = String(text || "").trim();
       if (!content) return;
+      if (options.tool !== "job.healthcheck" && !providerReady(state.status)) {
+        showOutput("Connect a model provider with odinn onboard, then refresh before sending a message.");
+        return;
+      }
       $("chat-status").textContent = "Thinking";
       const sessionId = await ensureChat();
       const currentTitle = $("chat-title").textContent.trim();
@@ -3876,7 +4747,7 @@ function renderConsoleHtml() {
             renderChatMessages(state.messages);
           });
       const reply = options.tool === "job.healthcheck"
-        ? "Healthcheck passed on " + result.output.platform + " " + result.output.release + ". Workspace: " + result.output.workspaceRoot
+        ? "System check passed. Ódinn is working normally."
         : result.output.content;
       await api("/sessions/" + encodeURIComponent(sessionId) + "/messages", {
         method: "POST",
@@ -3901,7 +4772,7 @@ function renderConsoleHtml() {
     }
 
     function renderRecord(record, title, meta, attrs) {
-      return '<div class="item clickable" ' + (attrs || "") + '>' +
+      return '<div class="item clickable" role="button" tabindex="0" ' + (attrs || "") + '>' +
         '<div class="item-line"><span class="item-title">' + renderItemText(title, "Untitled") + '</span>' +
         '<span class="muted">' + renderItemText(record.status || record.type || "", "") + '</span></div>' +
         '<div>' + renderItemText(record.text || record.rationale || record.description || record.content || "", "") + '</div>' +
@@ -3914,24 +4785,24 @@ function renderConsoleHtml() {
     }
 
     function renderBrowserTab(tab) {
-      return '<div class="item browser-tab" data-browser-tab-id="' + escapeHtml(tab.id) + '"><div class="item-line"><strong>' + escapeHtml(tab.title || "Untitled page") + '</strong><span class="chip">open</span></div><div class="muted">' + escapeHtml(tab.url || "about:blank") + '</div></div>';
+      return '<div class="item browser-tab" role="button" tabindex="0" data-browser-tab-id="' + escapeHtml(tab.id) + '"><div class="item-line"><strong>' + escapeHtml(tab.title || "Untitled page") + '</strong><span class="chip">open</span></div><div class="muted">' + escapeHtml(tab.url || "about:blank") + '</div></div>';
     }
 
     function renderApproval(approval) {
-      return '<div class="item approval-card"><div class="item-line"><strong>' + escapeHtml(approval.tool || "browser action") + '</strong><span class="chip warn">approval required</span></div><div class="approval-summary">' + escapeHtml(approval.summary || "External action requested.") + '</div><div class="row"><span class="muted">' + escapeHtml(approval.id || "") + '</span><button data-approve-id="' + escapeHtml(approval.id) + '" type="button">Approve once</button></div></div>';
+      return '<div class="item approval-card"><div class="item-line"><strong>' + escapeHtml(friendlyArea(approval.tool || "browser action")) + '</strong><span class="chip warn">waiting for you</span></div><div class="approval-summary">' + escapeHtml(approval.summary || "Ódinn wants to take an action on an external account.") + '</div><div class="row"><span class="muted">This permission will be used once.</span><button data-approve-id="' + escapeHtml(approval.id) + '" type="button">Allow once</button></div></div>';
     }
 
     async function refreshApprovals() {
       const approvals = await api("/approvals");
       $("cap-approval-count").textContent = approvals.length;
-      $("approval-list").innerHTML = approvals.map(renderApproval).join("") || '<div class="empty-state"><strong>No pending actions</strong><span>Ódinn Forge will stop before changing an external account.</span></div>';
+      $("approval-list").innerHTML = approvals.map(renderApproval).join("") || '<div class="empty-state"><strong>Nothing is waiting</strong><span>Ódinn will pause before changing an external account.</span></div>';
     }
 
     async function refreshBrowser() {
       try {
         const result = await api("/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tool: "browser.tabs", input: {} }) });
         const tabs = result.output?.tabs || [];
-        $("browser-tabs").innerHTML = tabs.map(renderBrowserTab).join("") || '<div class="empty-state"><strong>Browser is waiting</strong><span>Open a site to create the persistent beta profile.</span></div>';
+        $("browser-tabs").innerHTML = tabs.map(renderBrowserTab).join("") || '<div class="empty-state"><strong>Browser is waiting</strong><span>Open a site to begin.</span></div>';
         if (!state.browserTabId && tabs[0]) state.browserTabId = tabs[0].id;
         if (state.browserTabId) await inspectBrowserTab(state.browserTabId);
         $("cap-browser-status").textContent = "READY";
@@ -3986,28 +4857,38 @@ function renderConsoleHtml() {
         const status = await api("/status");
         state.status = status;
         renderExperimentalHome(status);
-        $("health").textContent = "Online";
         $("nav-health").textContent = "online";
         $("status-pill").textContent = "Online";
         $("workspace").textContent = compactPath(status.workspaceRoot) + " | " + compactPath(status.state);
         $("status-workspace").textContent = status.workspaceRoot;
         $("status-state").textContent = status.state;
         $("tool-count").textContent = status.tools.length + " capabilities";
+        $("product-version").textContent = "v" + (status.version || "development");
         $("provider-list").innerHTML = status.providers?.length
           ? status.providers.map(renderProvider).join("")
-          : '<div class="empty-state"><strong>No providers configured</strong><span>Run <code>pnpm odinn onboard --provider openai</code> to connect one.</span></div>';
+          : '<div class="empty-state"><strong>No providers connected</strong><span>Run <code>odinn onboard</code> in a terminal, then refresh this page.</span></div>';
         const modelSelect = $("model-select");
         const selectedModel = state.modelOverride || status.defaultModel;
-        modelSelect.innerHTML = status.models?.length
-          ? status.models.map((model) => '<option value="' + escapeHtml(model.id) + '">' + escapeHtml(model.id) + '</option>').join("")
+        const readyProviderNames = new Set((status.providers || []).filter((provider) => provider.configured && (provider.models || []).length > 0).map((provider) => provider.name));
+        const readyModels = (status.models || []).filter((model) => readyProviderNames.has(model.provider));
+        modelSelect.innerHTML = readyModels.length
+          ? readyModels.map((model) => '<option value="' + escapeHtml(model.id) + '">' + escapeHtml(model.id) + '</option>').join("")
           : '<option value="">Configure a provider first</option>';
-        const resolvedModel = status.models?.some((model) => model.id === selectedModel)
+        const resolvedModel = readyModels.some((model) => model.id === selectedModel)
           ? selectedModel
-          : (status.defaultModel || "");
+          : (readyModels[0]?.id || "");
         modelSelect.value = resolvedModel;
         if (state.modelOverride && resolvedModel !== state.modelOverride) state.modelOverride = "";
-        $("model-chip").textContent = status.models?.length ? (status.providers?.some((provider) => provider.configured) ? "provider ready" : "auth required") : "no model configured";
-        $("model-chip").className = "chip " + (status.models?.length && status.providers?.some((provider) => provider.configured) ? "ok" : "warn");
+        if (resolvedModel && resolvedModel !== status.defaultModel) state.modelOverride = resolvedModel;
+        const ready = readyModels.length > 0;
+        $("model-chip").textContent = ready ? "provider ready" : "provider required";
+        $("model-chip").className = "chip " + (ready ? "ok" : "warn");
+        $("model-select").disabled = !ready;
+        $("chat-input").disabled = !ready;
+        $("send-chat").disabled = !ready;
+        $("provider-cta").hidden = ready;
+        $("chat-input").placeholder = ready ? "Message Ódinn Forge..." : "Connect a provider to start chatting";
+        $("chat-status").textContent = ready ? "Ready" : "Provider required";
         $("metric-tools").textContent = status.tools.length;
         $("metric-policy").textContent = status.allowedCapabilities.length;
         $("runtime-chips").innerHTML = [
@@ -4016,9 +4897,17 @@ function renderConsoleHtml() {
           '<span class="chip">' + escapeHtml(status.tools.length) + ' tools</span>',
           '<span class="chip">' + escapeHtml(status.allowedCapabilities.length) + ' caps</span>'
         ].join("");
-        $("cap-web-status").textContent = status.security?.web?.enabled === false ? "OFF" : "READY";
-        $("cap-browser-status").textContent = status.security?.browser?.enabled === false ? "OFF" : "READY";
-        $("cap-security-mode").textContent = status.security?.browser?.requireApproval === false ? "OPEN" : "SAFE";
+        const webReady = status.security?.web?.enabled !== false && status.tools.includes("web.search");
+        const browserReady = status.security?.browser?.enabled !== false && status.tools.includes("browser.tabs");
+        const approvalRequired = status.security?.browser?.requireApproval !== false;
+        $("cap-web-status").textContent = webReady ? "READY" : "OFF";
+        $("cap-browser-status").textContent = browserReady ? "READY" : "OFF";
+        $("cap-security-mode").textContent = approvalRequired ? "REVIEW" : "DIRECT";
+        $("browser-approval-mode").textContent = approvalRequired ? "Approval required" : "Approval disabled";
+        $("browser-approval-mode").className = "chip " + (approvalRequired ? "ok" : "warn");
+        $("browser-approval-copy").textContent = approvalRequired
+          ? "Clicks, typing, and key presses pause here for explicit approval."
+          : "Browser actions can proceed without console approval under the current policy.";
         $("tool").innerHTML = status.tools.map((tool) => '<option value="' + escapeHtml(tool) + '">' + escapeHtml(tool) + '</option>').join("");
         $("cron-tool").innerHTML = status.tools.map((tool) => '<option value="' + escapeHtml(tool) + '">' + escapeHtml(tool) + '</option>').join("");
         $("tool-list").innerHTML = status.toolDetails.map((tool) => renderRecord(tool, tool.name, tool.capability + " | " + tool.description)).join("");
@@ -4034,7 +4923,6 @@ function renderConsoleHtml() {
         await Promise.allSettled(background);
         await refreshApprovals();
       } catch (error) {
-        $("health").textContent = "Error";
         $("nav-health").textContent = "error";
         $("status-pill").textContent = "Error";
         $("status-pill").className = "pill danger";
@@ -4047,7 +4935,7 @@ function renderConsoleHtml() {
       state.runs = runs;
       $("metric-runs").textContent = runs.length;
       $("metric-completed").textContent = runs.filter((run) => run.status === "completed").length;
-      $("runs").innerHTML = runs.slice(0, 12).map(renderRun).join("") || '<div class="muted">No runs yet.</div>';
+      $("runs").innerHTML = runs.slice(0, 4).map(renderRun).join("") || '<div class="muted">No runs yet.</div>';
       const planRuns = runs.filter((run) => run.tool === "plan" || String(run.id).startsWith("plan_"));
       $("run-history").innerHTML = runs.slice(0, 8).map(renderRun).join("") || '<div class="empty-state"><strong>No executions yet</strong><span>Run a capability to see its evidence here.</span></div>';
       $("plan-runs").innerHTML = planRuns.slice(0, 12).map(renderRun).join("") || '<div class="empty-state"><strong>No plan runs yet</strong><span>Choose a starter template and run it.</span></div>';
@@ -4056,8 +4944,20 @@ function renderConsoleHtml() {
     }
 
     async function refreshTasks() {
-      const data = await api("/tasks?includeSystem=" + String($("task-system-toggle")?.checked === true));
+      const params = new URLSearchParams({
+        includeSystem: String($("task-system-toggle")?.checked === true),
+        page: String(state.taskPage || 1),
+        pageSize: $("task-page-size")?.value || "25",
+        status: $("task-status-filter")?.value || "all",
+        category: $("task-category-filter")?.value || "all"
+      });
+      const query = $("task-query")?.value.trim();
+      if (query) params.set("q", query);
+      const data = await api("/tasks?" + params);
       state.tasks = data.tasks || [];
+      state.taskPagination = data.pagination || { page: 1, pages: 1, total: state.tasks.length, from: 0, to: state.tasks.length };
+      state.taskPage = state.taskPagination.page;
+      for (const task of state.tasks) if (state.taskSelection.has(task.id)) state.taskSelection.set(task.id, task);
       renderTasks();
       $("task-total").textContent = data.summary.total;
       $("task-running").textContent = data.summary.running;
@@ -4066,18 +4966,59 @@ function renderConsoleHtml() {
     }
 
     function renderTasks() {
-      const query = $("task-query")?.value.trim().toLowerCase() || "";
-      const status = $("task-status-filter")?.value || "all";
-      const category = $("task-category-filter")?.value || "all";
-      const filtered = (state.tasks || []).filter((task) => {
-        const statusMatches = status === "all" || (status === "active" && ["queued", "running", "cancelling", "awaiting_approval"].includes(task.status)) || (status === "review" && ["failed", "denied", "blocked", "cancelled", "needs-review"].includes(task.status)) || task.status === status;
-        return statusMatches && (category === "all" || task.category === category) && (!query || JSON.stringify(task).toLowerCase().includes(query));
-      });
-      $("task-table").innerHTML = filtered.map((task) => {
+      const tasks = state.tasks || [];
+      $("task-table").innerHTML = tasks.map((task) => {
         const tone = task.status === "completed" ? "ok" : ["queued", "running", "cancelling", "awaiting_approval"].includes(task.status) ? "warn" : "danger";
-        const record = task.evidenceCount ? task.evidenceCount + " proof records" : task.eventCount + " ledger events";
-        return '<div class="data-row task-row" data-task-id="' + escapeHtml(task.id) + '"><span class="data-primary"><strong>' + escapeHtml(task.title) + '</strong><small>' + escapeHtml(task.tool + " · " + task.id) + '</small></span><span class="chip ' + tone + '">' + escapeHtml(task.status) + '</span><span>' + escapeHtml(task.category) + '</span><span class="muted">' + escapeHtml(relativeTime(task.updatedAt)) + (task.durationMs !== null ? '<small> · ' + escapeHtml(formatDuration(task.durationMs)) + '</small>' : '') + '</span><span>' + escapeHtml(record) + '</span><span class="row"><button class="secondary" data-task-inspect="' + escapeHtml(task.id) + '" type="button">Inspect</button></span></div>';
-      }).join("") || '<div class="empty-state"><strong>No matching tasks</strong><span>The proof and audit ledger is quiet.</span></div>';
+        const record = task.evidenceCount ? task.evidenceCount + " checks" : task.eventCount + " updates";
+        const checked = state.taskSelection.has(task.id) ? " checked" : "";
+        const rowActions = '<button class="secondary" data-task-inspect="' + escapeHtml(task.id) + '" type="button">Inspect</button>' +
+          (task.replayable ? '<button class="secondary" data-task-replay="' + escapeHtml(task.id) + '" type="button">Run again</button>' : "") +
+          (task.cancellable ? '<button class="secondary" data-task-cancel="' + escapeHtml(task.id) + '" type="button">Stop</button>' : "");
+        return '<div class="data-row task-row" data-task-id="' + escapeHtml(task.id) + '"><label class="task-select-label"><input data-task-select="' + escapeHtml(task.id) + '" type="checkbox"' + checked + '><span class="task-select-copy"><strong>' + escapeHtml(friendlyTaskTitle(task)) + '</strong><small>' + escapeHtml(friendlyArea(task.tool)) + '</small></span></label><span class="chip ' + tone + '">' + escapeHtml(friendlyStatus(task.status)) + '</span><span>' + escapeHtml(friendlyTaskOrigin(task.category)) + '</span><span class="muted">' + escapeHtml(relativeTime(task.updatedAt)) + (task.durationMs !== null ? '<small> · ' + escapeHtml(formatDuration(task.durationMs)) + '</small>' : '') + '</span><span>' + escapeHtml(record) + '</span><span class="row">' + rowActions + '</span></div>';
+      }).join("") || '<div class="empty-state"><strong>No matching tasks</strong><span>There is no matching activity right now.</span></div>';
+      const pagination = state.taskPagination || { page: 1, pages: 1, total: 0, from: 0, to: 0 };
+      $("task-page-label").textContent = pagination.total ? "Page " + pagination.page + " of " + pagination.pages + " · " + pagination.from + "–" + pagination.to + " of " + pagination.total : "Page 1 of 1 · 0 tasks";
+      $("task-prev").disabled = pagination.page <= 1;
+      $("task-next").disabled = pagination.page >= pagination.pages;
+      updateTaskManagement();
+    }
+
+    function updateTaskManagement() {
+      const tasks = state.tasks || [];
+      const selected = state.taskSelection.size;
+      const selectedOnPage = tasks.filter((task) => state.taskSelection.has(task.id)).length;
+      $("task-select-page").checked = tasks.length > 0 && selectedOnPage === tasks.length;
+      $("task-select-page").indeterminate = selectedOnPage > 0 && selectedOnPage < tasks.length;
+      $("task-selection-count").textContent = selected ? selected + " selected" : "No tasks selected";
+      $("task-rerun-selected").disabled = !Array.from(state.taskSelection.values()).some((task) => task.replayable);
+      $("task-cancel-selected").disabled = !Array.from(state.taskSelection.values()).some((task) => task.cancellable);
+      $("task-clear-selection").disabled = selected === 0;
+    }
+
+    async function replayTask(id, { confirm = true } = {}) {
+      const task = state.taskSelection.get(id) || (state.tasks || []).find((entry) => entry.id === id);
+      if (!task?.replayable) return;
+      if (confirm && !window.confirm('Run “' + friendlyTaskTitle(task) + '” again with the same saved input?')) return;
+      return api("/runs/" + encodeURIComponent(id) + "/replay", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    }
+
+    async function cancelTask(id, { confirm = true } = {}) {
+      const task = state.taskSelection.get(id) || (state.tasks || []).find((entry) => entry.id === id);
+      if (!task?.cancellable) return;
+      if (confirm && !window.confirm('Stop “' + friendlyTaskTitle(task) + '”?')) return;
+      return api("/jobs/" + encodeURIComponent(id) + "/cancel", { method: "POST" });
+    }
+
+    async function runSelectedTaskAction(action) {
+      const eligible = Array.from(state.taskSelection.values()).filter((task) => action === "replay" ? task.replayable : task.cancellable);
+      if (!eligible.length) return;
+      const verb = action === "replay" ? "run again" : "stop";
+      if (!window.confirm(verb.charAt(0).toUpperCase() + verb.slice(1) + " " + eligible.length + " selected " + (eligible.length === 1 ? "task" : "tasks") + "?")) return;
+      const results = await Promise.allSettled(eligible.map((task) => action === "replay" ? replayTask(task.id, { confirm: false }) : cancelTask(task.id, { confirm: false })));
+      const failures = results.filter((result) => result.status === "rejected");
+      showOutput(failures.length ? (eligible.length - failures.length) + " completed; " + failures.length + " could not be changed." : eligible.length + (action === "replay" ? " tasks started again." : " tasks stopped."));
+      state.taskSelection.clear();
+      await refreshTasks();
     }
 
     function formatDuration(value) {
@@ -4091,15 +5032,15 @@ function renderConsoleHtml() {
       const detail = await api("/tasks/" + encodeURIComponent(id));
       state.selectedTaskId = id;
       const task = detail.task || {};
-      $("task-detail-label").textContent = task.title ? task.title + " · " + id : id;
+      $("task-detail-label").textContent = friendlyTaskTitle(task);
       $("task-summary").innerHTML = [
-        ["Outcome", task.status || "unknown"], ["Origin", task.category || task.actor || "unknown"],
-        ["Duration", formatDuration(task.durationMs)], ["Replay", task.replayable ? "Safe to retry" : task.replayReason || "Unavailable"]
+        ["Outcome", friendlyStatus(task.status || "unknown")], ["Started by", friendlyTaskOrigin(task.category || task.actor || "unknown")],
+        ["Duration", formatDuration(task.durationMs)], ["Run again", task.replayable ? "Available" : "Not available"]
       ].map(([label, value]) => '<div class="item"><div class="muted">' + escapeHtml(label) + '</div><strong>' + escapeHtml(value) + '</strong></div>').join("");
-      $("task-evidence").innerHTML = (detail.run?.events || []).map((event) => '<div class="timeline-row"><span class="timeline-dot"></span><div class="item"><div class="item-line"><strong>' + escapeHtml(event.type) + '</strong><span class="chip">' + escapeHtml(event.decision || "recorded") + '</span></div><div class="muted">' + escapeHtml(event.at) + '</div><div>' + escapeHtml(event.message || event.tool || "") + '</div></div></div>').join("") || '<div class="empty-state"><strong>No ledger events</strong><span>This task only has queue metadata.</span></div>';
-      $("task-raw").textContent = JSON.stringify(detail, null, 2);
+      $("task-evidence").innerHTML = (detail.run?.events || []).map((event) => '<div class="timeline-row"><span class="timeline-dot"></span><div class="item"><div class="item-line"><strong>' + escapeHtml(friendlyEventTitle(event)) + '</strong><span class="chip">' + escapeHtml(friendlyStatus(event.decision || "recorded")) + '</span></div><div class="muted">' + escapeHtml(relativeTime(event.at)) + '</div><div>' + escapeHtml(event.message || friendlyArea(event.tool) || "") + '</div></div></div>').join("") || '<div class="empty-state"><strong>No timeline yet</strong><span>This task has no recorded updates.</span></div>';
       $("task-verify").disabled = !detail.ledger;
       $("task-replay").disabled = !task.replayable;
+      $("task-cancel").disabled = !task.cancellable;
     }
 
     async function refreshUsage() {
@@ -4111,7 +5052,7 @@ function renderConsoleHtml() {
       $("usage-errors").textContent = summary.errors || 0;
       const max = Math.max(1, ...(data.days || []).map((day) => day.events));
       $("usage-chart").innerHTML = (data.days || []).map((day) => '<span class="bar-column" title="' + escapeHtml(day.day + ': ' + day.events + ' events · ' + day.tokens + ' tokens') + '"><i style="height:' + Math.max(3, Math.round(day.events / max * 165)) + 'px"></i><small>' + escapeHtml(day.day.slice(5)) + '</small></span>').join("");
-      $("runs").innerHTML = (data.runs || []).slice(0, 12).map(renderRun).join("") || '<div class="empty-state"><strong>No model usage yet</strong><span>Completed model and agent runs will appear here.</span></div>';
+      $("runs").innerHTML = (data.runs || []).slice(0, 4).map(renderRun).join("") || '<div class="empty-state"><strong>No model usage yet</strong><span>Completed model and agent runs will appear here.</span></div>';
     }
 
     async function refreshCron() {
@@ -4119,11 +5060,43 @@ function renderConsoleHtml() {
       state.cronJobs = data.jobs || [];
       const query = $("cron-query")?.value.trim().toLowerCase() || "";
       const jobs = state.cronJobs.filter((job) => !query || JSON.stringify(job).toLowerCase().includes(query));
-      $("cron-enabled").textContent = data.enabled ? "Yes" : "No";
+      $("cron-enabled").textContent = data.enabled ? "On" : "Off";
       $("cron-count").textContent = data.jobs.length;
       $("cron-next").textContent = data.nextWake ? new Date(data.nextWake).toLocaleString() : "—";
       $("cron-shown").textContent = jobs.length + " shown of " + data.jobs.length;
-      $("cron-list").innerHTML = jobs.map((job) => '<div class="cron-card"><div class="item-line"><strong>' + escapeHtml(job.name) + '</strong><span class="chip ' + (job.lastStatus === "error" ? "danger" : job.enabled ? "ok" : "") + '">' + escapeHtml(job.enabled ? (job.lastStatus || "enabled") : "disabled") + '</span></div><div class="cron-meta"><span>Cron ' + escapeHtml(job.schedule) + ' (' + escapeHtml(job.timezone) + ')</span><span>Tool: ' + escapeHtml(job.tool) + '</span><span>Last: ' + escapeHtml(relativeTime(job.lastRunAt)) + '</span></div><div class="row"><button class="secondary" data-cron-run="' + escapeHtml(job.id) + '" type="button">Run</button><button class="secondary" data-cron-toggle="' + escapeHtml(job.id) + '" data-enabled="' + escapeHtml(job.enabled) + '" type="button">' + (job.enabled ? "Disable" : "Enable") + '</button><button class="secondary" data-cron-delete="' + escapeHtml(job.id) + '" type="button">Delete</button></div></div>').join("") || '<div class="empty-state"><strong>No scheduled jobs</strong><span>Create a persisted recurring run.</span></div>';
+      $("cron-list").innerHTML = jobs.map((job) => '<div class="cron-card"><div class="item-line"><strong>' + escapeHtml(job.name) + '</strong><span class="chip ' + (job.lastStatus === "error" ? "danger" : job.enabled ? "ok" : "") + '">' + escapeHtml(job.enabled ? friendlyStatus(job.lastStatus || "active") : "Paused") + '</span></div><div class="cron-meta"><span>' + escapeHtml(describeSchedule(job.schedule, job.timezone)) + '</span><span>' + escapeHtml(friendlyArea(job.tool)) + '</span><span>Last run ' + escapeHtml(relativeTime(job.lastRunAt)) + '</span></div><div class="row"><button class="secondary" data-cron-run="' + escapeHtml(job.id) + '" type="button">Run now</button><button class="secondary" data-cron-toggle="' + escapeHtml(job.id) + '" data-enabled="' + escapeHtml(job.enabled) + '" type="button">' + (job.enabled ? "Pause" : "Resume") + '</button><button class="secondary" data-cron-delete="' + escapeHtml(job.id) + '" type="button">Delete</button></div></div>').join("") || '<div class="empty-state"><strong>No schedules yet</strong><span>Create one when you want Ódinn to repeat an action.</span></div>';
+    }
+
+    function describeSchedule(value, timezone) {
+      const parts = String(value || "").trim().split(/\s+/);
+      if (parts.length !== 5) return "Custom schedule";
+      const [minute, hour, day, month, weekday] = parts;
+      const time = hour !== "*" && minute !== "*" ? new Date(2000, 0, 1, Number(hour), Number(minute)).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+      const zone = timezone ? " · " + timezone.replace(/_/g, " ") : "";
+      if (minute === "0" && hour === "*" && day === "*" && month === "*" && weekday === "*") return "Every hour" + zone;
+      if (day === "*" && month === "*" && weekday === "1-5") return "Weekdays at " + time + zone;
+      if (day === "*" && month === "*" && weekday === "*") return "Every day at " + time + zone;
+      if (day === "*" && month === "*" && /^[0-6]$/.test(weekday)) {
+        const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+        return "Every " + days[Number(weekday)] + " at " + time + zone;
+      }
+      return "Custom schedule" + zone;
+    }
+
+    function updateSchedulePattern() {
+      const frequency = $("cron-frequency").value;
+      const [hour, minute] = ($("cron-time").value || "09:00").split(":");
+      $("cron-weekday-field").hidden = frequency !== "weekly";
+      $("cron-time-field").hidden = frequency === "hourly" || frequency === "custom";
+      $("cron-custom-options").open = frequency === "custom";
+      if (frequency === "custom") return;
+      $("cron-schedule").value = frequency === "hourly"
+        ? "0 * * * *"
+        : frequency === "weekdays"
+          ? minute + " " + hour + " * * 1-5"
+          : frequency === "weekly"
+            ? minute + " " + hour + " * * " + $("cron-weekday").value
+            : minute + " " + hour + " * * *";
     }
 
     async function refreshAgents() {
@@ -4134,20 +5107,53 @@ function renderConsoleHtml() {
       $("agent-total").textContent = state.agents.length;
       $("agent-enabled").textContent = state.agents.filter((agent) => agent.status === "enabled").length;
       $("agent-quarantined").textContent = state.agents.filter((agent) => agent.status === "quarantined").length;
-      $("agent-list").innerHTML = agents.map((agent) => '<div class="item agent-package ' + (agent.id === state.selectedAgentId ? "selected" : "") + '" data-agent-id="' + escapeHtml(agent.id) + '"><div class="item-line"><strong>' + escapeHtml(agent.name) + '</strong><span class="chip ' + (agent.status === "enabled" ? "ok" : agent.status === "quarantined" ? "danger" : "") + '">' + escapeHtml(agent.status) + '</span></div><div class="muted">' + escapeHtml(agent.id + '@' + agent.version) + '</div><div class="chip-row"><span class="chip">' + escapeHtml((agent.tools || []).length + " tools") + '</span><span class="chip">' + escapeHtml((agent.plugins || []).length + " plugins") + '</span><span class="chip">' + escapeHtml((agent.tests || []).length + " tests") + '</span></div></div>').join("") || '<div class="empty-state"><strong>No agent packages installed</strong><span>Install an Agent SDK v0.3 manifest to start.</span></div>';
+      $("agent-list").innerHTML = agents.map((agent) => '<div class="item agent-package ' + (agent.id === state.selectedAgentId ? "selected" : "") + '" role="button" tabindex="0" data-agent-id="' + escapeHtml(agent.id) + '"><div class="item-line"><strong>' + escapeHtml(agent.name) + '</strong><span class="chip ' + (agent.status === "enabled" ? "ok" : agent.status === "quarantined" ? "danger" : "") + '">' + escapeHtml(friendlyAgentStatus(agent.status)) + '</span></div><div class="muted">' + escapeHtml(agent.description || agent.identity?.description || "Specialized agent") + '</div><div class="chip-row"><span class="chip">' + escapeHtml((agent.tools || []).length + " action" + ((agent.tools || []).length === 1 ? "" : "s")) + '</span><span class="chip">' + escapeHtml((agent.plugins || []).length + " add-on" + ((agent.plugins || []).length === 1 ? "" : "s")) + '</span><span class="chip">Version ' + escapeHtml(agent.version || "1") + '</span></div></div>').join("") || '<div class="empty-state"><strong>No agents yet</strong><span>Add one when you have a recurring kind of work to delegate.</span></div>';
       if (state.selectedAgentId) renderAgentDetail(state.agents.find((agent) => agent.id === state.selectedAgentId));
     }
 
     function renderAgentDetail(agent) {
       if (!agent) return;
       state.selectedAgentId = agent.id;
-      $("agent-detail-status").textContent = agent.status;
+      $("agent-detail-status").textContent = friendlyAgentStatus(agent.status);
       $("agent-detail-status").className = "chip " + (agent.status === "enabled" ? "ok" : agent.status === "quarantined" ? "danger" : "");
-      const sections = ["identity", "instructions", "tools", "plugins", "secrets", "sandbox", "network", "schedules", "channels", "memory", "tests", "integrity"];
+      const sections = [
+        ["Identity", agent.identity],
+        ["Instructions", agent.instructions],
+        ["Available actions", agent.tools],
+        ["Add-ons", agent.plugins],
+        ["Connected services", agent.network?.allow || agent.network],
+        ["Scheduled work", agent.schedules],
+        ["Memory", agent.memory],
+        ["Checks", agent.tests],
+        ["Package health", agent.integrity ? "Recorded and ready to verify" : "No package health information"]
+      ];
       $("agent-detail").className = "agent-inspector";
-      $("agent-detail").innerHTML = sections.map((name) => '<div class="agent-section"><strong>' + escapeHtml(name) + '</strong><pre>' + escapeHtml(JSON.stringify(agent[name], null, 2)) + '</pre></div>').join("");
+      $("agent-detail").innerHTML = sections.filter(([, value]) => hasHumanValue(value)).map(([label, value]) => renderHumanSection(label, value)).join("") || '<div class="empty-state"><strong>No additional setup</strong><span>This agent has no extra requirements.</span></div>';
       ["agent-enable", "agent-disable", "agent-quarantine"].forEach((id) => $(id).disabled = false);
       document.querySelectorAll("[data-agent-id]").forEach((item) => item.classList.toggle("selected", item.dataset.agentId === agent.id));
+    }
+
+    function friendlyAgentStatus(value) {
+      return value === "enabled" ? "Available" : value === "quarantined" ? "Set aside" : "Off";
+    }
+
+    function hasHumanValue(value) {
+      if (Array.isArray(value)) return value.length > 0;
+      if (value && typeof value === "object") return Object.keys(value).length > 0;
+      return value !== undefined && value !== null && value !== "";
+    }
+
+    function renderHumanSection(label, value) {
+      let content;
+      if (Array.isArray(value)) {
+        content = '<div class="chip-row">' + (value.length ? value.map((item) => '<span class="chip">' + escapeHtml(friendlyArea(typeof item === "string" ? item : item?.name || "Configured")) + '</span>').join("") : '<span class="muted">None</span>') + '</div>';
+      } else if (value && typeof value === "object") {
+        const entries = Object.entries(value).filter(([key]) => !/id|hash|digest|path|token|secret/i.test(key));
+        content = '<div class="detail-grid">' + entries.map(([key, item]) => '<div class="detail-card"><span>' + escapeHtml(friendlyStatus(key)) + '</span><strong>' + escapeHtml(Array.isArray(item) ? item.map((entry) => typeof entry === "string" ? friendlyArea(entry) : "Configured").join(", ") || "None" : typeof item === "boolean" ? item ? "Yes" : "No" : typeof item === "object" ? "Configured" : friendlyStatus(item)) + '</strong></div>').join("") + '</div>';
+      } else {
+        content = '<p>' + escapeHtml(String(value)) + '</p>';
+      }
+      return '<div class="agent-section"><strong>' + escapeHtml(label) + '</strong>' + content + '</div>';
     }
 
     async function refreshSkills() {
@@ -4160,27 +5166,40 @@ function renderConsoleHtml() {
       $("skill-enabled").textContent = state.skills.filter((skill) => skill.status === "enabled").length;
       $("skill-unmanaged").textContent = state.skills.filter((skill) => skill.status === "unmanaged" || skill.status === "draft").length;
       $("skill-quarantined").textContent = state.skills.filter((skill) => skill.status === "quarantined").length;
-      $("skills-list").innerHTML = skills.map((skill) => '<div class="item skill-card ' + (skill.id === state.selectedSkillId ? "selected" : "") + '" data-skill-id="' + escapeHtml(skill.id) + '"><div class="item-line"><strong>' + escapeHtml(skill.name) + '</strong><span class="chip ' + (skill.status === "enabled" ? "ok" : skill.status === "quarantined" ? "danger" : "warn") + '">' + escapeHtml(skill.status) + '</span></div><p>' + escapeHtml(skill.description || "No description") + '</p><div class="muted skill-path">' + escapeHtml(skill.path || skill.entrypoint || "") + '</div><div class="chip-row"><span class="chip">' + escapeHtml(skill.source || "managed") + '</span><span class="chip">' + escapeHtml(skill.version || (skill.bytes ? skill.bytes + " bytes" : "package")) + '</span></div></div>').join("") || '<div class="empty-state"><strong>No matching skills</strong><span>Create a managed Skill SDK package or change the filter.</span></div>';
+      $("skills-list").innerHTML = skills.map((skill) => '<div class="item skill-card ' + (skill.id === state.selectedSkillId ? "selected" : "") + '" role="button" tabindex="0" data-skill-id="' + escapeHtml(skill.id) + '"><div class="item-line"><strong>' + escapeHtml(skill.name) + '</strong><span class="chip ' + (skill.status === "enabled" ? "ok" : skill.status === "quarantined" ? "danger" : "warn") + '">' + escapeHtml(friendlySkillStatus(skill.status)) + '</span></div><p>' + escapeHtml(skill.description || "No description yet") + '</p><div class="chip-row"><span class="chip">' + escapeHtml(friendlySkillSource(skill.source)) + '</span><span class="chip">' + escapeHtml(skill.version ? "Version " + skill.version : "Local skill") + '</span></div></div>').join("") || '<div class="empty-state"><strong>No matching skills</strong><span>Create a skill or change the filter.</span></div>';
       if (state.selectedSkillId) renderSkillDetail(state.skills.find((skill) => skill.id === state.selectedSkillId));
     }
 
     function renderSkillDetail(skill) {
       if (!skill) return;
       state.selectedSkillId = skill.id;
-      $("skill-detail-status").textContent = skill.status;
+      $("skill-detail-status").textContent = friendlySkillStatus(skill.status);
       $("skill-detail-status").className = "chip " + (skill.status === "enabled" ? "ok" : skill.status === "quarantined" ? "danger" : "warn");
       const requirements = [
-        ["Tools", skill.requestedTools || []], ["Capabilities", skill.requestedCapabilities || []], ["Secrets", skill.requestedSecrets || []],
-        ["Network", skill.network?.allow || []], ["Integrity", skill.verification?.valid === true ? "verified" : skill.verification?.valid === false ? "failed" : skill.integrity ? "recorded" : "unmanaged"], ["Source", skill.source || "managed"]
+        ["Actions it can use", skill.requestedTools || []], ["Access it requests", skill.requestedCapabilities || []], ["Connected accounts", skill.requestedSecrets || []],
+        ["Websites it can contact", skill.network?.allow || []], ["Package check", skill.verification?.valid === true ? "Passed" : skill.verification?.valid === false ? "Needs attention" : skill.integrity ? "Ready to check" : "Local skill"], ["Where it came from", friendlySkillSource(skill.source)]
       ];
       $("skill-detail").className = "agent-inspector";
-      $("skill-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(skill.name) + '</strong><p>' + escapeHtml(skill.description || "No description") + '</p><div class="muted">' + escapeHtml(skill.id + (skill.version ? "@" + skill.version : "")) + '</div></div>' + requirements.map(([label, value]) => '<div class="agent-section"><strong>' + escapeHtml(label) + '</strong><pre>' + escapeHtml(Array.isArray(value) ? (value.join("\\n") || "None") : value) + '</pre></div>').join("");
+      $("skill-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(skill.name) + '</strong><p>' + escapeHtml(skill.description || "No description") + '</p></div>' + requirements.map(([label, value]) => renderHumanSection(label, value)).join("");
       const managed = skill.source === "managed";
       $("skill-enable").disabled = !managed || skill.status === "enabled";
       $("skill-disable").disabled = !managed || skill.status === "disabled";
       $("skill-verify").disabled = !managed;
       $("skill-quarantine").disabled = !managed || skill.status === "quarantined";
       document.querySelectorAll("[data-skill-id]").forEach((item) => item.classList.toggle("selected", item.dataset.skillId === skill.id));
+    }
+
+    function friendlySkillStatus(value) {
+      if (value === "enabled") return "Available";
+      if (value === "quarantined") return "Set aside";
+      if (value === "unmanaged" || value === "draft") return "Found locally";
+      return "Off";
+    }
+
+    function friendlySkillSource(value) {
+      if (value === "managed") return "Created in Ódinn";
+      if (value === "legacy-extension") return "Imported extension";
+      return "Found in this workspace";
     }
 
     async function refreshProjects() {
@@ -4197,7 +5216,7 @@ function renderConsoleHtml() {
       $("project-session-count").textContent = state.projects.reduce((sum, project) => sum + Number(project.sessionCount || 0), 0);
       $("project-goal-count").textContent = state.projects.reduce((sum, project) => sum + Number(project.goalCount || 0), 0);
       $("project-active-goal-count").textContent = state.projects.reduce((sum, project) => sum + Number(project.activeGoalCount || 0), 0);
-      $("project-list").innerHTML = projects.map((project) => '<div class="item project-card ' + (project.id === state.selectedProjectId ? "selected" : "") + '" data-project-id="' + escapeHtml(project.id) + '"><div class="item-line"><strong>' + escapeHtml(project.name) + '</strong><span class="chip ' + (project.status === "active" ? "ok" : "") + '">' + escapeHtml(project.status) + '</span></div><p>' + escapeHtml(project.description || "No description") + '</p><div class="chip-row"><span class="chip">' + escapeHtml(project.sessionCount + " sessions") + '</span><span class="chip">' + escapeHtml(project.goalCount + " goals") + '</span></div></div>').join("") || '<div class="empty-state"><strong>No matching projects</strong><span>Create one or clear the filter.</span></div>';
+      $("project-list").innerHTML = projects.map((project) => '<div class="item project-card ' + (project.id === state.selectedProjectId ? "selected" : "") + '" role="button" tabindex="0" data-project-id="' + escapeHtml(project.id) + '"><div class="item-line"><strong>' + escapeHtml(project.name) + '</strong><span class="chip ' + (project.status === "active" ? "ok" : "") + '">' + escapeHtml(project.status) + '</span></div><p>' + escapeHtml(project.description || "No description") + '</p><div class="chip-row"><span class="chip">' + escapeHtml(project.sessionCount + " sessions") + '</span><span class="chip">' + escapeHtml(project.goalCount + " goals") + '</span></div></div>').join("") || '<div class="empty-state"><strong>No matching projects</strong><span>Create one or clear the filter.</span></div>';
       populateScopeSelectors();
       renderProjectDetail(state.projects.find((project) => project.id === state.selectedProjectId));
     }
@@ -4209,11 +5228,17 @@ function renderConsoleHtml() {
       const goals = (state.goals || []).filter((goal) => goal.projectId === project.id);
       $("project-detail-status").textContent = project.status;
       $("project-detail").className = "agent-inspector";
-      $("project-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(project.name) + '</strong><p>' + escapeHtml(project.description || "No description") + '</p><div class="muted">' + escapeHtml(project.id) + '</div></div><div class="agent-section"><strong>Sessions</strong><pre>' + escapeHtml(sessions.map((session) => session.title).join("\\n") || "None") + '</pre></div><div class="agent-section"><strong>Goals</strong><pre>' + escapeHtml(goals.map((goal) => goal.status + " · " + goal.title).join("\\n") || "None") + '</pre></div>';
+      $("project-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(project.name) + '</strong><p>' + escapeHtml(project.description || "No description") + '</p></div>' +
+        '<div class="agent-section"><strong>Sessions</strong>' + renderNamedList(sessions.map((session) => session.title), "No sessions yet") + '</div>' +
+        '<div class="agent-section"><strong>Goals</strong>' + renderNamedList(goals.map((goal) => friendlyStatus(goal.status) + " · " + goal.title), "No goals yet") + '</div>';
       $("project-open-sessions").disabled = false;
       $("project-open-goals").disabled = false;
       $("project-archive").disabled = project.id === "project_default" || project.status === "archived";
       document.querySelectorAll("[data-project-id]").forEach((item) => item.classList.toggle("selected", item.dataset.projectId === project.id));
+    }
+
+    function renderNamedList(values, emptyText) {
+      return values.length ? '<ul class="human-list">' + values.map((value) => '<li>' + escapeHtml(value) + '</li>').join("") + '</ul>' : '<p class="muted">' + escapeHtml(emptyText) + '</p>';
     }
 
     function populateScopeSelectors() {
@@ -4223,6 +5248,8 @@ function renderConsoleHtml() {
       if ($("goal-project-filter")) { const selected = $("goal-project-filter").value; $("goal-project-filter").innerHTML = allProjectOptions; $("goal-project-filter").value = selected && [...$("goal-project-filter").options].some((option) => option.value === selected) ? selected : "all"; }
       updateGoalScopeOptions();
       updateMemoryScopeOptions();
+      if (state.memoryCandidates?.length) renderMemoryCandidates();
+      if (state.memories?.length) renderMemoryLibrary();
     }
 
     function updateGoalScopeOptions() {
@@ -4233,58 +5260,195 @@ function renderConsoleHtml() {
 
     function updateMemoryScopeOptions() {
       const type = $("memory-scope-type")?.value || "global";
+      $("memory-scope-target-field").hidden = type === "global";
       $("memory-scope-id").disabled = type === "global";
       const values = type === "session" ? (state.sessions || []).map((session) => [session.id, session.title]) : type === "project" ? (state.projects || []).map((project) => [project.id, project.name]) : [["", "Available everywhere"]];
       $("memory-scope-id").innerHTML = values.map(([id, name]) => '<option value="' + escapeHtml(id) + '">' + escapeHtml(name) + '</option>').join("");
     }
 
+    function setMemoryTab(tab, userInitiated = false) {
+      const next = tab === "saved" ? "saved" : "suggestions";
+      state.memoryTab = next;
+      if (userInitiated) state.memoryTabInitialized = true;
+      const suggestions = next === "suggestions";
+      $("memory-tab-suggestions").classList.toggle("active", suggestions);
+      $("memory-tab-suggestions").setAttribute("aria-selected", String(suggestions));
+      $("memory-tab-suggestions").tabIndex = suggestions ? 0 : -1;
+      $("memory-tab-saved").classList.toggle("active", !suggestions);
+      $("memory-tab-saved").setAttribute("aria-selected", String(!suggestions));
+      $("memory-tab-saved").tabIndex = suggestions ? -1 : 0;
+      $("memory-suggestions-panel").hidden = !suggestions;
+      $("memory-saved-panel").hidden = suggestions;
+    }
+
     async function refreshMemory() {
-      const query = $("memory-query").value.trim();
-      const kind = $("memory-kind-filter").value;
-      const scopeType = $("memory-scope-filter").value;
-      const params = new URLSearchParams({ limit: "100" });
-      if (query) params.set("query", query);
-      if (kind) params.set("kind", kind);
-      if (scopeType) params.set("scopeType", scopeType);
       const health = await api("/memory/status");
       state.memoryHealth = health;
       $("memory-new-toggle").disabled = !health.integration?.writeAllowed;
       if (!health.integration?.readAllowed) {
         $("memory-record-count").textContent = "—";
-        $("memory-namespace-count").textContent = "—";
-        $("memory-recall-status").textContent = "OFF";
-        $("memory-last-update").textContent = "—";
+        $("memory-candidate-count").textContent = "—";
+        $("memory-recall-status").textContent = "Recall off";
+        $("memory-last-update").textContent = "Unavailable";
         $("memory-health").textContent = "Memory permission required";
         $("memory-health").className = "chip danger";
+        $("memory-status-copy").textContent = "Ódinn cannot read or manage memory under the current policy.";
         $("memory-result-count").textContent = "Unavailable";
-        $("memory-list").innerHTML = '<div class="empty-state"><strong>Memory is disabled by policy</strong><span>Enable memory.read to inspect and recall durable context.</span></div>';
-        $("memory-tree").innerHTML = '<div class="empty-state"><strong>Context map unavailable</strong><span>No memory contents were read.</span></div>';
+        $("memory-candidate-badge").textContent = "Unavailable";
+        $("memory-tab-suggestions-count").textContent = "—";
+        $("memory-tab-saved-count").textContent = "—";
+        $("memory-candidate-list").innerHTML = '<div class="empty-state memory-empty"><strong>Suggestions are unavailable</strong><span>Memory access is turned off for this workspace.</span></div>';
+        $("memory-list").innerHTML = '<div class="empty-state memory-empty"><strong>Saved memories are unavailable</strong><span>Memory access is turned off for this workspace.</span></div>';
+        $("memory-tree").innerHTML = '<div class="empty-state"><strong>Organization unavailable</strong><span>No saved context was read.</span></div>';
         return;
       }
-      const data = await api("/memory?" + params);
-      const tree = await api("/memory/browse?limit=100");
+      const [data, tree, candidateData] = await Promise.all([
+        api("/memory?limit=100"),
+        api("/memory/browse?limit=100"),
+        api("/memory/candidates?status=pending&limit=100")
+      ]);
       state.memories = data.memories || [];
+      state.memoryCandidates = candidateData.candidates || [];
       $("memory-record-count").textContent = health.records || 0;
-      $("memory-namespace-count").textContent = health.namespaces || 0;
-      $("memory-recall-status").textContent = health.integration?.readAllowed && health.integration?.autoRecall ? "ON" : "OFF";
-      $("memory-last-update").textContent = health.latestAt ? relativeTime(health.latestAt) : "—";
+      $("memory-candidate-count").textContent = state.memoryCandidates.length;
+      $("memory-tab-suggestions-count").textContent = state.memoryCandidates.length;
+      $("memory-tab-saved-count").textContent = health.records || 0;
+      $("memory-recall-status").textContent = health.integration?.autoRecall ? "Recall on" : "Recall off";
+      $("memory-last-update").textContent = health.latestAt ? "Updated " + relativeTime(health.latestAt) : "No saved memories yet";
       const healthy = health.integration?.readAllowed && health.integration?.writeAllowed;
-      $("memory-health").textContent = healthy ? "Memory online" : "Permission required";
+      $("memory-health").textContent = healthy ? "On" : "Read only";
       $("memory-health").className = "chip " + (healthy ? "ok" : "danger");
-      $("memory-result-count").textContent = state.memories.length + " records";
-      $("memory-list").innerHTML = state.memories.map((memory) => '<div class="item memory-card ' + (memory.id === state.selectedMemoryId ? "selected" : "") + '" data-memory-id="' + escapeHtml(memory.id) + '"><div class="item-line"><strong>' + escapeHtml(memory.subject || memory.kind) + '</strong><span class="chip">' + escapeHtml(memory.kind) + '</span></div><p>' + escapeHtml(memory.summary || memory.text) + '</p><div class="scope-label">' + escapeHtml((memory.scopeType || "global") + (memory.scopeId ? " · " + memory.scopeId : "")) + '</div><div class="muted">' + escapeHtml(memory.authority || memory.source || "unknown source") + ' · ' + escapeHtml(relativeTime(memory.at)) + '</div></div>').join("") || '<div class="empty-state"><strong>No matching memory</strong><span>Try another search or add a durable fact.</span></div>';
-      $("memory-tree").innerHTML = (tree.namespaces || []).map((entry) => '<div class="item"><div class="item-line"><strong>' + escapeHtml(entry.namespace) + '</strong><span class="chip">' + escapeHtml(entry.count + " records") + '</span></div><div class="muted">' + escapeHtml(Object.entries(entry.tiers || {}).map(([tier, count]) => tier + ":" + count).join(" · ")) + '</div></div>').join("") || '<div class="empty-state"><strong>No namespaces yet</strong><span>New durable context will appear here.</span></div>';
-      if (state.selectedMemoryId) renderMemoryDetail(state.memories.find((memory) => memory.id === state.selectedMemoryId));
+      $("memory-status-copy").textContent = health.integration?.autoLearn
+        ? (health.integration?.autoRecall ? "Ódinn suggests useful details and recalls only the memories you keep." : "Ódinn can suggest useful details, but automatic recall is turned off.")
+        : "Automatic suggestions are off. You can still add and manage saved memories here.";
+      $("memory-tree").innerHTML = (tree.namespaces || []).map((entry) => '<div class="item"><div class="item-line"><strong>' + escapeHtml(friendlyMemoryNamespace(entry.namespace)) + '</strong><span class="chip">' + escapeHtml(entry.count + " memories") + '</span></div><div class="muted">' + escapeHtml(Object.entries(entry.tiers || {}).map(([tier, count]) => memoryTierLabel(tier) + ": " + count).join(" · ")) + '</div></div>').join("") || '<div class="empty-state"><strong>No memory groups yet</strong><span>New durable context will appear here.</span></div>';
+      renderMemoryLibrary();
+      renderMemoryCandidates();
+      if (!state.memoryTabInitialized) {
+        setMemoryTab(state.memoryCandidates.length ? "suggestions" : "saved");
+        state.memoryTabInitialized = true;
+      } else {
+        setMemoryTab(state.memoryTab);
+      }
+    }
+
+    function renderMemoryLibrary() {
+      const query = $("memory-query").value.trim().toLowerCase();
+      const kind = $("memory-kind-filter").value;
+      const scopeType = $("memory-scope-filter").value;
+      const memories = (state.memories || []).filter((memory) => {
+        if (kind && memory.kind !== kind) return false;
+        if (scopeType && (memory.scopeType || "global") !== scopeType) return false;
+        if (!query) return true;
+        const searchable = [memory.subject, memory.summary, memory.text, ...(memory.tags || [])].filter(Boolean).join(" ").toLowerCase();
+        return query.split(/\s+/).filter(Boolean).every((term) => searchable.includes(term));
+      });
+      $("memory-result-count").textContent = memories.length + (memories.length === 1 ? " saved memory" : " saved memories");
+      $("memory-list").innerHTML = memories.map((memory) => '<button class="item memory-card ' + (memory.id === state.selectedMemoryId ? "selected" : "") + '" type="button" data-memory-id="' + escapeHtml(memory.id) + '"><div class="item-line"><strong>' + escapeHtml(memory.subject || friendlyStatus(memory.kind)) + '</strong><span class="chip">' + escapeHtml(friendlyStatus(memory.kind)) + '</span></div><p>' + escapeHtml(memory.summary || memory.text) + '</p><div class="scope-label">' + escapeHtml(memoryScopeLabel(memory)) + '</div><div class="muted">' + escapeHtml(memorySourceLabel(memory)) + ' · ' + escapeHtml(relativeTime(memory.at)) + '</div></button>').join("") || '<div class="empty-state memory-empty"><strong>No saved memories found</strong><span>' + (query || kind || scopeType ? "Try clearing a filter." : "Add a lasting preference, fact, or decision when you want Ódinn to remember it.") + '</span></div>';
+      const selectedMemory = memories.find((memory) => memory.id === state.selectedMemoryId)
+        || (matchMedia("(max-width: 600px)").matches ? undefined : memories[0]);
+      if (selectedMemory) renderMemoryDetail(selectedMemory);
+      else clearMemoryDetail();
+    }
+
+    function renderMemoryCandidates() {
+      const candidates = state.memoryCandidates || [];
+      const canDecide = state.memoryHealth?.integration?.writeAllowed === true;
+      $("memory-candidate-badge").textContent = candidates.length + (candidates.length === 1 ? " to review" : " to review");
+      $("memory-candidate-badge").className = "chip " + (candidates.length ? "warn" : "ok");
+      $("memory-candidate-list").innerHTML = candidates.map((candidate) => {
+        const destinationOptions = [
+          ["original", "Suggested · " + memoryScopeLabel(candidate)],
+          ["global", "Everywhere"],
+          ...(state.projects || []).filter((project) => project.status === "active").map((project) => ["project:" + project.id, "Project · " + project.name])
+        ];
+        return '<article class="memory-suggestion-card"><div class="memory-suggestion-meta"><span class="chip">' + escapeHtml(friendlyStatus(candidate.kind)) + '</span><span class="muted">' + escapeHtml(memoryCandidateOriginLabel(candidate)) + ' · ' + escapeHtml(relativeTime(candidate.at)) + '</span></div><h3>' + escapeHtml(candidate.subject || "Suggested memory") + '</h3><p>' + escapeHtml(candidate.summary || candidate.text) + '</p><label class="memory-destination"><span>Use this memory in</span><select data-memory-candidate-destination="' + escapeHtml(candidate.id) + '" aria-label="Where to use ' + escapeHtml(candidate.subject || "this memory") + '">' + destinationOptions.map(([value, label]) => '<option value="' + escapeHtml(value) + '">' + escapeHtml(label) + '</option>').join("") + '</select></label><div class="memory-suggestion-actions"><button type="button" data-memory-candidate-keep="' + escapeHtml(candidate.id) + '"' + (canDecide ? "" : " disabled") + '>Keep memory</button><button class="secondary" type="button" data-memory-candidate-dismiss="' + escapeHtml(candidate.id) + '"' + (canDecide ? "" : " disabled") + '>Dismiss</button></div></article>';
+      }).join("") || '<div class="empty-state memory-empty"><strong>You are all caught up</strong><span>New suggestions will appear here after Ódinn notices something useful in a conversation.</span><div class="row"><button class="secondary" type="button" data-memory-tab-target="saved">View saved memories</button></div></div>';
+    }
+
+    async function decideMemoryCandidate(candidateId, decision, button) {
+      const candidate = state.memoryCandidates.find((entry) => entry.id === candidateId);
+      if (!candidate) return;
+      if (decision === "rejected" && !window.confirm('Dismiss "' + (candidate.subject || "this suggestion") + '"?')) return;
+      const destination = document.querySelector('[data-memory-candidate-destination="' + CSS.escape(candidateId) + '"]')?.value || "original";
+      const body = { decision };
+      if (decision === "accepted" && destination === "global") body.scopeType = "global";
+      if (decision === "accepted" && destination.startsWith("project:")) {
+        body.scopeType = "project";
+        body.scopeId = destination.slice("project:".length);
+      }
+      setBusy(button, true);
+      const result = await api("/memory/candidates/" + encodeURIComponent(candidateId) + "/decision", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      if (result.memory?.id) state.selectedMemoryId = result.memory.id;
+      const wasLast = state.memoryCandidates.length === 1;
+      if (decision === "accepted" && wasLast) setMemoryTab("saved");
+      showOutput(decision === "accepted" ? "Memory saved." : "Suggestion dismissed.");
+      await refreshMemory();
+    }
+
+    function clearMemoryDetail() {
+      state.selectedMemoryId = "";
+      $("memory-detail-panel").hidden = true;
+      $("memory-detail-kind").textContent = "No selection";
+      $("memory-detail").className = "empty-state";
+      $("memory-detail").innerHTML = '<strong>Choose a saved memory</strong><span>You will see what Ódinn remembers and where it can use it.</span>';
+      $("memory-correct").disabled = true;
+      $("memory-forget").disabled = true;
+      $("memory-recall-result").hidden = true;
     }
 
     function renderMemoryDetail(memory) {
       if (!memory) return;
       state.selectedMemoryId = memory.id;
-      $("memory-detail-kind").textContent = memory.kind;
+      $("memory-detail-panel").hidden = false;
+      $("memory-detail-kind").textContent = friendlyStatus(memory.kind);
       $("memory-detail").className = "agent-inspector";
-      $("memory-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(memory.subject || memory.kind) + '</strong><p>' + escapeHtml(memory.text) + '</p></div>' + [["Scope", (memory.scopeType || "global") + (memory.scopeId ? " · " + memory.scopeId : "")], ["Source", memory.source || "unknown"], ["Authority", memory.authority || "unknown"], ["Confidence", memory.confidence ?? "—"], ["Namespace", memory.namespace || "general"], ["Recorded", memory.at || "—"]].map(([label, value]) => '<div class="agent-section"><strong>' + escapeHtml(label) + '</strong><pre>' + escapeHtml(value) + '</pre></div>').join("");
+      $("memory-detail").innerHTML = '<div class="agent-section"><strong>' + escapeHtml(memory.subject || friendlyStatus(memory.kind)) + '</strong><p>' + escapeHtml(memory.text) + '</p></div><div class="detail-grid">' +
+        [["Applies to", memoryScopeLabel(memory)], ["Added", memorySourceLabel(memory)], ["Saved", relativeTime(memory.at)]].map(([label, value]) => '<div class="detail-card"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(value) + '</strong></div>').join("") + '</div><details class="advanced-options"><summary>Technical details</summary><p>Confidence: ' + escapeHtml(memoryConfidenceLabel(memory.confidence)) + ' · Type: ' + escapeHtml(friendlyStatus(memory.kind)) + '</p></details>';
       $("memory-correct").disabled = !state.memoryHealth?.integration?.writeAllowed;
+      $("memory-forget").disabled = !state.memoryHealth?.integration?.writeAllowed;
+      $("memory-recall-result").hidden = true;
       document.querySelectorAll("[data-memory-id]").forEach((item) => item.classList.toggle("selected", item.dataset.memoryId === memory.id));
+    }
+
+    function memoryScopeLabel(memory) {
+      if (memory.scopeType === "project") return "Project · " + ((state.projects || []).find((project) => project.id === memory.scopeId)?.name || "One project");
+      if (memory.scopeType === "session") return "Conversation · " + ((state.sessions || []).find((session) => session.id === memory.scopeId)?.title || "One conversation");
+      return "Everywhere";
+    }
+
+    function memorySourceLabel(memory) {
+      const value = String((memory.authority || "") + " " + (memory.source || ""));
+      if (/user/i.test(value)) return "Added manually";
+      if (/agent|auto/i.test(value)) return "Suggested by Ódinn";
+      if (/import/i.test(value)) return "Imported";
+      return "Saved locally";
+    }
+
+    function memoryCandidateOriginLabel(candidate) {
+      const sessionId = candidate.sessionId || (candidate.scopeType === "session" ? candidate.scopeId : "");
+      const session = (state.sessions || []).find((entry) => entry.id === sessionId);
+      if (session) return "From " + session.title;
+      const projectId = candidate.projectId || (candidate.scopeType === "project" ? candidate.scopeId : "");
+      const project = (state.projects || []).find((entry) => entry.id === projectId);
+      if (project) return "From " + project.name;
+      return "From a recent conversation";
+    }
+
+    function memoryConfidenceLabel(value) {
+      const score = Number(value);
+      if (!Number.isFinite(score)) return "Not rated";
+      if (score >= .9) return "High";
+      if (score >= .65) return "Medium";
+      return "Low";
+    }
+
+    function memoryTierLabel(value) {
+      return value === "l0" ? "Summaries" : value === "l2" ? "Supporting details" : "Facts";
+    }
+
+    function friendlyMemoryNamespace(value) {
+      return String(value || "General").split("/").map((part) => friendlyStatus(part)).join(" · ");
     }
 
     async function refreshSessions() {
@@ -4330,7 +5494,7 @@ function renderConsoleHtml() {
       }
       const groups = new Map();
       for (const session of sessions) {
-        const key = groupBy === "project" ? (state.projects.find((project) => project.id === session.projectId)?.name || "Workspace") : groupBy === "source" ? (session.source || "direct") : (session.status || "open");
+        const key = groupBy === "project" ? (state.projects.find((project) => project.id === session.projectId)?.name || "Workspace") : groupBy === "source" ? friendlySessionSource(session.source) : friendlyStatus(session.status || "open");
         groups.set(key, [...(groups.get(key) || []), session]);
       }
       $("session-list").innerHTML = Array.from(groups.entries()).map(([label, entries]) => '<div class="data-row data-group"><span style="grid-column:1/-1"><strong>' + escapeHtml(label) + '</strong> <span class="muted">' + escapeHtml(entries.length + " sessions") + '</span></span></div>' + entries.map(renderSessionRecord).join("")).join("") || '<div class="empty-state"><strong>No matching sessions</strong><span>Change the filters or create a new session.</span></div>';
@@ -4340,15 +5504,57 @@ function renderConsoleHtml() {
       const data = await api("/goals?limit=100");
       state.goals = data.goals || [];
       const projectId = $("goal-project-filter")?.value || "all";
-      const goals = state.goals.filter((goal) => projectId === "all" || goal.projectId === projectId);
+      const status = $("goal-status-filter")?.value || "all";
+      const query = $("goal-query")?.value.trim().toLowerCase() || "";
+      const goals = state.goals.filter((goal) =>
+        (projectId === "all" || goal.projectId === projectId)
+        && (status === "all" || goal.status === status)
+        && (!query || [goal.title, goal.description, goal.notes?.at(-1)?.note].some((value) => String(value || "").toLowerCase().includes(query))));
       $("goal-active-count").textContent = state.goals.filter((goal) => goal.status === "active").length;
+      $("goal-paused-count").textContent = state.goals.filter((goal) => goal.status === "paused").length;
       $("goal-blocked-count").textContent = state.goals.filter((goal) => goal.status === "blocked").length;
       $("goal-completed-count").textContent = state.goals.filter((goal) => goal.status === "completed").length;
       $("goal-list").innerHTML = goals.map((goal) => {
         const project = state.projects.find((entry) => entry.id === goal.projectId);
         const session = state.sessions.find((entry) => entry.id === goal.sessionId);
-        return '<div class="item clickable ' + (goal.id === state.selectedGoalId ? "selected" : "") + '" data-goal-id="' + escapeHtml(goal.id) + '"><div class="item-line"><strong>' + escapeHtml(goal.title) + '</strong><span class="chip ' + (goal.status === "completed" ? "ok" : goal.status === "blocked" ? "danger" : "warn") + '">' + escapeHtml(goal.status) + '</span></div><p>' + escapeHtml(goal.description || "No success criteria recorded") + '</p><div class="scope-label">' + escapeHtml(goal.scopeType === "session" ? "Session · " + (session?.title || goal.sessionId) : "Project · " + (project?.name || goal.projectId)) + '</div><div class="muted">Updated ' + escapeHtml(relativeTime(goal.updatedAt)) + (goal.notes?.length ? " · " + escapeHtml(goal.notes.at(-1).note) : "") + '</div></div>';
-      }).join("") || '<div class="empty-state"><strong>No matching goals</strong><span>Create a scoped objective or choose another project.</span></div>';
+        const tone = goal.status === "completed" ? "ok" : goal.status === "blocked" || goal.status === "cancelled" ? "danger" : "warn";
+        const resumeLabel = goal.status === "completed" ? "Reopen" : "Resume";
+        const quickActions = goal.status === "active"
+          ? '<button class="secondary" data-goal-action="paused" type="button">Pause</button><button data-goal-action="completed" type="button">Complete</button>'
+          : goal.status === "paused" || goal.status === "blocked" || goal.status === "completed" || goal.status === "cancelled"
+            ? '<button class="secondary" data-goal-action="active" type="button">' + resumeLabel + '</button>' + (goal.status === "completed" ? "" : '<button data-goal-action="completed" type="button">Complete</button>')
+            : "";
+        return '<article class="item goal-card ' + (goal.id === state.selectedGoalId ? "selected" : "") + '" data-goal-id="' + escapeHtml(goal.id) + '"><div class="item-line"><strong>' + escapeHtml(goal.title) + '</strong><span class="chip ' + tone + '">' + escapeHtml(friendlyStatus(goal.status)) + '</span></div><p>' + escapeHtml(goal.description || "No success criteria recorded") + '</p><div class="scope-label">' + escapeHtml(goal.scopeType === "session" ? "Conversation · " + (session?.title || "Unavailable conversation") : "Project · " + (project?.name || "Unavailable project")) + '</div><div class="muted">' + (goal.notes?.length ? escapeHtml(goal.notes.at(-1).note) + " · " : "") + 'Updated ' + escapeHtml(relativeTime(goal.updatedAt)) + '</div><div class="row goal-actions"><button class="secondary" data-goal-edit type="button">Edit</button>' + quickActions + '</div></article>';
+      }).join("") || '<div class="empty-state"><strong>No matching goals</strong><span>Create a goal or choose another project.</span></div>';
+    }
+
+    function openGoalEditor(goal) {
+      state.selectedGoalId = goal?.id || "";
+      $("goal-form").reset();
+      $("goal-title").value = goal?.title || "";
+      $("goal-description").value = goal?.description || "";
+      $("goal-status").value = goal?.status || "active";
+      $("goal-scope-type").value = goal?.scopeType || "project";
+      updateGoalScopeOptions();
+      if (goal) $("goal-scope-id").value = goal.scopeId || goal.projectId || goal.sessionId || "";
+      $("goal-scope-type").disabled = Boolean(goal);
+      $("goal-scope-id").disabled = Boolean(goal);
+      $("goal-editor-title").textContent = goal ? "Edit goal" : "Create goal";
+      $("goal-status-field").hidden = !goal;
+      $("create-goal").hidden = Boolean(goal);
+      $("update-goal").hidden = !goal;
+      $("goal-dialog").showModal();
+    }
+
+    async function quickUpdateGoal(goal, status) {
+      const verb = status === "completed" ? "Mark this goal complete?" : status === "paused" ? "Pause this goal?" : "Make this goal active again?";
+      if (!window.confirm(verb)) return;
+      await api("/goals/" + encodeURIComponent(goal.id) + "/updates", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status, note: status === "completed" ? "Marked complete from the goal board." : status === "paused" ? "Paused from the goal board." : "Resumed from the goal board.", source: "console" })
+      });
+      await refreshGoals();
     }
 
     async function refreshAudit() {
@@ -4364,7 +5570,7 @@ function renderConsoleHtml() {
       $("audit-run-count").textContent = summary.runs || 0;
       $("audit-model-count").textContent = summary.modelRuns || 0;
       $("audit-error-count").textContent = summary.errors || 0;
-      $("audit-events").innerHTML = state.audit.map(renderAuditEvent).join("") || '<div class="empty-state"><strong>No matching audit events</strong><span>Try another filter or run something.</span></div>';
+      $("audit-events").innerHTML = state.audit.map(renderAuditEvent).join("") || '<div class="empty-state"><strong>No matching activity</strong><span>Try another filter or start some work.</span></div>';
       $("audit-log").textContent = JSON.stringify(state.audit, null, 2);
       $("audit-showing").textContent = state.auditPagination.total ? state.auditPagination.from + "–" + state.auditPagination.to + " of " + state.auditPagination.total + " matching" : "0 matching events";
       $("audit-page-label").textContent = "Page " + state.auditPagination.page + " of " + state.auditPagination.pages;
@@ -4375,9 +5581,16 @@ function renderConsoleHtml() {
         const select = $(id);
         const selected = select.value;
         const label = select.options[0]?.textContent || "All";
-        select.innerHTML = '<option value="">' + escapeHtml(label) + '</option>' + (result.facets?.[facet] || []).map((entry) => '<option value="' + escapeHtml(entry.value) + '">' + escapeHtml(entry.value + " (" + entry.count + ")") + '</option>').join("");
+        select.innerHTML = '<option value="">' + escapeHtml(label) + '</option>' + (result.facets?.[facet] || []).map((entry) => '<option value="' + escapeHtml(entry.value) + '">' + escapeHtml(auditFacetLabel(facet, entry.value) + " (" + entry.count + ")") + '</option>').join("");
         if ([...select.options].some((option) => option.value === selected)) select.value = selected;
       }
+    }
+
+    function auditFacetLabel(facet, value) {
+      if (facet === "types") return friendlyEventTitle({ type: value });
+      if (facet === "tools") return friendlyArea(value);
+      if (facet === "actors") return friendlyActor(value);
+      return friendlyStatus(value);
     }
 
     async function showRunDetail(runId) {
@@ -4394,61 +5607,67 @@ function renderConsoleHtml() {
       button.addEventListener("click", () => switchView(button.dataset.viewJump));
     });
 
-    $("refresh-experiments").addEventListener("click", () => refreshExperiments().catch((error) => showOutput(error.message)));
-    $("experimental-feature-select").addEventListener("change", populateExperimentalActions);
-    $("experimental-action-select").addEventListener("change", () => updateExperimentalWorkbench());
-    $("experimental-target").addEventListener("input", () => updateExperimentalWorkbench({ resetPayload: false, resetTarget: false }));
-    $("experimental-feature-grid").addEventListener("click", (event) => {
-      const button = event.target.closest("[data-experimental-feature]");
-      if (!button) return;
-      $("experimental-feature-select").value = button.dataset.experimentalFeature;
-      populateExperimentalActions();
-      document.querySelector(".experimental-workbench")?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
-    $("experimental-run").addEventListener("click", () => runExperimentalAction().catch((error) => showOutput(error.message)));
-    $("copy-experimental-config").addEventListener("click", async () => {
-      await navigator.clipboard?.writeText($("experimental-config").textContent);
-      showOutput("Experimental configuration copied. Merge it into the existing config and restart the gateway.");
-    });
-    $("experimental-recent-runs").addEventListener("click", async (event) => {
-      const item = event.target.closest("[data-experimental-run-id]");
-      if (!item) return;
-      try {
-        const detail = await api("/runtime/runs/" + encodeURIComponent(item.dataset.experimentalRunId));
-        $("experimental-result").textContent = JSON.stringify(detail, null, 2);
-        showOutput(detail);
-      } catch (error) { showOutput(error.message); }
+    $("activity-tab-overview").addEventListener("click", () => setActivityTab("overview"));
+    $("activity-tab-history").addEventListener("click", () => setActivityTab("history"));
+    document.querySelectorAll("[data-experimental-page]").forEach((page) => {
+      page.addEventListener("click", async (event) => {
+        const featureKey = page.dataset.experimentalPage;
+        const action = event.target.closest("[data-feature-action]");
+        if (action) {
+          state.experimentalActions ||= {};
+          state.experimentalActions[featureKey] = action.dataset.featureAction;
+          renderExperimentalFeaturePage(featureKey);
+          return;
+        }
+        if (event.target.closest("[data-role=run]")) {
+          runExperimentalAction(featureKey).catch((error) => showOutput(error.message));
+          return;
+        }
+        if (event.target.closest("[data-refresh-experimental]")) {
+          refreshExperiments().catch((error) => showOutput(error.message));
+          return;
+        }
+        if (event.target.closest("[data-copy-access-pass]") && state.lastCapabilityToken) {
+          await navigator.clipboard?.writeText(state.lastCapabilityToken);
+          showOutput("Access pass copied. It remains hidden on screen.");
+        }
+      });
     });
     $("refresh-improvements").addEventListener("click", () => refreshImprovements().catch((error) => showOutput(error.message)));
     $("learn-improvements").addEventListener("click", () => learnImprovements().catch((error) => showOutput(error.message)));
-    $("new-improvement").addEventListener("click", () => $("improvement-dialog").showModal());
     $("improvement-list").addEventListener("click", (event) => {
       const item = event.target.closest("[data-improvement-id]");
       if (!item) return;
       state.selectedImprovementId = item.dataset.improvementId;
       renderImprovements();
     });
-    $("improvement-approve").addEventListener("click", () => decideImprovement("approved").catch((error) => showOutput(error.message)));
-    $("improvement-reject").addEventListener("click", () => decideImprovement("rejected").catch((error) => showOutput(error.message)));
     $("improvement-rollback").addEventListener("click", () => rollbackImprovement().catch((error) => showOutput(error.message)));
-    $("improvement-form").addEventListener("submit", async (event) => {
-      if (event.submitter?.value === "cancel") return;
-      event.preventDefault();
-      try {
-        const result = await api("/improvements", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: $("improvement-title").value.trim(), rationale: $("improvement-rationale").value.trim(), target: $("improvement-target").value.trim() || "runtime", priority: $("improvement-priority").value, source: "experimental-lab" }) });
-        state.selectedImprovementId = result.id;
-        $("improvement-dialog").close();
-        $("improvement-form").reset();
-        $("improvement-target").value = "runtime";
-        await refreshImprovements();
-        showOutput(result);
-      } catch (error) { showOutput(error.message); }
-    });
 
     $("sidebar-toggle").addEventListener("click", () => {
+      if (matchMedia("(max-width: 980px)").matches) {
+        const open = $("shell").classList.toggle("nav-open");
+        $("sidebar-toggle").title = open ? "Close navigation" : "Open navigation";
+        $("sidebar-toggle").setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+        $("sidebar-toggle").setAttribute("aria-expanded", String(open));
+        return;
+      }
       const collapsed = $("shell").classList.toggle("sidebar-collapsed");
-      $("sidebar-toggle").title = collapsed ? "Open navigation" : "Collapse navigation";
-      $("sidebar-toggle").setAttribute("aria-label", collapsed ? "Open navigation" : "Collapse navigation");
+      $("sidebar-toggle").title = collapsed ? "Expand navigation" : "Collapse navigation";
+      $("sidebar-toggle").setAttribute("aria-label", collapsed ? "Expand navigation" : "Collapse navigation");
+      $("sidebar-toggle").setAttribute("aria-expanded", String(!collapsed));
+    });
+    $("mobile-scrim").addEventListener("click", closeMobileNavigation);
+    window.addEventListener("hashchange", () => switchView(viewFromHash(), { updateHash: false }));
+    window.addEventListener("resize", () => {
+      if (!matchMedia("(max-width: 980px)").matches) closeMobileNavigation();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeMobileNavigation();
+      const target = event.target.closest?.('[role="button"][tabindex="0"]');
+      if (target && (event.key === "Enter" || event.key === " ")) {
+        event.preventDefault();
+        target.click();
+      }
     });
     $("web-search-run").addEventListener("click", runWebSearch);
     $("web-search-query").addEventListener("keydown", (event) => {
@@ -4475,7 +5694,7 @@ function renderConsoleHtml() {
       });
     });
     $("sidebar-settings").addEventListener("click", () => switchView("usage"));
-    $("sidebar-console").addEventListener("click", () => switchView("usage"));
+    $("sidebar-console").addEventListener("click", () => switchView("capabilities"));
     $("sidebar-theme").addEventListener("click", () => {
       document.body.classList.toggle("soft-contrast");
       showOutput(document.body.classList.contains("soft-contrast") ? "Soft contrast enabled." : "Soft contrast disabled.");
@@ -4483,14 +5702,31 @@ function renderConsoleHtml() {
     $("model-select").addEventListener("change", (event) => {
       state.modelOverride = event.currentTarget.value;
     });
-    $("new-chat").addEventListener("click", async (event) => {
+    $("copy-onboard-command").addEventListener("click", async () => {
+      await navigator.clipboard?.writeText("odinn onboard");
+      showOutput("Copied odinn onboard.");
+    });
+    $("remote-signout").addEventListener("click", async (event) => {
+      if (!state.hosted) return;
+      const button = event.currentTarget;
+      setBusy(button, true);
       try {
-        setBusy(event.currentTarget, true);
-        await createChat("Gateway beta chat");
+        await api("/auth/logout", { method: "POST" });
+        location.assign("/auth/login");
+      } catch (error) {
+        setBusy(button, false);
+        showOutput("Sign out failed: " + error.message);
+      }
+    });
+    $("new-chat").addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      try {
+        setBusy(button, true);
+        await createChat("New chat");
       } catch (error) {
         showOutput(error.message);
       } finally {
-        setBusy(event.currentTarget, false);
+        setBusy(button, false);
       }
     });
     function handleChatRailClick(event) {
@@ -4513,14 +5749,15 @@ function renderConsoleHtml() {
       $("chat-input").focus();
     });
     $("send-chat").addEventListener("click", async (event) => {
+      const button = event.currentTarget;
       try {
-        setBusy(event.currentTarget, true);
+        setBusy(button, true);
         await sendChatMessage($("chat-input").value);
       } catch (error) {
         $("chat-status").textContent = "Error";
         showOutput(error.message);
       } finally {
-        setBusy(event.currentTarget, false);
+        setBusy(button, false);
       }
     });
     $("chat-input").addEventListener("keydown", (event) => {
@@ -4529,22 +5766,7 @@ function renderConsoleHtml() {
         $("send-chat").click();
       }
     });
-    $("chat-smoke").addEventListener("click", async (event) => {
-      try {
-        setBusy(event.currentTarget, true);
-        await sendChatMessage("Run a local healthcheck.", { tool: "job.healthcheck" });
-      } catch (error) {
-        $("chat-status").textContent = "Error";
-        showOutput(error.message);
-      } finally {
-        setBusy(event.currentTarget, false);
-      }
-    });
     $("clear-output").addEventListener("click", () => showOutput("Ready."));
-    $("copy-status").addEventListener("click", async () => {
-      await navigator.clipboard?.writeText(JSON.stringify(state.status, null, 2));
-      showOutput("Status copied.");
-    });
     $("copy-audit").addEventListener("click", async () => {
       await navigator.clipboard?.writeText($("audit-log").textContent);
       showOutput("Current audit page copied.");
@@ -4570,7 +5792,7 @@ function renderConsoleHtml() {
       try {
         const result = await api("/audit/verify");
         const valid = result.valid !== false;
-        $("audit-integrity").textContent = valid ? "Chain verified" : "Integrity failure";
+        $("audit-integrity").textContent = valid ? "Journal chain valid" : "Integrity failure";
         $("audit-integrity").className = "chip " + (valid ? "ok" : "danger");
         showOutput(result);
       } catch (error) { showOutput(error.message); }
@@ -4593,18 +5815,16 @@ function renderConsoleHtml() {
       if (item) showRunDetail(item.dataset.runId).catch((error) => showOutput(error.message));
     });
     $("goal-list").addEventListener("click", (event) => {
-      const item = event.target.closest("[data-goal-id]");
-      if (!item) return;
-      state.selectedGoalId = item.dataset.goalId;
-      const goal = state.goals.find((entry) => entry.id === state.selectedGoalId);
+      const card = event.target.closest("[data-goal-id]");
+      if (!card) return;
+      const goal = state.goals.find((entry) => entry.id === card.dataset.goalId);
       if (!goal) return;
-      $("goal-title").value = goal.title || "";
-      $("goal-description").value = goal.description || "";
-      $("goal-status").value = goal.status || "active";
-      $("goal-scope-type").value = goal.scopeType || "project";
-      updateGoalScopeOptions();
-      $("goal-scope-id").value = goal.scopeId || goal.projectId || "";
-      refreshGoals().catch((error) => showOutput(error.message));
+      const action = event.target.closest("[data-goal-action]");
+      if (action) {
+        quickUpdateGoal(goal, action.dataset.goalAction).catch((error) => showOutput(error.message));
+        return;
+      }
+      if (event.target.closest("[data-goal-edit]")) openGoalEditor(goal);
     });
     $("session-list").addEventListener("click", async (event) => {
       const action = event.target.closest("[data-session-action]");
@@ -4633,26 +5853,12 @@ function renderConsoleHtml() {
       } catch (error) { showOutput(error.message); }
     });
 
-    $("quick-smoke").addEventListener("click", async (event) => {
-      try {
-        setBusy(event.currentTarget, true);
-        showOutput(await api("/plan", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(planTemplates.smoke)
-        }));
-        await refreshRuns();
-      } catch (error) {
-        showOutput(error.message);
-      } finally {
-        setBusy(event.currentTarget, false);
-      }
-    });
     $("create-session").addEventListener("click", async (event) => {
+      const button = event.currentTarget;
       try {
         const title = window.prompt("Session title", "New session");
         if (!title?.trim()) return;
-        setBusy(event.currentTarget, true);
+        setBusy(button, true);
         const session = await api("/sessions", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -4665,44 +5871,42 @@ function renderConsoleHtml() {
       } catch (error) {
         showOutput(error.message);
       } finally {
-        setBusy(event.currentTarget, false);
+        setBusy(button, false);
       }
     });
-    $("create-goal").addEventListener("click", async (event) => {
+    $("new-goal").addEventListener("click", () => openGoalEditor());
+    $("goal-form").addEventListener("submit", async (event) => {
+      if (event.submitter?.value === "cancel") return;
+      event.preventDefault();
+      const button = event.submitter;
       try {
-        setBusy(event.currentTarget, true);
+        setBusy(button, true);
         const scopeType = $("goal-scope-type").value;
         const scopeId = $("goal-scope-id").value;
-        const goal = await api("/goals", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ title: $("goal-title").value, description: $("goal-description").value, source: "console", ...(scopeType === "session" ? { sessionId: scopeId } : { projectId: scopeId }) })
-        });
-        state.selectedGoalId = goal.id;
-        showOutput(goal);
+        if (!scopeId) throw new Error("Choose where this goal belongs.");
+        let result;
+        if (state.selectedGoalId) {
+          result = await api("/goals/" + encodeURIComponent(state.selectedGoalId) + "/updates", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ title: $("goal-title").value.trim(), description: $("goal-description").value.trim(), status: $("goal-status").value, note: $("goal-note").value.trim(), source: "console" })
+          });
+        } else {
+          result = await api("/goals", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ title: $("goal-title").value.trim(), description: $("goal-description").value.trim(), source: "console", ...(scopeType === "session" ? { sessionId: scopeId } : { projectId: scopeId }) })
+          });
+          state.selectedGoalId = result.id;
+        }
+        $("goal-dialog").close();
+        showOutput(result);
         await refreshGoals();
         await refreshRuns();
       } catch (error) {
         showOutput(error.message);
       } finally {
-        setBusy(event.currentTarget, false);
-      }
-    });
-    $("update-goal").addEventListener("click", async (event) => {
-      try {
-        if (!state.selectedGoalId) throw new Error("Select or create a goal first.");
-        setBusy(event.currentTarget, true);
-        showOutput(await api("/goals/" + encodeURIComponent(state.selectedGoalId) + "/updates", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ title: $("goal-title").value, description: $("goal-description").value, status: $("goal-status").value, note: $("goal-note").value, source: "console" })
-        }));
-        await refreshGoals();
-        await refreshRuns();
-      } catch (error) {
-        showOutput(error.message);
-      } finally {
-        setBusy(event.currentTarget, false);
+        setBusy(button, false);
       }
     });
     $("refresh-sessions").addEventListener("click", () => refreshSessions().catch((error) => showOutput(error.message)));
@@ -4711,52 +5915,103 @@ function renderConsoleHtml() {
     $("session-project-filter").addEventListener("change", renderSessionTable);
     $("session-group").addEventListener("change", renderSessionTable);
     $("refresh-goals").addEventListener("click", () => refreshGoals().catch((error) => showOutput(error.message)));
+    $("goal-query").addEventListener("input", () => refreshGoals().catch((error) => showOutput(error.message)));
+    $("goal-status-filter").addEventListener("change", () => refreshGoals().catch((error) => showOutput(error.message)));
     $("goal-project-filter").addEventListener("change", () => refreshGoals().catch((error) => showOutput(error.message)));
     $("goal-scope-type").addEventListener("change", updateGoalScopeOptions);
 
     $("refresh-tasks").addEventListener("click", () => refreshTasks().catch((error) => showOutput(error.message)));
-    $("task-query").addEventListener("input", renderTasks);
-    $("task-status-filter").addEventListener("change", renderTasks);
-    $("task-category-filter").addEventListener("change", renderTasks);
-    $("task-system-toggle").addEventListener("change", () => refreshTasks().catch((error) => showOutput(error.message)));
-    $("task-table").addEventListener("click", (event) => {
-      const button = event.target.closest("[data-task-inspect]");
-      if (button) inspectTask(button.dataset.taskInspect).catch((error) => showOutput(error.message));
+    let taskDebounce;
+    const changeTaskFilters = () => {
+      state.taskPage = 1;
+      clearTimeout(taskDebounce);
+      taskDebounce = setTimeout(() => refreshTasks().catch((error) => showOutput(error.message)), 180);
+    };
+    $("task-query").addEventListener("input", changeTaskFilters);
+    ["task-status-filter", "task-category-filter", "task-system-toggle", "task-page-size"].forEach((id) => $(id).addEventListener("change", changeTaskFilters));
+    $("task-prev").addEventListener("click", () => { state.taskPage = Math.max(1, state.taskPage - 1); refreshTasks().catch((error) => showOutput(error.message)); });
+    $("task-next").addEventListener("click", () => { state.taskPage = Math.min(state.taskPagination.pages || 1, state.taskPage + 1); refreshTasks().catch((error) => showOutput(error.message)); });
+    $("task-select-page").addEventListener("change", (event) => {
+      for (const task of state.tasks || []) {
+        if (event.target.checked) state.taskSelection.set(task.id, task);
+        else state.taskSelection.delete(task.id);
+      }
+      renderTasks();
+    });
+    $("task-clear-selection").addEventListener("click", () => { state.taskSelection.clear(); renderTasks(); });
+    $("task-rerun-selected").addEventListener("click", () => runSelectedTaskAction("replay").catch((error) => showOutput(error.message)));
+    $("task-cancel-selected").addEventListener("click", () => runSelectedTaskAction("cancel").catch((error) => showOutput(error.message)));
+    $("task-table").addEventListener("change", (event) => {
+      const input = event.target.closest("[data-task-select]");
+      if (!input) return;
+      const task = (state.tasks || []).find((entry) => entry.id === input.dataset.taskSelect);
+      if (input.checked && task) state.taskSelection.set(task.id, task);
+      else state.taskSelection.delete(input.dataset.taskSelect);
+      updateTaskManagement();
+    });
+    $("task-table").addEventListener("click", async (event) => {
+      const inspect = event.target.closest("[data-task-inspect]");
+      const replay = event.target.closest("[data-task-replay]");
+      const cancel = event.target.closest("[data-task-cancel]");
+      try {
+        if (inspect) await inspectTask(inspect.dataset.taskInspect);
+        if (replay) { const result = await replayTask(replay.dataset.taskReplay); if (result) showOutput(result); await refreshTasks(); }
+        if (cancel) { const result = await cancelTask(cancel.dataset.taskCancel); if (result) showOutput(result); await refreshTasks(); }
+      } catch (error) {
+        showOutput(error.message);
+      }
     });
     $("task-verify").addEventListener("click", async () => {
       if (!state.selectedTaskId) return;
       try {
         const result = await api("/runtime/runs/" + encodeURIComponent(state.selectedTaskId) + "/verify");
-        $("task-summary").insertAdjacentHTML("beforeend", '<div class="item"><div class="muted">Proof integrity</div><strong>' + escapeHtml(result.valid === false ? "Failed" : "Verified") + '</strong></div>');
-        showOutput(result);
+        $("task-summary").insertAdjacentHTML("beforeend", '<div class="item"><div class="muted">History check</div><strong>' + escapeHtml(result.valid === false ? "Needs attention" : "Passed") + '</strong></div>');
+        showOutput(result.valid === false ? "The task history may have changed." : "The task history is intact.");
       } catch (error) { showOutput("Verification unavailable: " + error.message); }
     });
     $("task-replay").addEventListener("click", async () => {
-      if (!state.selectedTaskId || !window.confirm("Replay this task only if its tool is safe and idempotent?")) return;
-      showOutput(await api("/runs/" + encodeURIComponent(state.selectedTaskId) + "/replay", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
+      const result = await replayTask(state.selectedTaskId);
+      if (result) showOutput(result);
+      await refreshTasks();
+    });
+    $("task-cancel").addEventListener("click", async () => {
+      const result = await cancelTask(state.selectedTaskId);
+      if (result) showOutput(result);
       await refreshTasks();
     });
 
-    $("new-cron").addEventListener("click", () => $("cron-dialog").showModal());
+    $("new-cron").addEventListener("click", () => { updateSchedulePattern(); $("cron-dialog").showModal(); });
     $("refresh-cron").addEventListener("click", () => refreshCron().catch((error) => showOutput(error.message)));
     $("cron-query").addEventListener("input", () => refreshCron().catch((error) => showOutput(error.message)));
+    ["cron-frequency", "cron-time", "cron-weekday"].forEach((id) => $(id).addEventListener("change", updateSchedulePattern));
     $("cron-form").addEventListener("submit", async (event) => {
       if (event.submitter?.value === "cancel") return;
       event.preventDefault();
       try {
+        updateSchedulePattern();
         await api("/cron", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: $("cron-name").value, schedule: $("cron-schedule").value, timezone: $("cron-timezone").value, tool: $("cron-tool").value, input: JSON.parse($("cron-input").value || "{}") }) });
         $("cron-dialog").close();
         await refreshCron();
-      } catch (error) { showOutput(error.message); }
+      } catch (error) { showOutput(/JSON/i.test(error.message) ? "The advanced action input needs valid structured data." : error.message); }
     });
     $("cron-list").addEventListener("click", async (event) => {
       const run = event.target.closest("[data-cron-run]");
       const toggle = event.target.closest("[data-cron-toggle]");
       const remove = event.target.closest("[data-cron-delete]");
       try {
-        if (run) showOutput(await api("/cron/" + encodeURIComponent(run.dataset.cronRun) + "/run", { method: "POST" }));
+        if (run) {
+          const job = (state.cronJobs || []).find((entry) => entry.id === run.dataset.cronRun);
+          if (job && window.confirm('Run “' + job.name + '” now with its saved settings?')) {
+            showOutput(await api("/cron/" + encodeURIComponent(run.dataset.cronRun) + "/run", { method: "POST" }));
+          }
+        }
         if (toggle) await api("/cron/" + encodeURIComponent(toggle.dataset.cronToggle), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: toggle.dataset.enabled !== "true" }) });
-        if (remove && window.confirm("Delete this scheduled job?")) await api("/cron/" + encodeURIComponent(remove.dataset.cronDelete), { method: "DELETE" });
+        if (remove) {
+          const job = (state.cronJobs || []).find((entry) => entry.id === remove.dataset.cronDelete);
+          if (job && window.confirm('Delete "' + job.name + '"? Its schedule and saved input will be removed. This cannot be undone from the console.')) {
+            await api("/cron/" + encodeURIComponent(remove.dataset.cronDelete), { method: "DELETE" });
+          }
+        }
         await refreshCron();
       } catch (error) { showOutput(error.message); }
     });
@@ -4855,6 +6110,13 @@ function renderConsoleHtml() {
     for (const [buttonId, action] of [["agent-enable", "enable"], ["agent-disable", "disable"], ["agent-quarantine", "quarantine"]]) {
       $(buttonId).addEventListener("click", async () => {
         if (!state.selectedAgentId) return;
+        const agent = state.agents.find((entry) => entry.id === state.selectedAgentId);
+        const effect = action === "enable"
+          ? "This makes the agent available, but does not start any work."
+          : action === "quarantine"
+            ? "Its setup will be kept, but it cannot be used until you restore it."
+            : "Its setup will be kept, but it cannot be selected.";
+        if (!agent || !window.confirm(action[0].toUpperCase() + action.slice(1) + ' "' + agent.name + '"? ' + effect)) return;
         await api("/agents/" + encodeURIComponent(state.selectedAgentId) + "/lifecycle", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action }) });
         await refreshAgents();
       });
@@ -4876,7 +6138,7 @@ function renderConsoleHtml() {
       event.preventDefault();
       const list = (id) => $(id).value.split(",").map((value) => value.trim()).filter(Boolean);
       const manifest = {
-        sdkVersion: "0.1", id: $("skill-id").value.trim(), version: $("skill-version").value.trim(), name: $("skill-name").value.trim(),
+        sdkVersion: "0.1", id: $("skill-id").value.trim() || $("skill-name").value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 63), version: $("skill-version").value.trim(), name: $("skill-name").value.trim(),
         description: $("skill-description").value.trim(), instructions: $("skill-instructions").value.trim(),
         requestedTools: list("skill-tools"), requestedCapabilities: list("skill-capabilities"), requestedSecrets: list("skill-secrets"),
         network: { default: "deny", allow: list("skill-network") }, tests: []
@@ -4894,6 +6156,13 @@ function renderConsoleHtml() {
     for (const [buttonId, action] of [["skill-enable", "enable"], ["skill-disable", "disable"], ["skill-quarantine", "quarantine"]]) {
       $(buttonId).addEventListener("click", async () => {
         if (!state.selectedSkillId) return;
+        const skill = state.skills.find((entry) => entry.id === state.selectedSkillId);
+        const effect = action === "enable"
+          ? "This makes the skill available to Ódinn."
+          : action === "quarantine"
+            ? "Its setup will be kept, but it cannot be turned on until you restore it."
+            : "Its setup will be kept, but Ódinn cannot use it.";
+        if (!skill || !window.confirm(action[0].toUpperCase() + action.slice(1) + ' "' + skill.name + '"? ' + effect)) return;
         await api("/skills/" + encodeURIComponent(state.selectedSkillId) + "/lifecycle", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action }) });
         await refreshSkills();
         renderSkillDetail(state.skills.find((skill) => skill.id === state.selectedSkillId));
@@ -4929,7 +6198,8 @@ function renderConsoleHtml() {
       } catch (error) { showOutput(error.message); }
     });
     $("project-archive").addEventListener("click", async () => {
-      if (!state.selectedProjectId || state.selectedProjectId === "project_default" || !window.confirm("Archive this project? Its sessions and goals remain stored.")) return;
+      const project = state.projects.find((entry) => entry.id === state.selectedProjectId);
+      if (!project || state.selectedProjectId === "project_default" || !window.confirm('Archive "' + project.name + '"? Its sessions and goals will remain stored and viewable.')) return;
       const result = await api("/projects/" + encodeURIComponent(state.selectedProjectId), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: "archived", source: "console" }) });
       state.selectedProjectId = "project_default";
       await refreshProjects();
@@ -4946,24 +6216,63 @@ function renderConsoleHtml() {
       switchView("goals");
     });
 
-    let memoryDebounce;
-    const queueMemoryRefresh = () => {
-      clearTimeout(memoryDebounce);
-      memoryDebounce = setTimeout(() => refreshMemory().catch((error) => showOutput(error.message)), 180);
-    };
-    $("memory-query").addEventListener("input", queueMemoryRefresh);
-    $("memory-kind-filter").addEventListener("change", queueMemoryRefresh);
-    $("memory-scope-filter").addEventListener("change", queueMemoryRefresh);
+    $("memory-query").addEventListener("input", renderMemoryLibrary);
+    $("memory-kind-filter").addEventListener("change", renderMemoryLibrary);
+    $("memory-scope-filter").addEventListener("change", renderMemoryLibrary);
     $("refresh-memory-tree").addEventListener("click", () => refreshMemory().catch((error) => showOutput(error.message)));
+    document.querySelectorAll("[data-memory-tab]").forEach((button) => {
+      button.addEventListener("click", () => setMemoryTab(button.dataset.memoryTab, true));
+      button.addEventListener("keydown", (event) => {
+        const tabs = [$("memory-tab-suggestions"), $("memory-tab-saved")];
+        const current = tabs.indexOf(event.currentTarget);
+        const next = event.key === "ArrowRight" ? (current + 1) % tabs.length
+          : event.key === "ArrowLeft" ? (current - 1 + tabs.length) % tabs.length
+          : event.key === "Home" ? 0
+          : event.key === "End" ? tabs.length - 1
+          : -1;
+        if (next < 0) return;
+        event.preventDefault();
+        const target = tabs[next];
+        setMemoryTab(target.dataset.memoryTab, true);
+        target.focus();
+      });
+    });
+    $("memory-candidate-list").addEventListener("click", (event) => {
+      const tabTarget = event.target.closest("[data-memory-tab-target]");
+      if (tabTarget) {
+        setMemoryTab(tabTarget.dataset.memoryTabTarget, true);
+        return;
+      }
+      const keep = event.target.closest("[data-memory-candidate-keep]");
+      if (keep) {
+        decideMemoryCandidate(keep.dataset.memoryCandidateKeep, "accepted", keep).catch((error) => {
+          setBusy(keep, false);
+          showOutput(error.message);
+        });
+        return;
+      }
+      const dismiss = event.target.closest("[data-memory-candidate-dismiss]");
+      if (dismiss) {
+        decideMemoryCandidate(dismiss.dataset.memoryCandidateDismiss, "rejected", dismiss).catch((error) => {
+          setBusy(dismiss, false);
+          showOutput(error.message);
+        });
+      }
+    });
     $("memory-new-toggle").addEventListener("click", () => {
       $("memory-form").reset();
       updateMemoryScopeOptions();
       $("memory-dialog").showModal();
     });
+    $("memory-dialog-close").addEventListener("click", () => $("memory-dialog").close());
+    $("memory-correction-dialog-close").addEventListener("click", () => $("memory-correction-dialog").close());
     $("memory-scope-type").addEventListener("change", updateMemoryScopeOptions);
     $("memory-list").addEventListener("click", (event) => {
       const item = event.target.closest("[data-memory-id]");
-      if (item) renderMemoryDetail(state.memories.find((memory) => memory.id === item.dataset.memoryId));
+      if (item) {
+        renderMemoryDetail(state.memories.find((memory) => memory.id === item.dataset.memoryId));
+        if (matchMedia("(max-width: 600px)").matches) $("memory-detail-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+      }
     });
     $("memory-form").addEventListener("submit", async (event) => {
       if (event.submitter?.value === "cancel") return;
@@ -4977,6 +6286,7 @@ function renderConsoleHtml() {
           scopeType, ...(scopeType === "global" ? {} : { scopeId }), ...(scopeType === "project" ? { projectId: scopeId } : {}), ...(scopeType === "session" ? { sessionId: scopeId } : {})
         }) });
         state.selectedMemoryId = result.id;
+        setMemoryTab("saved", true);
         $("memory-dialog").close();
         await refreshMemory();
         showOutput(result);
@@ -4995,22 +6305,37 @@ function renderConsoleHtml() {
       try {
         const result = await api("/memory/corrections", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ targetId: state.selectedMemoryId, text: $("memory-correction-text").value.trim(), reason: $("memory-correction-reason").value.trim(), source: "console", authority: "user-correction" }) });
         state.selectedMemoryId = result.id;
+        setMemoryTab("saved");
         $("memory-correction-dialog").close();
         await refreshMemory();
         showOutput(result);
       } catch (error) { showOutput(error.message); }
     });
+    $("memory-forget").addEventListener("click", async () => {
+      const memory = state.memories.find((entry) => entry.id === state.selectedMemoryId);
+      if (!memory || !window.confirm('Forget "' + (memory.subject || "this memory") + '"? Ódinn will stop using it.')) return;
+      const result = await api("/memory/" + encodeURIComponent(memory.id) + "/forget", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ source: "console", authority: "user" }) });
+      state.selectedMemoryId = "";
+      await refreshMemory();
+      showOutput(result.forgotten ? "Memory forgotten." : "Memory could not be forgotten.");
+    });
     $("memory-recall-test").addEventListener("click", async () => {
-      const query = window.prompt("What should Ódinn try to remember?", $("memory-query").value || "project decisions");
+      const query = window.prompt("What are you working on?", $("memory-query").value || "project decisions");
       if (!query?.trim()) return;
       const params = new URLSearchParams({ query: query.trim(), limit: "8" });
       if (state.selectedProjectId) params.set("projectId", state.selectedProjectId);
       if (state.activeChatId) params.set("sessionId", state.activeChatId);
       const result = await api("/memory/recall?" + params);
-      showOutput(result);
-      const recalledIds = new Set((result.memories || []).map((memory) => memory.id));
+      const recalled = result.memories || [];
+      $("memory-recall-result").hidden = false;
+      $("memory-recall-result").innerHTML = recalled.length
+        ? '<strong>Ódinn would use ' + recalled.length + (recalled.length === 1 ? " saved memory" : " saved memories") + ' for this topic.</strong><ul class="human-list">' + recalled.map((memory) => '<li><strong>' + escapeHtml(memory.subject || friendlyStatus(memory.kind)) + '</strong><span class="muted"> ' + escapeHtml(memory.summary || memory.text) + '</span></li>').join("") + '</ul>'
+        : '<strong>No saved memories match this topic.</strong><p class="muted">Ódinn would continue without adding memory context.</p>';
+      showOutput(recalled.length ? "Recall preview ready." : "No matching memories found.");
+      const recalledIds = new Set(recalled.map((memory) => memory.id));
       document.querySelectorAll("[data-memory-id]").forEach((item) => item.classList.toggle("selected", recalledIds.has(item.dataset.memoryId)));
     });
+    switchView(viewFromHash(), { updateHash: false });
     refresh();
   </script>
 </body>

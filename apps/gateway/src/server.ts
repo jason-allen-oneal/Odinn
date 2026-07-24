@@ -1,7 +1,8 @@
 import { createServer } from "node:http";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { access, chmod, mkdir, readFile, readdir, rename, stat as statPath, writeFile } from "node:fs/promises";
-import { dirname, join, resolve, sep } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
@@ -563,6 +564,23 @@ export async function createGatewayServer({
       const authentication = process.env.ODINN_GATEWAY_AUTH === "off" ? "disabled" : authenticationMode(request, gatewayToken);
       if (isMutatingMethod(request.method) && !validMutationOrigin(request, authentication)) {
         return json(response, 403, { ok: false, error: "origin rejected for control-plane mutation" });
+      }
+      if (request.method === "GET" && url.pathname === "/config") {
+        const editable = await readEditableConfig(state);
+        return json(response, 200, {
+          ok: true,
+          ...editable,
+          restartRequired: !configsMatch(editable.config, config)
+        });
+      }
+      if (request.method === "PUT" && url.pathname === "/config") {
+        const body = await readJson(request, { maxBytes: requestMaxBytes });
+        const saved = await writeEditableConfig(state, body);
+        return json(response, 200, {
+          ok: true,
+          ...saved,
+          restartRequired: !configsMatch(saved.config, config)
+        });
       }
       if (request.method === "GET" && url.pathname === "/status") {
         return json(response, 200, {
@@ -1361,6 +1379,7 @@ async function readConfig(state: any) {
   const path = join(state, "config.json");
   try {
     const config = JSON.parse(await readFile(path, "utf8"));
+    validateGatewayConfig(config);
     await chmod(path, 0o600);
     return config;
   } catch (error: any) {
@@ -1368,6 +1387,7 @@ async function readConfig(state: any) {
     return withStateMutationLock(state, async () => {
       try {
         const existing = JSON.parse(await readFile(path, "utf8"));
+        validateGatewayConfig(existing);
         await chmod(path, 0o600);
         return existing;
       } catch (readError: any) {
@@ -1380,6 +1400,223 @@ async function readConfig(state: any) {
       return config;
     });
   }
+}
+
+function assertConfigObject(value: any) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new GatewayError(400, "config must be a JSON object");
+  }
+}
+
+function assertConfigRecord(value: any, label: string) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new GatewayError(400, `${label} must be a JSON object`);
+  }
+}
+
+function assertConfigStringArray(value: any, label: string) {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new GatewayError(400, `${label} must be an array of strings`);
+  }
+}
+
+function assertOptionalConfigBoolean(record: any, key: string, label: string) {
+  if (record[key] !== undefined && typeof record[key] !== "boolean") {
+    throw new GatewayError(400, `${label}.${key} must be true or false`);
+  }
+}
+
+function validateGatewayConfig(config: any) {
+  assertConfigObject(config);
+  if (config.version !== undefined && config.version !== 1) {
+    throw new GatewayError(400, "config.version must be 1");
+  }
+  if (config.auditLog !== undefined && (typeof config.auditLog !== "string" || !/^(?:audit|audit[-_.][a-z0-9][a-z0-9._-]{0,110})\.jsonl$/i.test(config.auditLog))) {
+    throw new GatewayError(400, "config.auditLog must be audit.jsonl or an audit-*.jsonl filename");
+  }
+  if (config.defaultModel !== undefined && typeof config.defaultModel !== "string") {
+    throw new GatewayError(400, "config.defaultModel must be a string");
+  }
+
+  if (config.providers !== undefined) {
+    assertConfigRecord(config.providers, "config.providers");
+    for (const [name, provider] of Object.entries(config.providers) as Array<[string, any]>) {
+      if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(name)) {
+        throw new GatewayError(400, `config.providers contains an invalid provider name: ${name}`);
+      }
+      assertConfigRecord(provider, `config.providers.${name}`);
+      for (const key of ["type", "baseUrl", "apiKeyEnv", "transport"]) {
+        if (provider[key] !== undefined && typeof provider[key] !== "string") {
+          throw new GatewayError(400, `config.providers.${name}.${key} must be a string`);
+        }
+      }
+      if (provider.models !== undefined) assertConfigStringArray(provider.models, `config.providers.${name}.models`);
+      if (provider.auth !== undefined) assertConfigRecord(provider.auth, `config.providers.${name}.auth`);
+    }
+  }
+
+  let normalizedModels;
+  try {
+    normalizedModels = normalizeModelConfig(config);
+    for (const provider of Object.values(normalizedModels.providers) as any[]) {
+      if (["oauth", "device"].includes(provider.auth?.mode)) oauthTokenPath(provider, ".");
+    }
+  } catch (error) {
+    throw new GatewayError(400, error instanceof Error ? error.message : "model provider configuration is invalid");
+  }
+
+  if (config.policy !== undefined) {
+    assertConfigRecord(config.policy, "config.policy");
+    if (config.policy.deniedTools !== undefined) assertConfigStringArray(config.policy.deniedTools, "config.policy.deniedTools");
+    if (config.policy.allowedCapabilities !== undefined) assertConfigStringArray(config.policy.allowedCapabilities, "config.policy.allowedCapabilities");
+    if (config.policy.maxInputBytes !== undefined && (!Number.isSafeInteger(config.policy.maxInputBytes) || config.policy.maxInputBytes < 1)) {
+      throw new GatewayError(400, "config.policy.maxInputBytes must be a positive integer");
+    }
+    if (config.policy.security !== undefined) {
+      assertConfigRecord(config.policy.security, "config.policy.security");
+      for (const surfaceName of ["web", "browser"]) {
+        const surface = config.policy.security[surfaceName];
+        if (surface === undefined) continue;
+        assertConfigRecord(surface, `config.policy.security.${surfaceName}`);
+        for (const key of ["enabled", "allowPrivateNetwork", "requireApproval", "allowDownloads", "allowUploads"]) {
+          assertOptionalConfigBoolean(surface, key, `config.policy.security.${surfaceName}`);
+        }
+        for (const key of ["allowedDomains", "blockedDomains"]) {
+          if (surface[key] !== undefined) assertConfigStringArray(surface[key], `config.policy.security.${surfaceName}.${key}`);
+        }
+      }
+    }
+    createDefaultPolicy(config.policy);
+  }
+
+  if (config.proof !== undefined) {
+    assertConfigRecord(config.proof, "config.proof");
+    if (config.proof.allowedCommands !== undefined) {
+      if (!Array.isArray(config.proof.allowedCommands) || config.proof.allowedCommands.some((command: any) =>
+        !Array.isArray(command) || command.length === 0 || command.some((part: any) => typeof part !== "string") || !isAbsolute(command[0]))) {
+        throw new GatewayError(400, "config.proof.allowedCommands must contain exact argument arrays beginning with an absolute executable path");
+      }
+    }
+  }
+
+  if (config.experimental !== undefined) {
+    assertConfigRecord(config.experimental, "config.experimental");
+    for (const key of ["proof", "rewind", "sentinel", "capsules", "darwin", "capabilities", "counterfactual"]) {
+      assertOptionalConfigBoolean(config.experimental, key, "config.experimental");
+    }
+    normalizeExperimentalFlags(config.experimental);
+  }
+
+  if (config.selfImprovement !== undefined) {
+    assertConfigRecord(config.selfImprovement, "config.selfImprovement");
+    assertOptionalConfigBoolean(config.selfImprovement, "enabled", "config.selfImprovement");
+    assertOptionalConfigBoolean(config.selfImprovement, "rollbackOnFailure", "config.selfImprovement");
+    if (config.selfImprovement.mode !== undefined && !["disabled", "propose", "auto"].includes(config.selfImprovement.mode)) {
+      throw new GatewayError(400, "config.selfImprovement.mode must be disabled, propose, or auto");
+    }
+    for (const [key, minimum, maximum] of [["intervalMs", 30_000, 86_400_000], ["maxChangesPerCycle", 1, 3]] as const) {
+      const value = config.selfImprovement[key];
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < minimum || value > maximum)) {
+        throw new GatewayError(400, `config.selfImprovement.${key} must be an integer from ${minimum} through ${maximum}`);
+      }
+    }
+    normalizeSelfImprovementConfig(config.selfImprovement);
+  }
+
+  if (config.runtime !== undefined) {
+    assertConfigRecord(config.runtime, "config.runtime");
+    if (config.runtime.modelRetries !== undefined && (!Number.isSafeInteger(config.runtime.modelRetries) || config.runtime.modelRetries < 0 || config.runtime.modelRetries > 4)) {
+      throw new GatewayError(400, "config.runtime.modelRetries must be an integer from 0 through 4");
+    }
+  }
+
+  if (config.memory !== undefined) {
+    assertConfigRecord(config.memory, "config.memory");
+    for (const key of ["autoRecall", "autoLearn", "autoCompact"]) assertOptionalConfigBoolean(config.memory, key, "config.memory");
+  }
+}
+
+function configFingerprint(contents: string | Buffer) {
+  return createHash("sha256").update(contents).digest("hex");
+}
+
+function canonicalConfig(value: any): any {
+  if (Array.isArray(value)) return value.map(canonicalConfig);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalConfig(value[key])]));
+}
+
+function configsMatch(left: any, right: any) {
+  return JSON.stringify(canonicalConfig(left)) === JSON.stringify(canonicalConfig(right));
+}
+
+async function openEditableConfigFile(path: string) {
+  let handle;
+  try {
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || metadata.nlink !== 1) {
+      throw new GatewayError(409, "config.json is not a regular private file");
+    }
+    return handle;
+  } catch (error: any) {
+    await handle?.close().catch(() => undefined);
+    if (error instanceof GatewayError) throw error;
+    if (["ELOOP", "EMLINK"].includes(String(error?.code ?? ""))) {
+      throw new GatewayError(409, "config.json must not be a symbolic link");
+    }
+    throw error;
+  }
+}
+
+async function readEditableConfig(state: string) {
+  const path = join(state, "config.json");
+  const handle = await openEditableConfigFile(path);
+  let contents;
+  try {
+    contents = await handle.readFile("utf8");
+    await handle.chmod(0o600);
+  } finally {
+    await handle.close();
+  }
+  let config;
+  try {
+    config = JSON.parse(contents);
+  } catch {
+    throw new GatewayError(409, "config.json is not valid JSON");
+  }
+  validateGatewayConfig(config);
+  return { config, fingerprint: configFingerprint(contents) };
+}
+
+async function writeEditableConfig(state: string, input: any) {
+  validateGatewayConfig(input?.config);
+  const expectedFingerprint = String(input?.fingerprint ?? "");
+  if (!/^[a-f0-9]{64}$/.test(expectedFingerprint)) {
+    throw new GatewayError(400, "a current config fingerprint is required");
+  }
+  const serialized = `${JSON.stringify(input.config, null, 2)}\n`;
+  return withStateMutationLock(state, async () => {
+    const path = join(state, "config.json");
+    const handle = await openEditableConfigFile(path);
+    let current;
+    try {
+      current = await handle.readFile();
+    } finally {
+      await handle.close();
+    }
+    if (configFingerprint(current) !== expectedFingerprint) {
+      throw new GatewayError(409, "config changed after this page loaded; reload it before saving");
+    }
+    const temporary = join(state, `.config.json.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
+    try {
+      await writeFile(temporary, serialized, { flag: "wx", mode: 0o600 });
+      await rename(temporary, path);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
+    return { config: input.config, fingerprint: configFingerprint(serialized) };
+  });
 }
 
 async function readJson(request: any, { maxBytes = DEFAULT_REQUEST_MAX_BYTES }: any = {}) {
@@ -2950,6 +3187,7 @@ function renderConsoleHtml(version = "development") {
       }
       .page-head,
       .experimental-warning,
+      .config-actions,
       .pagination {
         align-items: stretch;
         flex-direction: column;
@@ -3041,6 +3279,13 @@ function renderConsoleHtml(version = "development") {
     }
     .oc-page { max-width: 1320px; }
     .oc-page .page-head h1 { color: var(--text); }
+    .config-page { max-width: 980px; }
+    .config-editor { min-height: min(62vh, 720px); padding: 16px; font-size: 13px; line-height: 1.55; tab-size: 2; }
+    .config-guidance { margin: 0; color: var(--muted); line-height: 1.55; }
+    .config-actions { justify-content: space-between; }
+    .config-actions > .row { gap: 8px; }
+    .config-restart { display: grid; gap: 4px; padding: 13px 15px; border: 1px solid #7b632c; border-radius: 10px; background: #2b2414; color: #f3d891; }
+    .config-restart strong { color: #ffe5a2; }
     .summary-bar { display: flex; align-items: center; gap: 34px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: #151a22; }
     .summary-bar span { display: flex; align-items: center; gap: 10px; }
     .summary-bar small { color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .08em; }
@@ -3451,10 +3696,11 @@ function renderConsoleHtml(version = "development") {
         <button data-view="projects" data-title="Projects" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-project"></use></svg></span><span class="nav-label">Projects</span></button>
         <button data-view="memory" data-title="Memory" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-memory"></use></svg></span><span class="nav-label">Memory</span></button>
         <button data-view="goals" data-title="Goals" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-goal"></use></svg></span><span class="nav-label">Goals</span></button>
+        <button data-view="config" data-title="Configuration" type="button"><span class="icon"><svg class="icon-svg"><use href="#icon-settings"></use></svg></span><span class="nav-label">Configuration</span></button>
       </nav>
       <div class="sidebar-footer">
         <div class="sidebar-footer-tools">
-          <button class="sidebar-icon-button" id="sidebar-settings" title="Open usage and provider status" aria-label="Open usage and provider status" type="button"><svg class="icon-svg"><use href="#icon-settings"></use></svg></button>
+          <button class="sidebar-icon-button" id="sidebar-settings" title="Open configuration" aria-label="Open configuration" type="button"><svg class="icon-svg"><use href="#icon-settings"></use></svg></button>
           <button class="sidebar-icon-button" id="sidebar-console" title="Open Web and browser tools" aria-label="Open Web and browser tools" type="button"><svg class="icon-svg"><use href="#icon-monitor"></use></svg></button>
           <button class="sidebar-icon-button" id="sidebar-theme" title="Toggle theme" aria-label="Toggle theme" type="button"><svg class="icon-svg"><use href="#icon-moon"></use></svg></button>
           <button class="sidebar-icon-button" id="refresh" title="Refresh" aria-label="Refresh" type="button"><svg class="icon-svg"><use href="#icon-refresh"></use></svg></button>
@@ -3623,6 +3869,37 @@ function renderConsoleHtml(version = "development") {
         </div>
       </section>
 
+      <section id="view-config" class="view">
+        <div class="page oc-page config-page">
+          <div class="page-head">
+            <div>
+              <div class="section-kicker">Advanced workspace setup</div>
+              <h1>Configuration</h1>
+              <p>Edit the JSON that Ódinn reads from <code>.odinn/config.json</code>. Changes are written safely and remain local to this workspace.</p>
+            </div>
+            <span class="chip" id="config-state">Not loaded</span>
+          </div>
+          <div class="panel stack">
+            <div class="panel-head"><div><h2>Configuration JSON</h2><span class="muted">Unknown settings are preserved.</span></div><span class="chip warn">Advanced</span></div>
+            <p class="config-guidance">Use valid JSON with an object at the top level. Credentials and OAuth tokens should stay outside this file; use environment variables or Ódinn's connection setup for secrets.</p>
+            <div class="field">
+              <label for="config-editor">config.json</label>
+              <textarea id="config-editor" class="config-editor" aria-describedby="config-guidance config-error" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+              <span id="config-guidance" class="muted">Saving preserves a private owner-only file. Runtime settings take effect after the gateway restarts.</span>
+              <div id="config-error" class="inline-error" role="alert" aria-live="assertive"></div>
+            </div>
+            <div class="row config-actions">
+              <div class="row"><button class="secondary" id="format-config" type="button">Format JSON</button><button class="secondary" id="reload-config" type="button">Reload from disk</button></div>
+              <button id="save-config" type="button">Save configuration</button>
+            </div>
+          </div>
+          <div id="config-restart" class="config-restart" role="status" hidden>
+            <strong id="config-restart-title">Restart required</strong>
+            <span id="config-restart-copy">Restart the Ódinn gateway when you are ready to apply these settings.</span>
+          </div>
+        </div>
+      </section>
+
       <section id="view-automatic-improvements" class="view">
         <div class="page oc-page">
           <div class="page-head"><div><div class="section-kicker">Automatic care</div><h1>Automatic improvements</h1><p>Ódinn watches for recurring reliability problems, asks the connected model for a plain-language assessment, and applies only a small set of reversible reliability adjustments.</p></div><div class="row"><span class="chip warn" id="improvement-mode-chip">Starting</span><button class="secondary" id="refresh-improvements" type="button">Refresh</button><button id="learn-improvements" type="button">Check now</button></div></div>
@@ -3742,6 +4019,8 @@ function renderConsoleHtml(version = "development") {
       hosted: false,
       hostUser: "",
       activityTab: "overview",
+      configFingerprint: "",
+      configRestartRequired: false,
       activeView: "overview"
     };
     const experimentalFeatures = {
@@ -4059,6 +4338,10 @@ function renderConsoleHtml(version = "development") {
       if (name === "projects") refreshProjects().catch((error) => showOutput(error.message));
       if (name === "memory") refreshMemory().catch((error) => showOutput(error.message));
       if (name === "goals") refreshGoals().catch((error) => showOutput(error.message));
+      if (name === "config") refreshConfig().catch((error) => {
+        $("config-error").textContent = error.message;
+        showOutput(error.message);
+      });
     }
 
     function setActivityTab(tab) {
@@ -4850,6 +5133,73 @@ function renderConsoleHtml(version = "development") {
       await refreshApprovals();
       await refreshBrowser();
       showOutput(result);
+    }
+
+    function readConfigEditor() {
+      let value;
+      try {
+        value = JSON.parse($("config-editor").value);
+      } catch (error) {
+        throw new Error("Configuration JSON is invalid: " + error.message);
+      }
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("Configuration JSON must contain an object at the top level.");
+      }
+      return value;
+    }
+
+    function renderConfigState(message = "") {
+      const restartRequired = state.configRestartRequired === true;
+      $("config-state").textContent = restartRequired ? "Restart required" : "Loaded";
+      $("config-state").className = "chip " + (restartRequired ? "warn" : "ok");
+      $("config-restart").hidden = !restartRequired;
+      $("config-restart-title").textContent = message || "Restart required";
+      $("config-restart-copy").textContent = "Restart the Ódinn gateway when you are ready to apply these settings.";
+    }
+
+    async function refreshConfig() {
+      $("config-error").textContent = "";
+      const result = await api("/config");
+      state.configFingerprint = result.fingerprint;
+      state.configRestartRequired = result.restartRequired === true;
+      $("config-editor").value = JSON.stringify(result.config, null, 2);
+      renderConfigState();
+    }
+
+    function formatConfig() {
+      try {
+        $("config-editor").value = JSON.stringify(readConfigEditor(), null, 2);
+        $("config-error").textContent = "";
+        showToast("Configuration JSON formatted.");
+      } catch (error) {
+        $("config-error").textContent = error.message;
+      }
+    }
+
+    async function saveConfig() {
+      const button = $("save-config");
+      $("config-error").textContent = "";
+      try {
+        const config = readConfigEditor();
+        setBusy(button, true);
+        const result = await api("/config", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ config, fingerprint: state.configFingerprint })
+        });
+        state.configFingerprint = result.fingerprint;
+        state.configRestartRequired = result.restartRequired === true;
+        $("config-editor").value = JSON.stringify(result.config, null, 2);
+        renderConfigState("Configuration saved");
+        showToast(state.configRestartRequired
+          ? "Configuration saved. Restart the gateway to apply it."
+          : "Configuration saved. No restart is needed.");
+      } catch (error) {
+        $("config-error").textContent = error.message;
+        showToast(error.message, "error");
+      } finally {
+        setBusy(button, false);
+      }
     }
 
     async function refresh() {
@@ -5685,6 +6035,21 @@ function renderConsoleHtml(version = "development") {
     });
 
     $("refresh").addEventListener("click", refresh);
+    $("format-config").addEventListener("click", formatConfig);
+    $("reload-config").addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      try {
+        setBusy(button, true);
+        await refreshConfig();
+        showToast("Configuration reloaded from disk.");
+      } catch (error) {
+        $("config-error").textContent = error.message;
+        showToast(error.message, "error");
+      } finally {
+        setBusy(button, false);
+      }
+    });
+    $("save-config").addEventListener("click", saveConfig);
     $("sidebar-search").addEventListener("click", () => {
       const query = window.prompt("Search sessions", "");
       if (query === null) return;
@@ -5693,7 +6058,7 @@ function renderConsoleHtml(version = "development") {
         item.hidden = Boolean(normalized) && !item.textContent.toLowerCase().includes(normalized);
       });
     });
-    $("sidebar-settings").addEventListener("click", () => switchView("usage"));
+    $("sidebar-settings").addEventListener("click", () => switchView("config"));
     $("sidebar-console").addEventListener("click", () => switchView("capabilities"));
     $("sidebar-theme").addEventListener("click", () => {
       document.body.classList.toggle("soft-contrast");
@@ -5761,7 +6126,7 @@ function renderConsoleHtml(version = "development") {
       }
     });
     $("chat-input").addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
         event.preventDefault();
         $("send-chat").click();
       }

@@ -2096,10 +2096,17 @@ async function chatWithModel(modelConfig: any, input: any = {}, { stateDir, sign
   try {
     const baseUrl = await resolveProviderBaseUrl(provider, stateDir);
     const tools = Array.isArray(input.tools) ? input.tools : [];
+    const responseMessages = isChatGptResponsesTransport
+      ? messages.filter((message: any) => message.role !== "system")
+      : messages;
     const requestBody = {
       model: parsed.model,
       ...(isResponsesTransport
-        ? { input: responsesInput(messages), ...(tools.length ? { tools: responseTools(tools) } : {}) }
+        ? {
+            input: responsesInput(responseMessages),
+            ...(isChatGptResponsesTransport ? { instructions: chatGptResponsesInstructions(messages) } : {}),
+            ...(tools.length ? { tools: responseTools(tools) } : {})
+          }
         : { messages: chatCompletionMessages(messages), ...(tools.length ? { tools: chatCompletionTools(tools) } : {}) }),
       ...(isChatGptResponsesTransport || streamRequested ? { stream: true, ...(isChatGptResponsesTransport ? { store: false } : {}) } : {}),
       ...(input.temperature === undefined ? {} : { temperature: normalizeTemperature(input.temperature) }),
@@ -2237,6 +2244,16 @@ function responsesInput(messages: any) {
     }
     return [{ role: message.role, content: message.content }];
   });
+}
+
+function chatGptResponsesInstructions(messages: any) {
+  const instructions = messages
+    .filter((message: any) => message.role === "system")
+    .map((message: any) => message.content)
+    .filter((content: any) => typeof content === "string" && content.trim())
+    .join("\n\n")
+    .trim();
+  return instructions || "Follow the user request.";
 }
 
 function chatCompletionMessages(messages: any) {

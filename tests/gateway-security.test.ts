@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { request as httpRequest } from "node:http";
-import { mkdtemp, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,11 +14,29 @@ test("gateway control surfaces require bootstrap authentication and reject cross
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     assert.equal((await fetch(`${base}/status`)).status, 401);
+    assert.equal((await fetch(`${base}/config`)).status, 401);
     const bootstrap = await fetch(`${base}/`);
     assert.equal(bootstrap.status, 200);
     const cookie = bootstrap.headers.get("set-cookie")?.split(";")[0];
     assert.ok(cookie);
     assert.equal((await fetch(`${base}/status`, { headers: { cookie } })).status, 200);
+    const configResponse = await fetch(`${base}/config`, { headers: { cookie } });
+    assert.equal(configResponse.status, 200);
+    const currentConfig = await configResponse.json();
+
+    const missingConfigOrigin = await fetch(`${base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", cookie },
+      body: JSON.stringify({ config: currentConfig.config, fingerprint: currentConfig.fingerprint })
+    });
+    assert.equal(missingConfigOrigin.status, 403);
+
+    const crossOriginConfig = await fetch(`${base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", cookie, origin: "https://evil.example" },
+      body: JSON.stringify({ config: currentConfig.config, fingerprint: currentConfig.fingerprint })
+    });
+    assert.equal(crossOriginConfig.status, 403);
 
     const missingCookieOrigin = await fetch(`${base}/run`, {
       method: "POST",
@@ -92,6 +110,41 @@ test("gateway state files and directory are owner-only", async () => {
     await stat(join(stateDir, "config.json"));
     assert.equal((await stat(stateDir)).mode & 0o777, 0o700);
     assert.equal((await stat(join(stateDir, "config.json"))).mode & 0o777, 0o600);
+  } finally {
+    await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
+  }
+});
+
+test("gateway rejects an audit path that escapes state before startup", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-unsafe-audit-"));
+  await writeFile(join(stateDir, "config.json"), `${JSON.stringify({ version: 1, auditLog: "../other-tenant/audit.jsonl" })}\n`, { mode: 0o600 });
+  await assert.rejects(
+    () => createGatewayServer({ stateDir, workspaceRoot: stateDir }),
+    /auditLog must be audit\.jsonl or an audit-\*\.jsonl filename/
+  );
+});
+
+test("configuration reads refuse symbolic-link swaps", { skip: process.platform === "win32" }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "odinn-config-symlink-"));
+  const outsideDir = await mkdtemp(join(tmpdir(), "odinn-config-outside-"));
+  const outside = join(outsideDir, "outside.json");
+  const outsideContents = '{"private":"must-not-be-returned"}\n';
+  await writeFile(outside, outsideContents, { mode: 0o644 });
+  const outsideMode = (await stat(outside)).mode & 0o777;
+  const server = await createGatewayServer({ stateDir, workspaceRoot: stateDir });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const bootstrap = await fetch(`${base}/`);
+    const cookie = bootstrap.headers.get("set-cookie")?.split(";")[0];
+    assert.ok(cookie);
+    await rename(join(stateDir, "config.json"), join(stateDir, "config.original.json"));
+    await symlink(outside, join(stateDir, "config.json"));
+    const response = await fetch(`${base}/config`, { headers: { cookie } });
+    assert.equal(response.status, 409);
+    assert.match((await response.json()).error, /symbolic link/);
+    assert.equal(await readFile(outside, "utf8"), outsideContents);
+    assert.equal((await stat(outside)).mode & 0o777, outsideMode);
   } finally {
     await new Promise((resolve: any, reject: any) => server.close((error: any) => error ? reject(error) : resolve()));
   }

@@ -98,6 +98,47 @@ test("multi-user host rate limits repeated authentication failures", async () =>
   } finally { await new Promise((resolve: any) => server.close(() => resolve())); }
 });
 
+test("multi-user host rejects tenant-controlled provider destinations and credentials", async () => {
+  const root = await mkdtemp(join(tmpdir(), "odinn-host-provider-policy-"));
+  const workspace = await mkdtemp(join(tmpdir(), "odinn-provider-policy-user-"));
+  const password = await hashPassword("provider-policy-password-long");
+  const publicOrigin = "https://odinn.test";
+  const server = await createMultiUserHost({
+    stateDir: root,
+    publicOrigin,
+    users: { schemaVersion: 1, users: [{ id: "alice", workspaceRoot: workspace, salt: password.salt, passwordHash: password.hash }] }
+  });
+  await new Promise((resolve: any) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const login = await fetch(`${base}/auth/login`, { method: "POST", headers: { "content-type": "application/json", origin: publicOrigin }, body: JSON.stringify({ userId: "alice", password: "provider-policy-password-long" }) });
+    assert.equal(login.status, 200);
+    const cookie = login.headers.get("set-cookie").split(";")[0];
+    const current = await (await fetch(`${base}/config`, { headers: { cookie } })).json();
+    const save = (provider: any) => fetch(`${base}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", cookie, origin: publicOrigin },
+      body: JSON.stringify({
+        config: { ...current.config, providers: { probe: provider }, defaultModel: "probe:model" },
+        fingerprint: current.fingerprint
+      })
+    });
+
+    const privateEndpoint = await save({ type: "openai-compatible", baseUrl: "http://127.0.0.1:4000/v1", apiKeyEnv: "OPENAI_API_KEY", models: ["model"] });
+    assert.equal(privateEndpoint.status, 400);
+    assert.match((await privateEndpoint.json()).error, /approved provider endpoints/);
+
+    const customCredential = await save({ type: "openai-compatible", baseUrl: "https://api.openai.com/v1", apiKeyEnv: "TENANT_CONTROLLED_SECRET", models: ["model"] });
+    assert.equal(customCredential.status, 400);
+    assert.match((await customCredential.json()).error, /credential environment variable/);
+
+    const approved = await save({ type: "openai-compatible", baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY", models: ["model"] });
+    assert.equal(approved.status, 200);
+  } finally {
+    await new Promise((resolve: any) => server.close(() => resolve()));
+  }
+});
+
 test("multi-user host preserves authentication throttles across restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "odinn-host-limit-restart-"));
   const workspace = await mkdtemp(join(tmpdir(), "odinn-limit-restart-user-"));

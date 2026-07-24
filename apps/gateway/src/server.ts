@@ -4,7 +4,7 @@ import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat as statPath, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
+import { createApprovalStore, createAuditStore, createBuiltInRegistry, createDifferentiatedRuntime, createIsolatedTaskExecutor, ExtensionRegistry, JobSupervisor, listConfiguredModels, normalizeExperimentalFlags, normalizeModelConfig, normalizeSelfImprovementConfig, oauthTokenPath, PROVIDER_PRESETS, ProofVerifier, runTask as executeTask, SkillPackageStore, toolSafetyDescriptor, validatePolicy, validateSkillPackage, withStateMutationLock } from "@odinn/kernel";
 import { createDefaultPolicy, evaluateTaskPolicy } from "@odinn/policy";
 import { FileJobStore, ensureSecureStateDirectory } from "@odinn/store-file";
 
@@ -494,13 +494,14 @@ export async function createGatewayServer({
   stateDir = ".odinn",
   workspaceRoot = process.cwd(),
   requestMaxBytes = DEFAULT_REQUEST_MAX_BYTES,
-  quotas = {}
+  quotas = {},
+  hosted = false
 }: any = {}) {
   const state = resolve(stateDir);
   const root = resolve(workspaceRoot);
   const version = await productVersion();
   await ensureSecureStateDirectory(state);
-  const config = await readConfig(state);
+  const config = await readConfig(state, { hosted });
   const featureFlags = normalizeExperimentalFlags(config.experimental);
   const runtime = createDifferentiatedRuntime({ stateDir: state, workspaceRoot: root, featureFlags });
   const auditStore = createAuditStore(join(state, config.auditLog ?? "audit.jsonl"));
@@ -566,7 +567,7 @@ export async function createGatewayServer({
         return json(response, 403, { ok: false, error: "origin rejected for control-plane mutation" });
       }
       if (request.method === "GET" && url.pathname === "/config") {
-        const editable = await readEditableConfig(state);
+        const editable = await readEditableConfig(state, { hosted });
         return json(response, 200, {
           ok: true,
           ...editable,
@@ -575,7 +576,7 @@ export async function createGatewayServer({
       }
       if (request.method === "PUT" && url.pathname === "/config") {
         const body = await readJson(request, { maxBytes: requestMaxBytes });
-        const saved = await writeEditableConfig(state, body);
+        const saved = await writeEditableConfig(state, body, { hosted });
         return json(response, 200, {
           ok: true,
           ...saved,
@@ -1375,11 +1376,76 @@ async function streamAuditEvents(request: any, response: any, auditStore: any, u
   request.on("close", () => clearInterval(poll));
 }
 
-async function readConfig(state: any) {
+const HOSTED_PROVIDER_ENDPOINTS = new Set<string>();
+const HOSTED_PROVIDER_ENV_NAMES = new Set<string>();
+const HOSTED_PROVIDER_AUTH_URLS = new Set<string>();
+for (const preset of Object.values(PROVIDER_PRESETS) as any[]) {
+  for (const value of [preset.baseUrl, preset.oauth?.baseUrl]) {
+    const normalized = normalizeHostedProviderUrl(value);
+    if (normalized && !isPrivateHostedProviderUrl(normalized)) HOSTED_PROVIDER_ENDPOINTS.add(normalized);
+  }
+  for (const value of [preset.apiKeyEnv, preset.oauth?.auth?.clientIdEnv, preset.oauth?.auth?.clientSecretEnv, preset.auth?.clientIdEnv, preset.auth?.clientSecretEnv]) {
+    if (typeof value === "string" && value.trim()) HOSTED_PROVIDER_ENV_NAMES.add(value.trim());
+  }
+  for (const auth of [preset.oauth?.auth, preset.auth]) {
+    for (const value of [auth?.authorizationUrl, auth?.tokenUrl]) {
+      const normalized = normalizeHostedProviderUrl(value);
+      if (normalized) HOSTED_PROVIDER_AUTH_URLS.add(normalized);
+    }
+  }
+}
+
+function normalizeHostedProviderUrl(value: any) {
+  if (typeof value !== "string" || !value.trim()) return "";
+  try {
+    const parsed = new URL(value.trim());
+    if (!/^https?:$/u.test(parsed.protocol) || parsed.username || parsed.password || parsed.hash) return "";
+    return parsed.href.replace(/\/+$/u, "");
+  } catch {
+    return "";
+  }
+}
+
+function isPrivateHostedProviderUrl(value: string) {
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || /^(?:0\.|10\.|127\.|169\.254\.|192\.168\.)/u.test(host) || /^172\.(?:1[6-9]|2\d|3[01])\./u.test(host) || host === "::1";
+  } catch {
+    return true;
+  }
+}
+
+function validateHostedProviderConfig(config: any) {
+  for (const [name, provider] of Object.entries(config?.providers ?? {}) as Array<[string, any]>) {
+    const auth = provider?.auth && typeof provider.auth === "object" && !Array.isArray(provider.auth) ? provider.auth : {};
+    if (provider?.type === "cli" || String(provider?.transport ?? "").startsWith("cli-") || auth.mode === "cli") {
+      throw new GatewayError(400, `multi-user host does not allow CLI provider ${name}`);
+    }
+    if (provider?.baseUrl) {
+      const baseUrl = normalizeHostedProviderUrl(provider.baseUrl);
+      if (!baseUrl || !HOSTED_PROVIDER_ENDPOINTS.has(baseUrl)) {
+        throw new GatewayError(400, `multi-user host only permits approved provider endpoints: ${name}`);
+      }
+    }
+    for (const [label, value] of [["apiKeyEnv", provider?.apiKeyEnv], ["clientIdEnv", auth.clientIdEnv], ["clientSecretEnv", auth.clientSecretEnv]] as Array<[string, any]>) {
+      if (value && !HOSTED_PROVIDER_ENV_NAMES.has(String(value).trim())) {
+        throw new GatewayError(400, `multi-user host does not allow custom provider credential environment variable: ${label}`);
+      }
+    }
+    for (const [label, value] of [["authorizationUrl", auth.authorizationUrl], ["tokenUrl", auth.tokenUrl]] as Array<[string, any]>) {
+      if (value && !HOSTED_PROVIDER_AUTH_URLS.has(normalizeHostedProviderUrl(value))) {
+        throw new GatewayError(400, `multi-user host does not allow custom provider ${label}`);
+      }
+    }
+  }
+}
+
+async function readConfig(state: any, { hosted = false }: any = {}) {
   const path = join(state, "config.json");
   try {
     const config = JSON.parse(await readFile(path, "utf8"));
     validateGatewayConfig(config);
+    if (hosted) validateHostedProviderConfig(config);
     await chmod(path, 0o600);
     return config;
   } catch (error: any) {
@@ -1388,6 +1454,7 @@ async function readConfig(state: any) {
       try {
         const existing = JSON.parse(await readFile(path, "utf8"));
         validateGatewayConfig(existing);
+        if (hosted) validateHostedProviderConfig(existing);
         await chmod(path, 0o600);
         return existing;
       } catch (readError: any) {
@@ -1569,7 +1636,7 @@ async function openEditableConfigFile(path: string) {
   }
 }
 
-async function readEditableConfig(state: string) {
+async function readEditableConfig(state: string, { hosted = false }: any = {}) {
   const path = join(state, "config.json");
   const handle = await openEditableConfigFile(path);
   let contents;
@@ -1586,11 +1653,13 @@ async function readEditableConfig(state: string) {
     throw new GatewayError(409, "config.json is not valid JSON");
   }
   validateGatewayConfig(config);
+  if (hosted) validateHostedProviderConfig(config);
   return { config, fingerprint: configFingerprint(contents) };
 }
 
-async function writeEditableConfig(state: string, input: any) {
+async function writeEditableConfig(state: string, input: any, { hosted = false }: any = {}) {
   validateGatewayConfig(input?.config);
+  if (hosted) validateHostedProviderConfig(input?.config);
   const expectedFingerprint = String(input?.fingerprint ?? "");
   if (!/^[a-f0-9]{64}$/.test(expectedFingerprint)) {
     throw new GatewayError(400, "a current config fingerprint is required");

@@ -81,7 +81,7 @@ export async function createMultiUserHost({ stateDir = ".odinn-host", users, pub
     const userState = resolve(root, "users", user.id);
     if (!userState.startsWith(`${root}${sep}`)) throw new Error("invalid tenant state path");
     const workspaceRoot = await realpath(resolve(user.workspaceRoot));
-    const gateway = await createGatewayServer({ stateDir: userState, workspaceRoot, quotas: user.quotas ?? tenantLimits });
+    const gateway = await createGatewayServer({ stateDir: userState, workspaceRoot, quotas: user.quotas ?? tenantLimits, hosted: true });
     await new Promise((resolveListen: any) => gateway.listen(0, "127.0.0.1", resolveListen));
     const value = { gateway, port: (gateway.address() as any).port, token: (gateway as any).odinnAuthToken, stateDir: userState, lastUsedAt: Date.now() };
     tenants.set(user.id, value);

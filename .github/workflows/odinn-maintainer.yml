@@ -33,31 +33,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # pull_request_target runs trusted workflow code from the base branch.
-      # Never check out or execute the untrusted PR head.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      # Keep the event workflow in Odinn, but execute the reviewed logic from
+      # the separately owned maintainer repository at an immutable commit.
+      - id: maintainer
+        uses: jason-allen-oneal/odinn-maintainer/.github/actions/review@d19f36eb5ac4423f0a908a29284bffc7ef8d6a56 # v0.1.0
         with:
-          # For pull_request_target this is the trusted base commit. For a
-          # manual dispatch it is the selected workflow branch, which makes a
-          # new action testable before it lands on the default branch.
-          ref: ${{ github.sha }}
-          fetch-depth: 1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "24"
-      - name: Run bounded review
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_EVENT_PATH: ${{ github.event_path }}
-          # This is the OAuth token record exported from Odinn's
-          # .odinn/oauth/openai.json. It is never written to the repository or
-          # included in the GitHub comment.
-          ODINN_OPENAI_OAUTH_JSON: ${{ secrets.ODINN_OPENAI_OAUTH_JSON }}
-          ODINN_MAINTAINER_MODEL: ${{ vars.ODINN_MAINTAINER_MODEL || 'gpt-5.5' }}
-          ODINN_OPENAI_OAUTH_CLIENT_ID: ${{ vars.ODINN_OPENAI_OAUTH_CLIENT_ID || 'app_EMoamEEZ73f0CkXaXp7hrann' }}
-          ODINN_OPENAI_ORIGINATOR: ${{ vars.ODINN_OPENAI_ORIGINATOR || 'openclaw' }}
-          ODINN_OPENAI_CLIENT_VERSION: ${{ vars.ODINN_OPENAI_CLIENT_VERSION || '2026.6.11' }}
-          ODINN_MAINTAINER_NUMBER: ${{ inputs.number }}
-        run: node .github/maintainer/index.mjs
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          oauth-json: ${{ secrets.ODINN_OPENAI_OAUTH_JSON }}
+          model: ${{ vars.ODINN_MAINTAINER_MODEL || 'gpt-5.5' }}
+          number: ${{ inputs.number }}
+          oauth-client-id: ${{ vars.ODINN_OPENAI_OAUTH_CLIENT_ID || 'app_EMoamEEZ73f0CkXaXp7hrann' }}
+          originator: ${{ vars.ODINN_OPENAI_ORIGINATOR || 'openclaw' }}
+          client-version: ${{ vars.ODINN_OPENAI_CLIENT_VERSION || '2026.6.11' }}

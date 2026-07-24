@@ -3251,6 +3251,7 @@ function renderConsoleHtml(version = "development") {
       .overview-grid, .layout-grid, .split, .grid-2, .chat-shell, .capability-grid, .stat-strip, .record-grid {
         grid-template-columns: 1fr;
       }
+      .config-check-grid { grid-template-columns: 1fr; }
       .stat-strip {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
@@ -3348,11 +3349,27 @@ function renderConsoleHtml(version = "development") {
     }
     .oc-page { max-width: 1320px; }
     .oc-page .page-head h1 { color: var(--text); }
-    .config-page { max-width: 980px; }
-    .config-editor { min-height: min(62vh, 720px); padding: 16px; font-size: 13px; line-height: 1.55; tab-size: 2; }
+    .config-page { max-width: 1180px; }
+    .config-section { gap: 14px; }
+    .config-section > .panel-head { margin-bottom: 0; }
     .config-guidance { margin: 0; color: var(--muted); line-height: 1.55; }
-    .config-actions { justify-content: space-between; }
+    .config-actions { justify-content: space-between; position: sticky; bottom: 0; z-index: 2; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--surface) 94%, transparent); backdrop-filter: blur(8px); }
     .config-actions > .row { gap: 8px; }
+    .config-actions .button-primary { margin-left: auto; }
+    .config-card { display: grid; gap: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #121720; }
+    .config-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+    .config-card-head h3 { margin: 0; font-size: 15px; }
+    .config-card-head p { margin: 3px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .config-subsection { display: grid; gap: 10px; padding-top: 10px; border-top: 1px solid var(--line-soft); }
+    .config-subsection h3 { margin: 0; font-size: 13px; }
+    .config-list { display: grid; gap: 8px; }
+    .config-list-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; }
+    .config-list-row > .field { min-width: 0; }
+    .config-list-row .danger-button { min-height: 38px; }
+    .config-help { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .config-check-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 14px; }
+    .config-check-grid .switch-label { min-height: 36px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #10161f; }
+    .config-actions .secondary { white-space: nowrap; }
     .config-restart { display: grid; gap: 4px; padding: 13px 15px; border: 1px solid #7b632c; border-radius: 10px; background: #2b2414; color: #f3d891; }
     .config-restart strong { color: #ffe5a2; }
     .summary-bar { display: flex; align-items: center; gap: 34px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: #151a22; }
@@ -3942,26 +3959,87 @@ function renderConsoleHtml(version = "development") {
         <div class="page oc-page config-page">
           <div class="page-head">
             <div>
-              <div class="section-kicker">Advanced workspace setup</div>
+              <div class="section-kicker">Everything Ódinn can configure</div>
               <h1>Configuration</h1>
-              <p>Edit the JSON that Ódinn reads from <code>.odinn/config.json</code>. Changes are written safely and remain local to this workspace.</p>
+              <p>Set up providers, safety rules, experimental features, memory, and runtime behavior without editing JSON by hand.</p>
             </div>
             <span class="chip" id="config-state">Not loaded</span>
           </div>
-          <div class="panel stack">
-            <div class="panel-head"><div><h2>Configuration JSON</h2><span class="muted">Unknown settings are preserved.</span></div><span class="chip warn">Advanced</span></div>
-            <p class="config-guidance">Use valid JSON with an object at the top level. Credentials and OAuth tokens should stay outside this file; use environment variables or Ódinn's connection setup for secrets.</p>
-            <div class="field">
-              <label for="config-editor">config.json</label>
-              <textarea id="config-editor" class="config-editor" aria-describedby="config-guidance config-error" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
-              <span id="config-guidance" class="muted">Saving preserves a private owner-only file. Runtime settings take effect after the gateway restarts.</span>
-              <div id="config-error" class="inline-error" role="alert" aria-live="assertive"></div>
-            </div>
-            <div class="row config-actions">
-              <div class="row"><button class="secondary" id="format-config" type="button">Format JSON</button><button class="secondary" id="reload-config" type="button">Reload from disk</button></div>
-              <button id="save-config" type="button">Save configuration</button>
-            </div>
+          <div class="config-actions">
+            <div class="row"><span class="muted">Saved to <code>.odinn/config.json</code></span><span class="muted" id="config-field-count"></span></div>
+            <div class="row"><button class="secondary" id="reload-config" type="button">Reload from disk</button><button class="button-primary" id="save-config" type="button">Save configuration</button></div>
           </div>
+          <div id="config-error" class="inline-error" role="alert" aria-live="assertive"></div>
+          <form id="config-form" class="stack" novalidate>
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>General</h2><p class="config-help">The basic identity and default behavior for this workspace.</p></div></div>
+              <div class="grid-2">
+                <div class="field"><label for="config-version">Configuration version</label><input id="config-version" data-config-field="version" type="number" min="1" max="1" readonly><span class="config-help">The current format is version 1.</span></div>
+                <div class="field"><label for="config-audit-log">Audit log filename</label><input id="config-audit-log" data-config-field="auditLog" autocomplete="off"><span class="config-help">Use <code>audit.jsonl</code> or an <code>audit-*.jsonl</code> filename.</span></div>
+              </div>
+              <div class="field"><label for="config-default-model">Default model</label><input id="config-default-model" data-config-field="defaultModel" placeholder="provider:model" autocomplete="off"><span class="config-help">Used when a chat does not choose a model explicitly.</span></div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Model providers</h2><p class="config-help">Connect one or more OpenAI-compatible providers. API keys and OAuth tokens stay outside this file.</p></div><button class="secondary" id="config-add-provider" type="button">Add provider</button></div>
+              <div id="config-providers" class="config-list"></div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Policy and safety</h2><p class="config-help">Choose which capabilities are available and how web and browser access behave.</p></div></div>
+              <div class="grid-2">
+                <div class="field"><label for="config-policy-max-input">Maximum input bytes</label><input id="config-policy-max-input" data-config-policy="maxInputBytes" type="number" min="1" step="1"><span class="config-help">Requests above this size are rejected.</span></div>
+                <div class="field"><label for="config-policy-id">Policy name</label><input id="config-policy-id" data-config-policy="id" placeholder="Optional policy identifier" autocomplete="off"></div>
+              </div>
+              <div class="grid-2">
+                <div class="field"><label for="config-policy-allowed">Allowed capabilities</label><textarea id="config-policy-allowed" data-config-policy="allowedCapabilities" rows="7" placeholder="model.chat&#10;web.read"></textarea><span class="config-help">One capability per line.</span></div>
+                <div class="field"><label for="config-policy-denied">Denied tools</label><textarea id="config-policy-denied" data-config-policy="deniedTools" rows="7" placeholder="browser.click"></textarea><span class="config-help">One tool name per line.</span></div>
+              </div>
+              <div class="config-subsection">
+                <div><h3>Public web reading</h3><p class="config-help">These rules apply to web search and webpage reading.</p></div>
+                <div class="config-check-grid"><label class="switch-label"><input type="checkbox" data-config-security="web.enabled"> Enabled</label><label class="switch-label"><input type="checkbox" data-config-security="web.allowPrivateNetwork"> Allow private networks</label><label class="switch-label"><input type="checkbox" data-config-security="web.requireApproval"> Require approval</label><label class="switch-label"><input type="checkbox" data-config-security="web.allowDownloads"> Allow downloads</label><label class="switch-label"><input type="checkbox" data-config-security="web.allowUploads"> Allow uploads</label></div>
+                <div class="grid-2"><div class="field"><label for="config-web-allowed">Allowed domains</label><textarea id="config-web-allowed" data-config-security-list="web.allowedDomains" rows="4" placeholder="example.com"></textarea><span class="config-help">Blank allows any public domain.</span></div><div class="field"><label for="config-web-blocked">Blocked domains</label><textarea id="config-web-blocked" data-config-security-list="web.blockedDomains" rows="4" placeholder="example.net"></textarea></div></div>
+              </div>
+              <div class="config-subsection">
+                <div><h3>Browser access</h3><p class="config-help">Browser actions can read pages and, by default, require your approval before changing external state.</p></div>
+                <div class="config-check-grid"><label class="switch-label"><input type="checkbox" data-config-security="browser.enabled"> Enabled</label><label class="switch-label"><input type="checkbox" data-config-security="browser.allowPrivateNetwork"> Allow private networks</label><label class="switch-label"><input type="checkbox" data-config-security="browser.requireApproval"> Require approval for actions</label><label class="switch-label"><input type="checkbox" data-config-security="browser.allowDownloads"> Allow downloads</label><label class="switch-label"><input type="checkbox" data-config-security="browser.allowUploads"> Allow uploads</label></div>
+                <div class="grid-2"><div class="field"><label for="config-browser-allowed">Allowed domains</label><textarea id="config-browser-allowed" data-config-security-list="browser.allowedDomains" rows="4" placeholder="example.com"></textarea></div><div class="field"><label for="config-browser-blocked">Blocked domains</label><textarea id="config-browser-blocked" data-config-security-list="browser.blockedDomains" rows="4" placeholder="example.net"></textarea></div></div>
+              </div>
+              <div class="config-subsection">
+                <div><h3>Sentinel invariants</h3><p class="config-help">Optional rules used by the safety preview when Sentinel is enabled.</p></div>
+                <div class="grid-2"><div class="field"><label for="config-policy-version">Policy version</label><input id="config-policy-version" data-config-policy="version" type="number" min="1" step="1"></div><div class="field"><label for="config-policy-invariants-help">Invariant format</label><input id="config-policy-invariants-help" value="id · type · values · enforcement" readonly></div></div>
+                <div id="config-invariants" class="config-list"></div>
+                <button class="secondary" id="config-add-invariant" type="button">Add invariant</button>
+              </div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Experimental features</h2><p class="config-help">These controls expose the Labs capabilities. Leave them off until you understand the behavior.</p></div></div>
+              <div class="config-check-grid">
+                <label class="switch-label"><input type="checkbox" data-config-experimental="proof"> Proof checks</label><label class="switch-label"><input type="checkbox" data-config-experimental="sentinel"> Sentinel safety preview</label><label class="switch-label"><input type="checkbox" data-config-experimental="capabilities"> Capability tokens</label><label class="switch-label"><input type="checkbox" data-config-experimental="rewind"> Restore points</label><label class="switch-label"><input type="checkbox" data-config-experimental="capsules"> Portable runs</label><label class="switch-label"><input type="checkbox" data-config-experimental="counterfactual"> Compare approaches</label><label class="switch-label"><input type="checkbox" data-config-experimental="darwin"> Smart routing</label>
+              </div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Automatic improvement</h2><p class="config-help">Control how Ódinn observes recurring problems and applies bounded, reversible reliability changes.</p></div></div>
+              <div class="grid-2"><div class="field"><label for="config-self-mode">Mode</label><select id="config-self-mode" data-config-self="mode"><option value="disabled">Disabled</option><option value="propose">Propose changes</option><option value="auto">Apply safe changes automatically</option></select></div><div class="field"><label for="config-self-interval">Check interval (milliseconds)</label><input id="config-self-interval" data-config-self="intervalMs" type="number" min="30000" max="86400000" step="1000"></div><div class="field"><label for="config-self-max">Maximum changes per check</label><input id="config-self-max" data-config-self="maxChangesPerCycle" type="number" min="1" max="3" step="1"></div><label class="switch-label"><input type="checkbox" data-config-self="enabled"> Automatic improvement enabled</label><label class="switch-label"><input type="checkbox" data-config-self="rollbackOnFailure"> Roll back when an improvement fails</label></div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Runtime</h2><p class="config-help">Small runtime tuning values. Lower retries fail faster; higher retries tolerate temporary provider failures.</p></div></div>
+              <div class="field"><label for="config-runtime-retries">Model retries</label><input id="config-runtime-retries" data-config-runtime="modelRetries" type="number" min="0" max="4" step="1"></div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Proof command allowlist</h2><p class="config-help">Exact executable argument vectors allowed for Proof checks. Put one argument on each line; the first line must be an absolute executable path.</p></div><button class="secondary" id="config-add-command" type="button">Add command</button></div>
+              <div id="config-proof-commands" class="config-list"></div>
+            </div>
+
+            <div class="panel config-section">
+              <div class="panel-head"><div><h2>Memory behavior</h2><p class="config-help">Choose which automatic memory behaviors agent runs may use when the matching capabilities are allowed.</p></div></div>
+              <div class="config-check-grid"><label class="switch-label"><input type="checkbox" data-config-memory="autoRecall"> Recall relevant memories</label><label class="switch-label"><input type="checkbox" data-config-memory="autoLearn"> Suggest memories from conversations</label><label class="switch-label"><input type="checkbox" data-config-memory="autoCompact"> Compact long sessions</label></div>
+            </div>
+          </form>
           <div id="config-restart" class="config-restart" role="status" hidden>
             <strong id="config-restart-title">Restart required</strong>
             <span id="config-restart-copy">Restart the Ódinn gateway when you are ready to apply these settings.</span>
@@ -4090,6 +4168,7 @@ function renderConsoleHtml(version = "development") {
       activityTab: "overview",
       configFingerprint: "",
       configRestartRequired: false,
+      config: null,
       activeView: "overview"
     };
     const experimentalFeatures = {
@@ -5204,17 +5283,205 @@ function renderConsoleHtml(version = "development") {
       showOutput(result);
     }
 
-    function readConfigEditor() {
-      let value;
-      try {
-        value = JSON.parse($("config-editor").value);
-      } catch (error) {
-        throw new Error("Configuration JSON is invalid: " + error.message);
+    function cloneConfig(value) {
+      return JSON.parse(JSON.stringify(value && typeof value === "object" ? value : {}));
+    }
+
+    function configLines(value) {
+      return String(value || "").split(/\\r?\\n/u).map((item) => item.trim()).filter(Boolean);
+    }
+
+    function configNumber(value, fallback) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : fallback;
+    }
+
+    function configField(container, name) {
+      return container.querySelector('[data-config-field="' + name + '"]');
+    }
+
+    function selectedOption(value, current) {
+      return String(value) === String(current) ? " selected" : "";
+    }
+
+    function renderOptions(values, current) {
+      const options = values.map((value) => '<option value="' + escapeHtml(value) + '"' + selectedOption(value, current) + '>' + escapeHtml(value) + '</option>');
+      if (current && !values.includes(current)) options.unshift('<option value="' + escapeHtml(current) + '" selected>' + escapeHtml(current) + '</option>');
+      return options.join("");
+    }
+
+    function renderAuthParams(params) {
+      return Object.entries(params && typeof params === "object" && !Array.isArray(params) ? params : {}).map(([key, value]) => \`
+        <div class="config-list-row" data-auth-param-row>
+          <div class="grid-2"><div class="field"><label>Parameter name</label><input data-auth-param-key value="\${escapeHtml(key)}" autocomplete="off"></div><div class="field"><label>Value</label><input data-auth-param-value value="\${escapeHtml(value)}" autocomplete="off"></div></div>
+          <button class="danger-button" data-remove-auth-param type="button" aria-label="Remove OAuth authorization parameter">Remove</button>
+        </div>\`).join("");
+    }
+
+    function renderProviderForm(name, provider = {}) {
+      const auth = provider.auth && typeof provider.auth === "object" ? provider.auth : {};
+      return \`
+        <article class="config-card" data-provider-card data-original-name="\${escapeHtml(name)}">
+          <div class="config-card-head"><div><h3>Provider</h3><p>Configure the connection metadata. Never paste an API key or OAuth token here.</p></div><button class="danger-button" data-remove-provider type="button">Remove provider</button></div>
+          <div class="grid-2">
+            <div class="field"><label>Provider name</label><input data-provider-field="name" value="\${escapeHtml(name)}" placeholder="openai" autocomplete="off"></div>
+            <div class="field"><label>Provider type</label><select data-provider-field="type">\${renderOptions(["openai-compatible", "cli"], provider.type || "openai-compatible")}</select></div>
+            <div class="field"><label>Base URL</label><input data-provider-field="baseUrl" value="\${escapeHtml(provider.baseUrl || "")}" placeholder="https://api.example.com/v1" autocomplete="off"></div>
+            <div class="field"><label>API key environment variable</label><input data-provider-field="apiKeyEnv" value="\${escapeHtml(provider.apiKeyEnv || "")}" placeholder="OPENAI_API_KEY" autocomplete="off"></div>
+            <div class="field"><label>Transport</label><input data-provider-field="transport" value="\${escapeHtml(provider.transport || "")}" placeholder="openai-chat-completions" autocomplete="off"></div>
+            <div class="field"><label>Models</label><textarea data-provider-field="models" rows="3" placeholder="gpt-4.1-mini\\none-model-per-line">\${escapeHtml(Array.isArray(provider.models) ? provider.models.join("\\n") : "")}</textarea></div>
+          </div>
+          <div class="config-subsection">
+            <div><h3>Authentication</h3><p class="config-help">Select the authentication flow for this provider. Secrets remain in the environment or private OAuth store.</p></div>
+            <div class="grid-2">
+              <div class="field"><label>Authentication mode</label><select data-provider-auth="mode">\${renderOptions(["api-key", "oauth", "device", "cli"], auth.mode || "api-key")}</select></div>
+              <div class="field"><label>Authentication flow</label><input data-provider-auth="flow" value="\${escapeHtml(auth.flow || "")}" placeholder="generic-pkce" autocomplete="off"></div>
+              <div class="field"><label>Authorization URL</label><input data-provider-auth="authorizationUrl" value="\${escapeHtml(auth.authorizationUrl || "")}" placeholder="https://login.example.com/authorize" autocomplete="off"></div>
+              <div class="field"><label>Token URL</label><input data-provider-auth="tokenUrl" value="\${escapeHtml(auth.tokenUrl || "")}" placeholder="https://login.example.com/token" autocomplete="off"></div>
+              <div class="field"><label>Client ID</label><input data-provider-auth="clientId" value="\${escapeHtml(auth.clientId || "")}" autocomplete="off"></div>
+              <div class="field"><label>Client ID environment variable</label><input data-provider-auth="clientIdEnv" value="\${escapeHtml(auth.clientIdEnv || "")}" autocomplete="off"></div>
+              <div class="field"><label>Client secret environment variable</label><input data-provider-auth="clientSecretEnv" value="\${escapeHtml(auth.clientSecretEnv || "")}" autocomplete="off"></div>
+              <div class="field"><label>CLI command environment variable</label><input data-provider-auth="commandEnv" value="\${escapeHtml(auth.commandEnv || "")}" placeholder="ODINN_ANTIGRAVITY_CLI" autocomplete="off"><span class="config-help">Used when authentication mode is CLI.</span></div>
+              <div class="field"><label>Scopes</label><textarea data-provider-auth="scopes" rows="3" placeholder="openid\\noffline_access">\${escapeHtml(Array.isArray(auth.scopes) ? auth.scopes.join("\\n") : "")}</textarea></div>
+              <div class="field"><label>Redirect URI</label><input data-provider-auth="redirectUri" value="\${escapeHtml(auth.redirectUri || "")}" placeholder="http://localhost:1455/auth/callback" autocomplete="off"></div>
+              <div class="field"><label>OAuth token filename</label><input data-provider-auth="tokenFile" value="\${escapeHtml(auth.tokenFile || "")}" placeholder="oauth/provider.json" autocomplete="off"></div>
+            </div>
+            <div class="config-subsection"><div><h3>Authorization parameters</h3><p class="config-help">Optional name/value pairs added to the authorization request.</p></div><div class="config-list" data-auth-params>\${renderAuthParams(auth.authorizationParams)}</div><button class="secondary" data-add-auth-param type="button">Add authorization parameter</button></div>
+          </div>
+        </article>\`;
+    }
+
+    function renderInvariantForm(invariant = {}) {
+      return \`<div class="config-card" data-invariant-row><div class="config-list-row"><div class="grid-2"><div class="field"><label>Invariant ID</label><input data-invariant-field="id" value="\${escapeHtml(invariant.id || "")}" placeholder="deny-shell" autocomplete="off"></div><div class="field"><label>Type</label><select data-invariant-field="type">\${renderOptions(["command.deny-pattern", "tool.requires-approval", "filesystem.allowed-roots"], invariant.type || "command.deny-pattern")}</select></div><div class="field"><label>Values</label><textarea data-invariant-field="values" rows="3" placeholder="One value per line">\${escapeHtml(Array.isArray(invariant.values) ? invariant.values.join("\\n") : "")}</textarea></div><div class="field"><label>Enforcement</label><select data-invariant-field="enforcement">\${renderOptions(["log", "warn", "pause", "block", "rollback", "terminate"], invariant.enforcement || "block")}</select></div></div><button class="danger-button" data-remove-invariant type="button">Remove</button></div></div>\`;
+    }
+
+    function renderProofCommand(command = []) {
+      return \`<div class="config-list-row" data-proof-command><div class="field"><label>Exact command arguments</label><textarea data-command-args rows="3" placeholder="/usr/bin/git\\nstatus\\n--short">\${escapeHtml(Array.isArray(command) ? command.join("\\n") : "")}</textarea></div><button class="danger-button" data-remove-command type="button">Remove</button></div>\`;
+    }
+
+    function renderConfigForm(config) {
+      const value = cloneConfig(config);
+      const policy = value.policy || {};
+      const security = policy.security || {};
+      const web = security.web || {};
+      const browser = security.browser || {};
+      const experimental = value.experimental || {};
+      const selfImprovement = value.selfImprovement || {};
+      const memory = value.memory || {};
+      $("config-version").value = configNumber(value.version, 1);
+      $("config-audit-log").value = value.auditLog || "audit.jsonl";
+      $("config-default-model").value = value.defaultModel || "";
+      $("config-policy-max-input").value = configNumber(policy.maxInputBytes, 16384);
+      $("config-policy-id").value = policy.id || "";
+      $("config-policy-version").value = policy.version || "";
+      $("config-policy-allowed").value = Array.isArray(policy.allowedCapabilities) ? policy.allowedCapabilities.join("\\n") : "";
+      $("config-policy-denied").value = Array.isArray(policy.deniedTools) ? policy.deniedTools.join("\\n") : "";
+      for (const [surface, source] of [["web", web], ["browser", browser]]) {
+        for (const key of ["enabled", "allowPrivateNetwork", "requireApproval", "allowDownloads", "allowUploads"]) {
+          const input = document.querySelector('[data-config-security="' + surface + "." + key + '"]');
+          if (input) input.checked = source[key] === true;
+        }
+        for (const key of ["allowedDomains", "blockedDomains"]) {
+          const input = document.querySelector('[data-config-security-list="' + surface + "." + key + '"]');
+          if (input) input.value = Array.isArray(source[key]) ? source[key].join("\\n") : "";
+        }
       }
-      if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("Configuration JSON must contain an object at the top level.");
+      for (const key of ["proof", "sentinel", "capabilities", "rewind", "capsules", "counterfactual", "darwin"]) {
+        const input = document.querySelector('[data-config-experimental="' + key + '"]');
+        if (input) input.checked = experimental[key] === true;
       }
-      return value;
+      for (const key of ["enabled", "rollbackOnFailure"]) {
+        const input = document.querySelector('[data-config-self="' + key + '"]');
+        if (input) input.checked = selfImprovement[key] !== false;
+      }
+      $("config-self-mode").value = selfImprovement.mode || "auto";
+      $("config-self-interval").value = configNumber(selfImprovement.intervalMs, 300000);
+      $("config-self-max").value = configNumber(selfImprovement.maxChangesPerCycle, 1);
+      $("config-runtime-retries").value = configNumber(value.runtime?.modelRetries, 0);
+      for (const key of ["autoRecall", "autoLearn", "autoCompact"]) {
+        const input = document.querySelector('[data-config-memory="' + key + '"]');
+        if (input) input.checked = memory[key] !== false;
+      }
+      $("config-providers").innerHTML = Object.entries(value.providers || {}).map(([name, provider]) => renderProviderForm(name, provider)).join("") || '<div class="empty-state"><strong>No providers configured</strong><span>Add a provider to make model conversations available.</span></div>';
+      $("config-invariants").innerHTML = (Array.isArray(policy.invariants) ? policy.invariants : []).map(renderInvariantForm).join("") || '<div class="empty-state"><strong>No Sentinel invariants</strong><span>Add a rule only when you need a policy check beyond the default capability controls.</span></div>';
+      $("config-proof-commands").innerHTML = (Array.isArray(value.proof?.allowedCommands) ? value.proof.allowedCommands : []).map(renderProofCommand).join("") || '<div class="empty-state"><strong>No Proof commands allowed</strong><span>Proof command checks remain unavailable until you add an exact executable argument vector.</span></div>';
+      $("config-field-count").textContent = "All supported fields shown; unknown settings are preserved.";
+    }
+
+    function readStructuredConfig() {
+      const config = cloneConfig(state.config || {});
+      config.version = configNumber($("config-version").value, 1);
+      config.auditLog = $("config-audit-log").value.trim();
+      config.defaultModel = $("config-default-model").value.trim();
+      const policy = { ...(config.policy || {}) };
+      policy.maxInputBytes = configNumber($("config-policy-max-input").value, 16384);
+      const policyId = $("config-policy-id").value.trim();
+      if (policyId) policy.id = policyId; else delete policy.id;
+      const policyVersion = $("config-policy-version").value.trim();
+      if (policyVersion) policy.version = configNumber(policyVersion, 1); else delete policy.version;
+      policy.allowedCapabilities = configLines($("config-policy-allowed").value);
+      policy.deniedTools = configLines($("config-policy-denied").value);
+      policy.security = { ...(policy.security || {}) };
+      for (const surface of ["web", "browser"]) {
+        const current = { ...(policy.security[surface] || {}) };
+        for (const key of ["enabled", "allowPrivateNetwork", "requireApproval", "allowDownloads", "allowUploads"]) {
+          const input = document.querySelector('[data-config-security="' + surface + "." + key + '"]');
+          if (input) current[key] = input.checked;
+        }
+        for (const key of ["allowedDomains", "blockedDomains"]) {
+          const input = document.querySelector('[data-config-security-list="' + surface + "." + key + '"]');
+          current[key] = configLines(input?.value);
+        }
+        policy.security[surface] = current;
+      }
+      policy.invariants = Array.from(document.querySelectorAll("[data-invariant-row]")).map((row) => ({
+        id: row.querySelector('[data-invariant-field="id"]').value.trim(),
+        type: row.querySelector('[data-invariant-field="type"]').value,
+        values: configLines(row.querySelector('[data-invariant-field="values"]').value),
+        enforcement: row.querySelector('[data-invariant-field="enforcement"]').value
+      }));
+      config.policy = policy;
+      config.experimental = { ...(config.experimental || {}) };
+      for (const key of ["proof", "sentinel", "capabilities", "rewind", "capsules", "counterfactual", "darwin"]) config.experimental[key] = document.querySelector('[data-config-experimental="' + key + '"]').checked;
+      config.selfImprovement = { ...(config.selfImprovement || {}) };
+      for (const key of ["enabled", "rollbackOnFailure"]) config.selfImprovement[key] = document.querySelector('[data-config-self="' + key + '"]').checked;
+      config.selfImprovement.mode = $("config-self-mode").value;
+      config.selfImprovement.intervalMs = configNumber($("config-self-interval").value, 300000);
+      config.selfImprovement.maxChangesPerCycle = configNumber($("config-self-max").value, 1);
+      config.runtime = { ...(config.runtime || {}), modelRetries: configNumber($("config-runtime-retries").value, 0) };
+      config.memory = { ...(config.memory || {}) };
+      for (const key of ["autoRecall", "autoLearn", "autoCompact"]) config.memory[key] = document.querySelector('[data-config-memory="' + key + '"]').checked;
+      const providers = {};
+      for (const card of document.querySelectorAll("[data-provider-card]")) {
+        const name = card.querySelector('[data-provider-field="name"]').value.trim();
+        if (!name) throw new Error("Every provider needs a name.");
+        if (providers[name]) throw new Error("Provider names must be unique: " + name);
+        const original = config.providers?.[card.dataset.originalName] || {};
+        const provider = { ...original, type: card.querySelector('[data-provider-field="type"]').value, models: configLines(card.querySelector('[data-provider-field="models"]').value) };
+        for (const key of ["baseUrl", "apiKeyEnv", "transport"]) {
+          const input = card.querySelector('[data-provider-field="' + key + '"]');
+          if (input.value.trim()) provider[key] = input.value.trim(); else delete provider[key];
+        }
+        const auth = { ...(provider.auth || {}) };
+        for (const key of ["mode", "flow", "authorizationUrl", "tokenUrl", "clientId", "clientIdEnv", "clientSecretEnv", "commandEnv", "redirectUri", "tokenFile"]) {
+          const input = card.querySelector('[data-provider-auth="' + key + '"]');
+          if (input.value.trim()) auth[key] = input.value.trim(); else delete auth[key];
+        }
+        auth.scopes = configLines(card.querySelector('[data-provider-auth="scopes"]').value);
+        const authorizationParams = {};
+        for (const row of card.querySelectorAll("[data-auth-param-row]")) {
+          const key = row.querySelector("[data-auth-param-key]").value.trim();
+          const value = row.querySelector("[data-auth-param-value]").value;
+          if (key) authorizationParams[key] = value;
+        }
+        auth.authorizationParams = authorizationParams;
+        provider.auth = auth;
+        providers[name] = provider;
+      }
+      config.providers = providers;
+      const commands = Array.from(document.querySelectorAll("[data-proof-command]")).map((row) => configLines(row.querySelector("[data-command-args]").value)).filter((command) => command.length);
+      config.proof = { ...(config.proof || {}), allowedCommands: commands };
+      return config;
     }
 
     function renderConfigState(message = "") {
@@ -5231,25 +5498,16 @@ function renderConsoleHtml(version = "development") {
       const result = await api("/config");
       state.configFingerprint = result.fingerprint;
       state.configRestartRequired = result.restartRequired === true;
-      $("config-editor").value = JSON.stringify(result.config, null, 2);
+      state.config = result.config;
+      renderConfigForm(result.config);
       renderConfigState();
-    }
-
-    function formatConfig() {
-      try {
-        $("config-editor").value = JSON.stringify(readConfigEditor(), null, 2);
-        $("config-error").textContent = "";
-        showToast("Configuration JSON formatted.");
-      } catch (error) {
-        $("config-error").textContent = error.message;
-      }
     }
 
     async function saveConfig() {
       const button = $("save-config");
       $("config-error").textContent = "";
       try {
-        const config = readConfigEditor();
+        const config = readStructuredConfig();
         setBusy(button, true);
         const result = await api("/config", {
           method: "PUT",
@@ -5258,7 +5516,8 @@ function renderConsoleHtml(version = "development") {
         });
         state.configFingerprint = result.fingerprint;
         state.configRestartRequired = result.restartRequired === true;
-        $("config-editor").value = JSON.stringify(result.config, null, 2);
+        state.config = result.config;
+        renderConfigForm(result.config);
         renderConfigState("Configuration saved");
         showToast(state.configRestartRequired
           ? "Configuration saved. Restart the gateway to apply it."
@@ -6104,7 +6363,64 @@ function renderConsoleHtml(version = "development") {
     });
 
     $("refresh").addEventListener("click", refresh);
-    $("format-config").addEventListener("click", formatConfig);
+    $("config-form").addEventListener("submit", (event) => event.preventDefault());
+    $("config-add-provider").addEventListener("click", () => {
+      try {
+        const draft = readStructuredConfig();
+        const providers = draft.providers || {};
+        let name = "new-provider";
+        let index = 2;
+        while (providers[name]) name = "new-provider-" + index++;
+        providers[name] = { type: "openai-compatible", baseUrl: "", apiKeyEnv: "", models: [""] };
+        draft.providers = providers;
+        state.config = draft;
+        renderConfigForm(draft);
+      } catch (error) { $("config-error").textContent = error.message; }
+    });
+    $("config-providers").addEventListener("click", (event) => {
+      const removeProvider = event.target.closest("[data-remove-provider]");
+      if (removeProvider) {
+        removeProvider.closest("[data-provider-card]").remove();
+        return;
+      }
+      const addParam = event.target.closest("[data-add-auth-param]");
+      if (addParam) {
+        const list = addParam.parentElement.querySelector("[data-auth-params]");
+        const row = document.createElement("div");
+        row.className = "config-list-row";
+        row.setAttribute("data-auth-param-row", "");
+        row.innerHTML = '<div class="grid-2"><div class="field"><label>Parameter name</label><input data-auth-param-key autocomplete="off"></div><div class="field"><label>Value</label><input data-auth-param-value autocomplete="off"></div></div><button class="danger-button" data-remove-auth-param type="button" aria-label="Remove OAuth authorization parameter">Remove</button>';
+        list.appendChild(row);
+        row.querySelector("[data-auth-param-key]").focus();
+        return;
+      }
+      const removeParam = event.target.closest("[data-remove-auth-param]");
+      if (removeParam) removeParam.closest("[data-auth-param-row]").remove();
+    });
+    $("config-add-invariant").addEventListener("click", () => {
+      const list = $("config-invariants");
+      if (list.querySelector(".empty-state")) list.innerHTML = "";
+      const row = document.createElement("div");
+      row.innerHTML = renderInvariantForm({ id: "", type: "command.deny-pattern", values: [], enforcement: "block" });
+      list.appendChild(row.firstElementChild);
+      list.lastElementChild.querySelector('[data-invariant-field="id"]').focus();
+    });
+    $("config-invariants").addEventListener("click", (event) => {
+      const remove = event.target.closest("[data-remove-invariant]");
+      if (remove) remove.closest("[data-invariant-row]").remove();
+    });
+    $("config-add-command").addEventListener("click", () => {
+      const list = $("config-proof-commands");
+      if (list.querySelector(".empty-state")) list.innerHTML = "";
+      const row = document.createElement("div");
+      row.innerHTML = renderProofCommand([]);
+      list.appendChild(row.firstElementChild);
+      list.lastElementChild.querySelector("[data-command-args]").focus();
+    });
+    $("config-proof-commands").addEventListener("click", (event) => {
+      const remove = event.target.closest("[data-remove-command]");
+      if (remove) remove.closest("[data-proof-command]").remove();
+    });
     $("reload-config").addEventListener("click", async (event) => {
       const button = event.currentTarget;
       try {

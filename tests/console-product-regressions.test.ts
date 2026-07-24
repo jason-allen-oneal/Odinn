@@ -137,8 +137,20 @@ test("console presents the human-first product surfaces and dedicated Labs pages
     assert.match(goals, /update progress quickly/i);
 
     const config = section(html, /<section id="view-config"[^>]*>/, /<section id="view-automatic-improvements"[^>]*>/);
-    assertIds(config, ["config-state", "config-editor", "config-error", "format-config", "reload-config", "save-config", "config-restart"]);
-    assert.match(config, /Configuration JSON/);
+    assertIds(config, [
+      "config-state", "config-error", "reload-config", "save-config", "config-restart", "config-form", "config-providers", "config-add-provider",
+      "config-version", "config-audit-log", "config-default-model", "config-policy-max-input", "config-policy-id", "config-policy-version", "config-policy-allowed", "config-policy-denied",
+      "config-web-allowed", "config-web-blocked", "config-browser-allowed", "config-browser-blocked", "config-invariants", "config-add-invariant",
+      "config-self-mode", "config-self-interval", "config-self-max", "config-runtime-retries", "config-proof-commands", "config-add-command", "config-field-count"
+    ]);
+    assert.match(config, /Everything Ódinn can configure/);
+    assert.match(config, /Model providers/);
+    assert.match(config, /Sentinel invariants/);
+    assert.match(config, /Proof command allowlist/);
+    assert.match(config, /data-config-security="web\.requireApproval"/u);
+    assert.match(config, /data-config-security="web\.allowDownloads"/u);
+    assert.match(config, /data-config-security="web\.allowUploads"/u);
+    assert.doesNotMatch(config, /<textarea[^>]+id=["']config-editor["']/i);
     assert.match(config, /\.odinn\/config\.json/);
     assert.match(config, /restart/i);
 
@@ -228,6 +240,9 @@ test("console presents the human-first product surfaces and dedicated Labs pages
     assert.match(script, /location\.hash/u, "view selection must be reflected in the URL hash");
     assert.match(script, /addEventListener\(["']hashchange["']/u, "browser Back and direct hashes must restore the selected view");
     assert.match(script, /api\(["']\/config["']\)/u, "the configuration page must load config.json");
+    assert.match(script, /function readStructuredConfig\s*\(/u, "configuration saves must collect structured fields");
+    assert.match(script, /data-provider-field/u, "provider configuration must use individual fields");
+    assert.match(script, /data-provider-auth="commandEnv"/u, "CLI provider authentication must be configurable");
     assert.match(script, /method:\s*["']PUT["'][\s\S]{0,320}fingerprint/u, "configuration saves must use conflict protection");
     assert.match(script, /sidebar-settings["']\)\.addEventListener\(["']click["'],\s*\(\)\s*=>\s*switchView\(["']config["']\)/u);
     assert.match(

@@ -1,0 +1,47 @@
+name: Odinn Maintainer
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issues:
+    types: [opened, edited, reopened]
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Item type for a manual review
+        required: true
+        default: pull_request
+        type: choice
+        options: [pull_request, issue]
+      number:
+        description: Issue or pull request number
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: odinn-maintainer-${{ github.event.pull_request.number || github.event.issue.number || inputs.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Review PR or issue
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Keep the event workflow in Odinn, but execute the reviewed logic from
+      # the separately owned maintainer repository at an immutable commit.
+      - id: maintainer
+        uses: jason-allen-oneal/odinn-maintainer/.github/actions/review@76ca079aca882ec8f5e4775264b772855285b5c0 # v0.1.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          oauth-json: ${{ secrets.ODINN_OPENAI_OAUTH_JSON }}
+          model: ${{ vars.ODINN_MAINTAINER_MODEL || 'gpt-5.5' }}
+          number: ${{ inputs.number }}
+          oauth-client-id: ${{ vars.ODINN_OPENAI_OAUTH_CLIENT_ID || 'app_EMoamEEZ73f0CkXaXp7hrann' }}
+          originator: ${{ vars.ODINN_OPENAI_ORIGINATOR || 'openclaw' }}
+          client-version: ${{ vars.ODINN_OPENAI_CLIENT_VERSION || '2026.6.11' }}

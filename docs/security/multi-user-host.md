@@ -41,3 +41,5 @@ Every user receives a separate:
 - browser profile and recovery journal.
 
 This is application-level tenant separation. It is not a sandbox for mutually hostile users running arbitrary local code. Deploy mutually untrusted tenants under separate operating-system users, containers, or machines. Do not share workspace roots between tenants.
+
+Hosted tenant gateways accept only the built-in public provider endpoints and credential environment names. Custom provider URLs, private/local endpoints, CLI providers, and custom OAuth endpoints are rejected because a tenant-selected endpoint must never receive a shared host credential or become an SSRF primitive. Use a separate OS/container deployment when a private or custom provider is required.

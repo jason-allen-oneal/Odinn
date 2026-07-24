@@ -20,6 +20,7 @@ on:
 
 permissions:
   contents: read
+  checks: write
   issues: write
   pull-requests: write
 
@@ -36,7 +37,7 @@ jobs:
       # Keep the event workflow in Odinn, but execute the reviewed logic from
       # the separately owned maintainer repository at an immutable commit.
       - id: maintainer
-        uses: jason-allen-oneal/odinn-maintainer/.github/actions/review@6f7d372de73690aaa432f2732db01789955f1abe # v0.1.2
+        uses: jason-allen-oneal/odinn-maintainer/.github/actions/review@4672d856281dad626774397e9a1b6802c6eaa0ba # v0.2.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           oauth-json: ${{ secrets.ODINN_OPENAI_OAUTH_JSON }}

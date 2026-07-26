@@ -1,1 +1,0 @@
-{"schemaVersion":1,"at":"2026-07-01T00:08:00.000Z","runId":"run_fixture","type":"task.completed","actor":"fixture","tool":"text.echo","data":{"output":{"text":"preserve audit"}}}

@@ -1,5 +1,0 @@
-{"schemaVersion":1,"at":"2026-07-01T00:00:00.000Z","type":"project.created","id":"project_fixture","name":"Fixture project"}
-{"schemaVersion":1,"at":"2026-07-01T00:01:00.000Z","type":"session.created","id":"session_fixture","projectId":"project_fixture","title":"Fixture session"}
-{"schemaVersion":1,"at":"2026-07-01T00:02:00.000Z","type":"session.message","id":"message_fixture","sessionId":"session_fixture","role":"user","content":"Preserve this message"}
-{"schemaVersion":1,"at":"2026-07-01T00:03:00.000Z","type":"goal.created","id":"goal_fixture","projectId":"project_fixture","title":"Preserve this goal","status":"active"}
-{"schemaVersion":1,"at":"2026-07-01T00:04:00.000Z","type":"memory.created","id":"memory_fixture","subject":"migration","text":"Preserve this memory"}

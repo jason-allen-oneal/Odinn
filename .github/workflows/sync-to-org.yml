@@ -1,22 +1,9 @@
 name: Sync to BlueDot-IT
 
 on:
-  push:
-    branches: [ main ]
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
-    inputs:
-      bootstrap:
-        description: Reset org-sync from BlueDot-IT main
-        required: false
-        default: false
-        type: boolean
-      sync_now:
-        description: Run organization sync now
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -26,45 +13,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  bootstrap:
-    if: >-
-      (github.event_name == 'push' && contains(github.event.head_commit.message, '[bootstrap-org-sync]')) ||
-      (github.event_name == 'workflow_dispatch' && inputs.bootstrap)
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Bootstrap org-sync from organization main
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git remote add bluedot https://github.com/BlueDot-IT/Odinn-Forge.git
-          git fetch --no-tags bluedot main
-          git checkout -B org-sync bluedot/main
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push origin org-sync:org-sync --force
   sync:
-    if: >-
-      github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' && inputs.sync_now)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify and push org-sync to organization main
+      - name: Bootstrap and sync org-sync
         env:
           ORG_SYNC_TOKEN: ${{ secrets.ORG_SYNC_TOKEN }}
         run: |
           if [ -z "$ORG_SYNC_TOKEN" ]; then echo "ORG_SYNC_TOKEN is not configured; skipping."; exit 0; fi
-          git fetch --no-tags origin refs/heads/org-sync:refs/remotes/origin/org-sync
+          git remote set-url origin "https://x-access-token:${ORG_SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git remote add org "https://x-access-token:${ORG_SYNC_TOKEN}@github.com/BlueDot-IT/Odinn-Forge.git"
           git fetch --no-tags org main
+          if ! git ls-remote --exit-code --heads origin org-sync >/dev/null 2>&1; then
+            git push origin refs/remotes/org/main:refs/heads/org-sync
+          fi
+          git fetch --no-tags origin refs/heads/org-sync:refs/remotes/origin/org-sync
           if [ "$(git rev-parse origin/org-sync)" = "$(git rev-parse org/main)" ]; then exit 0; fi
           git merge-base --is-ancestor org/main origin/org-sync || { echo "Refusing sync: org main contains commits not present in org-sync." >&2; exit 1; }
           git push org refs/remotes/origin/org-sync:refs/heads/main

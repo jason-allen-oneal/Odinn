@@ -1,0 +1,62 @@
+name: Sync to BlueDot-IT
+
+on:
+  push:
+    branches:
+      - main
+      - org-sync
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: Reset org-sync from BlueDot-IT main
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: odinn-forge-sync-to-org
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[bootstrap-org-sync]')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.bootstrap)
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bootstrap org-sync from organization main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git remote add bluedot https://github.com/BlueDot-IT/Odinn-Forge.git
+          git fetch --no-tags bluedot main
+          git checkout -B org-sync bluedot/main
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin org-sync:org-sync --force
+  sync:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/org-sync'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: org-sync
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify and push to organization main
+        env:
+          ORG_SYNC_TOKEN: ${{ secrets.ORG_SYNC_TOKEN }}
+        run: |
+          test -n "$ORG_SYNC_TOKEN" || { echo "Missing required repository secret: ORG_SYNC_TOKEN" >&2; exit 1; }
+          git remote add org "https://x-access-token:${ORG_SYNC_TOKEN}@github.com/BlueDot-IT/Odinn-Forge.git"
+          git fetch --no-tags org main
+          git merge-base --is-ancestor org/main HEAD || { echo "Refusing sync: org main contains commits not present in org-sync." >&2; exit 1; }
+          git push org HEAD:main
